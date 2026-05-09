@@ -1,0 +1,13 @@
+.env
+*.local
+node_modules/
+
+backend/.env
+backend/data/
+backend/logs/
+backend/node_modules/
+
+hubert-platform/frontend/.env
+hubert-platform/frontend/.env.local
+hubert-platform/frontend/dist/
+hubert-platform/frontend/node_modules/

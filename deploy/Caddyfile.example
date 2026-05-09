@@ -1,0 +1,21 @@
+# Optional Caddy reverse proxy template.
+# Replace trading.example.com with your domain.
+
+trading.example.com {
+	encode gzip
+
+	# Frontend build, for example /var/www/choromanski-frontend
+	root * /var/www/choromanski-frontend
+	file_server
+
+	# Backend API on the same domain under /api/*
+	handle_path /api/* {
+		reverse_proxy 127.0.0.1:8787
+	}
+}
+
+# Alternative API subdomain:
+# api.trading.example.com {
+# 	encode gzip
+# 	reverse_proxy 127.0.0.1:8787
+# }
