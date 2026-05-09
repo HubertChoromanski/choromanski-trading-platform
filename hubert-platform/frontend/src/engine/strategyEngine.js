@@ -30,6 +30,35 @@ const DEFAULT_INPUTS = {
   maxSameSideFailures: 2,
 };
 
+const DEBUG_REASONS = {
+  ALREADY_IN_POSITION: "already in position",
+  BAND_MISSING: "no band touch",
+  HA_MISSING: "HA confirmation missing",
+  HISTORY_MISSING: "missing candle/history",
+  OTHER_FILTER: "other filter",
+  SL_LIMITER: "SL limiter blocked",
+  SIZING_INVALID: "MM/sizing invalid",
+};
+
+function createDiagnosticSummary() {
+  return {
+    openedLongTrades: 0,
+    openedShortTrades: 0,
+    skippedByAlreadyInPosition: 0,
+    skippedByBandMissing: 0,
+    skippedByFilters: 0,
+    skippedByHaMissing: 0,
+    skippedByHistory: 0,
+    skippedByLimiter: 0,
+    skippedBySizingMm: 0,
+    skippedLongByLimiter: 0,
+    skippedShortByLimiter: 0,
+    totalEvaluatedCandles: 0,
+    validLongSetups: 0,
+    validShortSetups: 0,
+  };
+}
+
 function isFiniteBand(band) {
   return Number.isFinite(band?.upper) && Number.isFinite(band?.lower);
 }
@@ -168,6 +197,22 @@ function createDebugRow(candle, band, flags) {
   };
 }
 
+function reasonForBlockedStart(direction, position, waitingBenchmark, activeSetup) {
+  if (direction === "LONG" && position === STRATEGY_STATES.LONG_ACTIVE) {
+    return DEBUG_REASONS.ALREADY_IN_POSITION;
+  }
+
+  if (direction === "SHORT" && position === STRATEGY_STATES.SHORT_ACTIVE) {
+    return DEBUG_REASONS.ALREADY_IN_POSITION;
+  }
+
+  if (waitingBenchmark || activeSetup) {
+    return DEBUG_REASONS.OTHER_FILTER;
+  }
+
+  return DEBUG_REASONS.OTHER_FILTER;
+}
+
 function isBullish(candle) {
   return candle.close > candle.open;
 }
@@ -217,6 +262,83 @@ function makeBlockedEvent(direction, index, candle, longFailures, shortFailures,
   );
 }
 
+function makeDiagnosticEvent({
+  activeSetup,
+  atrReady = true,
+  bandTouchCondition,
+  candle,
+  config,
+  direction,
+  haConfirmationCondition,
+  index,
+  longFailures,
+  position,
+  reason,
+  setupId = "",
+  setupValid = false,
+  shortFailures,
+  tradeOpened = false,
+}) {
+  return {
+    atrReady,
+    bandTouchCondition: Boolean(bandTouchCondition),
+    candleTime: candle.time,
+    currentLongSlStreak: longFailures,
+    currentShortSlStreak: shortFailures,
+    index,
+    limiterBlockingLong: isDirectionBlocked("LONG", longFailures, shortFailures, config.maxSameSideFailures),
+    limiterBlockingShort: isDirectionBlocked("SHORT", longFailures, shortFailures, config.maxSameSideFailures),
+    positionState: position,
+    reason,
+    setupId: setupId || activeSetup?.setupId || "",
+    setupValid: Boolean(setupValid),
+    side: direction,
+    tradeOpened: Boolean(tradeOpened),
+    haConfirmationCondition: Boolean(haConfirmationCondition),
+  };
+}
+
+function incrementDiagnosticReason(summary, reason, direction) {
+  if (reason === DEBUG_REASONS.BAND_MISSING) {
+    summary.skippedByBandMissing += 1;
+    return;
+  }
+
+  if (reason === DEBUG_REASONS.HISTORY_MISSING) {
+    summary.skippedByHistory += 1;
+    return;
+  }
+
+  if (reason === DEBUG_REASONS.HA_MISSING) {
+    summary.skippedByHaMissing += 1;
+    return;
+  }
+
+  if (reason === DEBUG_REASONS.ALREADY_IN_POSITION) {
+    summary.skippedByAlreadyInPosition += 1;
+    return;
+  }
+
+  if (reason === DEBUG_REASONS.SL_LIMITER) {
+    summary.skippedByLimiter += 1;
+    if (direction === "LONG") {
+      summary.skippedLongByLimiter += 1;
+    } else {
+      summary.skippedShortByLimiter += 1;
+    }
+    return;
+  }
+
+  if (reason === DEBUG_REASONS.SIZING_INVALID) {
+    summary.skippedBySizingMm += 1;
+    return;
+  }
+
+  if (reason) {
+    summary.skippedByFilters += 1;
+  }
+}
+
 export function evaluateChoromanskiStrategy({
   sourceCandles,
   envelope,
@@ -230,6 +352,8 @@ export function evaluateChoromanskiStrategy({
   const events = [];
   const setupAudits = [];
   const auditBySetupId = new Map();
+  const diagnosticEvents = [];
+  const diagnosticSummary = createDiagnosticSummary();
   const debugRows = [];
   let position = STRATEGY_STATES.NEUTRAL;
   let activePosition = null;
@@ -253,6 +377,7 @@ export function evaluateChoromanskiStrategy({
       lifecycle: [],
       setupId: "",
     };
+    diagnosticSummary.totalEvaluatedCandles += 1;
 
     if (activePosition && index > activePosition.entryIndex && positionStopped(activePosition, candle)) {
       const exitEvent = makeEvent(
@@ -284,14 +409,25 @@ export function evaluateChoromanskiStrategy({
     }
 
     if (!isFiniteBand(band) || !isFiniteBand(previousBand)) {
+      diagnosticSummary.skippedByHistory += 2;
       debugRows.push(createDebugRow(candle, band, debug));
       continue;
     }
 
     const longSignal = crossunder(candle.close, band.lower, previousCandle.close, previousBand.lower);
     const shortSignal = crossover(candle.close, band.upper, previousCandle.close, previousBand.upper);
+    const longHaConfirmation = isBullish(candle);
+    const shortHaConfirmation = isBearish(candle);
     debug.longSignal = longSignal;
     debug.shortSignal = shortSignal;
+
+    if (!longSignal) {
+      diagnosticSummary.skippedByBandMissing += 1;
+    }
+
+    if (!shortSignal) {
+      diagnosticSummary.skippedByBandMissing += 1;
+    }
 
     if (longSignal && canStartSetup("LONG", position, waitingBenchmark, activeSetup)) {
       if (
@@ -300,8 +436,22 @@ export function evaluateChoromanskiStrategy({
           consecutiveLongFailures,
           consecutiveShortFailures,
           config.maxSameSideFailures,
-        )
+          )
       ) {
+        diagnosticEvents.push(makeDiagnosticEvent({
+          bandTouchCondition: true,
+          candle,
+          config,
+          direction: "LONG",
+          haConfirmationCondition: longHaConfirmation,
+          index,
+          longFailures: consecutiveLongFailures,
+          position,
+          reason: DEBUG_REASONS.SL_LIMITER,
+          setupValid: false,
+          shortFailures: consecutiveShortFailures,
+        }));
+        incrementDiagnosticReason(diagnosticSummary, DEBUG_REASONS.SL_LIMITER, "LONG");
         if (!blockedDirections.has("LONG")) {
           const blockedEvent = makeBlockedEvent(
             "LONG",
@@ -317,6 +467,22 @@ export function evaluateChoromanskiStrategy({
           blockedDirections.add("LONG");
         }
       } else {
+        if (!longHaConfirmation) {
+          diagnosticEvents.push(makeDiagnosticEvent({
+            bandTouchCondition: true,
+            candle,
+            config,
+            direction: "LONG",
+            haConfirmationCondition: false,
+            index,
+            longFailures: consecutiveLongFailures,
+            position,
+            reason: DEBUG_REASONS.HA_MISSING,
+            setupValid: false,
+            shortFailures: consecutiveShortFailures,
+          }));
+          incrementDiagnosticReason(diagnosticSummary, DEBUG_REASONS.HA_MISSING, "LONG");
+        }
         setupSequence += 1;
         waitingBenchmark = makeSignal("LONG", makeSetupId(setupSequence), index, candle);
         const audit = makeSetupAudit(waitingBenchmark);
@@ -335,6 +501,23 @@ export function evaluateChoromanskiStrategy({
         events.push(bandEvent);
         addLifecycle(debug, bandEvent);
       }
+    } else if (longSignal) {
+      const reason = reasonForBlockedStart("LONG", position, waitingBenchmark, activeSetup);
+      diagnosticEvents.push(makeDiagnosticEvent({
+        activeSetup,
+        bandTouchCondition: true,
+        candle,
+        config,
+        direction: "LONG",
+        haConfirmationCondition: longHaConfirmation,
+        index,
+        longFailures: consecutiveLongFailures,
+        position,
+        reason,
+        setupValid: false,
+        shortFailures: consecutiveShortFailures,
+      }));
+      incrementDiagnosticReason(diagnosticSummary, reason, "LONG");
     }
 
     if (shortSignal && canStartSetup("SHORT", position, waitingBenchmark, activeSetup)) {
@@ -344,8 +527,22 @@ export function evaluateChoromanskiStrategy({
           consecutiveLongFailures,
           consecutiveShortFailures,
           config.maxSameSideFailures,
-        )
+          )
       ) {
+        diagnosticEvents.push(makeDiagnosticEvent({
+          bandTouchCondition: true,
+          candle,
+          config,
+          direction: "SHORT",
+          haConfirmationCondition: shortHaConfirmation,
+          index,
+          longFailures: consecutiveLongFailures,
+          position,
+          reason: DEBUG_REASONS.SL_LIMITER,
+          setupValid: false,
+          shortFailures: consecutiveShortFailures,
+        }));
+        incrementDiagnosticReason(diagnosticSummary, DEBUG_REASONS.SL_LIMITER, "SHORT");
         if (!blockedDirections.has("SHORT")) {
           const blockedEvent = makeBlockedEvent(
             "SHORT",
@@ -361,6 +558,22 @@ export function evaluateChoromanskiStrategy({
           blockedDirections.add("SHORT");
         }
       } else {
+        if (!shortHaConfirmation) {
+          diagnosticEvents.push(makeDiagnosticEvent({
+            bandTouchCondition: true,
+            candle,
+            config,
+            direction: "SHORT",
+            haConfirmationCondition: false,
+            index,
+            longFailures: consecutiveLongFailures,
+            position,
+            reason: DEBUG_REASONS.HA_MISSING,
+            setupValid: false,
+            shortFailures: consecutiveShortFailures,
+          }));
+          incrementDiagnosticReason(diagnosticSummary, DEBUG_REASONS.HA_MISSING, "SHORT");
+        }
         setupSequence += 1;
         waitingBenchmark = makeSignal("SHORT", makeSetupId(setupSequence), index, candle);
         const audit = makeSetupAudit(waitingBenchmark);
@@ -379,6 +592,23 @@ export function evaluateChoromanskiStrategy({
         events.push(bandEvent);
         addLifecycle(debug, bandEvent);
       }
+    } else if (shortSignal) {
+      const reason = reasonForBlockedStart("SHORT", position, waitingBenchmark, activeSetup);
+      diagnosticEvents.push(makeDiagnosticEvent({
+        activeSetup,
+        bandTouchCondition: true,
+        candle,
+        config,
+        direction: "SHORT",
+        haConfirmationCondition: shortHaConfirmation,
+        index,
+        longFailures: consecutiveLongFailures,
+        position,
+        reason,
+        setupValid: false,
+        shortFailures: consecutiveShortFailures,
+      }));
+      incrementDiagnosticReason(diagnosticSummary, reason, "SHORT");
     }
 
     const benchmarkConfirmed =
@@ -389,6 +619,25 @@ export function evaluateChoromanskiStrategy({
 
     if (benchmarkConfirmed) {
       activeSetup = makeSetup(waitingBenchmark, index, candle, atr[index], config.atrMultiplier);
+      if (activeSetup.direction === "LONG") {
+        diagnosticSummary.validLongSetups += 1;
+      } else {
+        diagnosticSummary.validShortSetups += 1;
+      }
+      diagnosticEvents.push(makeDiagnosticEvent({
+        bandTouchCondition: activeSetup.signalIndex === index,
+        candle,
+        config,
+        direction: activeSetup.direction,
+        haConfirmationCondition: true,
+        index,
+        longFailures: consecutiveLongFailures,
+        position,
+        reason: DEBUG_REASONS.OTHER_FILTER,
+        setupId: activeSetup.setupId,
+        setupValid: true,
+        shortFailures: consecutiveShortFailures,
+      }));
       waitingBenchmark = null;
       debug.benchmark = activeSetup.direction;
       updateAudit(auditBySetupId, activeSetup.setupId, {
@@ -420,6 +669,44 @@ export function evaluateChoromanskiStrategy({
       events.push(benchmarkEvent, setupActiveEvent);
       addLifecycle(debug, benchmarkEvent);
       addLifecycle(debug, setupActiveEvent);
+    } else if (waitingBenchmark && Number.isFinite(atr[index])) {
+      const haConfirmation =
+        waitingBenchmark.direction === "LONG" ? longHaConfirmation : shortHaConfirmation;
+
+      if (!haConfirmation && waitingBenchmark.signalIndex !== index) {
+        diagnosticEvents.push(makeDiagnosticEvent({
+          bandTouchCondition: waitingBenchmark.signalIndex === index,
+          candle,
+          config,
+          direction: waitingBenchmark.direction,
+          haConfirmationCondition: false,
+          index,
+          longFailures: consecutiveLongFailures,
+          position,
+          reason: DEBUG_REASONS.HA_MISSING,
+          setupId: waitingBenchmark.setupId,
+          setupValid: false,
+          shortFailures: consecutiveShortFailures,
+        }));
+        incrementDiagnosticReason(diagnosticSummary, DEBUG_REASONS.HA_MISSING, waitingBenchmark.direction);
+      }
+    } else if (waitingBenchmark && waitingBenchmark.signalIndex !== index) {
+      diagnosticEvents.push(makeDiagnosticEvent({
+        atrReady: false,
+        bandTouchCondition: waitingBenchmark.signalIndex === index,
+        candle,
+        config,
+        direction: waitingBenchmark.direction,
+        haConfirmationCondition: waitingBenchmark.direction === "LONG" ? longHaConfirmation : shortHaConfirmation,
+        index,
+        longFailures: consecutiveLongFailures,
+        position,
+        reason: DEBUG_REASONS.HISTORY_MISSING,
+        setupId: waitingBenchmark.setupId,
+        setupValid: false,
+        shortFailures: consecutiveShortFailures,
+      }));
+      incrementDiagnosticReason(diagnosticSummary, DEBUG_REASONS.HISTORY_MISSING, waitingBenchmark.direction);
     }
 
     if (activeSetup && index > activeSetup.benchmarkIndex) {
@@ -444,6 +731,22 @@ export function evaluateChoromanskiStrategy({
         } else {
           consecutiveShortFailures += 1;
         }
+        diagnosticEvents.push(makeDiagnosticEvent({
+          activeSetup,
+          bandTouchCondition: false,
+          candle,
+          config,
+          direction: activeSetup.direction,
+          haConfirmationCondition: activeSetup.direction === "LONG" ? longHaConfirmation : shortHaConfirmation,
+          index,
+          longFailures: consecutiveLongFailures,
+          position,
+          reason: DEBUG_REASONS.OTHER_FILTER,
+          setupId: activeSetup.setupId,
+          setupValid: false,
+          shortFailures: consecutiveShortFailures,
+        }));
+        incrementDiagnosticReason(diagnosticSummary, DEBUG_REASONS.OTHER_FILTER, activeSetup.direction);
         updateAudit(auditBySetupId, activeSetup.setupId, {
           invalidationIndex: index,
           invalidationTime: candle.time,
@@ -498,6 +801,27 @@ export function evaluateChoromanskiStrategy({
         addLifecycle(debug, activeEvent);
         debug.entry = activeSetup.direction;
         if (activeSetup.direction === "LONG") {
+          diagnosticSummary.openedLongTrades += 1;
+        } else {
+          diagnosticSummary.openedShortTrades += 1;
+        }
+        diagnosticEvents.push(makeDiagnosticEvent({
+          activeSetup,
+          bandTouchCondition: false,
+          candle,
+          config,
+          direction: activeSetup.direction,
+          haConfirmationCondition: activeSetup.direction === "LONG" ? longHaConfirmation : shortHaConfirmation,
+          index,
+          longFailures: consecutiveLongFailures,
+          position,
+          reason: "",
+          setupId: activeSetup.setupId,
+          setupValid: true,
+          shortFailures: consecutiveShortFailures,
+          tradeOpened: true,
+        }));
+        if (activeSetup.direction === "LONG") {
           consecutiveShortFailures = 0;
           blockedDirections.delete("SHORT");
         } else {
@@ -523,6 +847,8 @@ export function evaluateChoromanskiStrategy({
   }
 
   return {
+    diagnosticEvents,
+    diagnosticSummary,
     debugRows,
     events,
     setupAudits,

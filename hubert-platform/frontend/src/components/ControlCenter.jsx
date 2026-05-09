@@ -394,6 +394,9 @@ function compactBacktestResult(result) {
 
   return {
     ...rest,
+    diagnosticEventCount: result.diagnosticEvents?.length ?? 0,
+    diagnosticEvents: result.diagnosticEvents?.slice(-STORED_BACKTEST_EVENT_LIMIT) ?? [],
+    diagnosticSummary: result.diagnosticSummary ?? {},
     eventCount: result.events?.length ?? 0,
     events: result.events?.slice(-STORED_BACKTEST_EVENT_LIMIT) ?? [],
     setupAuditCount: result.setupAudits?.length ?? 0,
@@ -1927,7 +1930,93 @@ function BacktestResult({ result }) {
       </div>
       <SideBreakdown trades={result.trades} />
       <TradeTable trades={result.trades} />
+      <BacktestDebugSection result={result} />
     </>
+  );
+}
+
+function BacktestDebugSection({ result }) {
+  const [showDebug, setShowDebug] = useState(false);
+  const summary = result?.diagnosticSummary ?? {};
+  const rows = useMemo(
+    () => (result?.diagnosticEvents ?? []).slice(-50).reverse(),
+    [result?.diagnosticEvents],
+  );
+
+  return (
+    <section className="hubert-lab__section">
+      <div className="hubert-lab__subhead">
+        <strong>Backtest Debug</strong>
+        <label className="hubert-inline-toggle">
+          <input
+            checked={showDebug}
+            type="checkbox"
+            onChange={(event) => setShowDebug(event.target.checked)}
+          />
+          <span>Show debug events</span>
+        </label>
+      </div>
+      {!showDebug ? (
+        <MiniStatus>Debug events are hidden. Turn them on when you want to audit setup decisions.</MiniStatus>
+      ) : (
+        <>
+          <div className="hubert-lab__metrics">
+            <Metric label="Evaluated candles" value={summary.totalEvaluatedCandles ?? 0} />
+            <Metric label="Valid LONG setups" value={summary.validLongSetups ?? 0} />
+            <Metric label="Valid SHORT setups" value={summary.validShortSetups ?? 0} />
+            <Metric label="Opened LONG" value={summary.openedLongTrades ?? 0} />
+            <Metric label="Opened SHORT" value={summary.openedShortTrades ?? 0} />
+            <Metric label="LONG limiter skips" value={summary.skippedLongByLimiter ?? 0} />
+            <Metric label="SHORT limiter skips" value={summary.skippedShortByLimiter ?? 0} />
+            <Metric label="HA missing" value={summary.skippedByHaMissing ?? 0} />
+            <Metric label="Band missing" value={summary.skippedByBandMissing ?? 0} />
+            <Metric label="Already in position" value={summary.skippedByAlreadyInPosition ?? 0} />
+            <Metric label="Sizing/MM" value={summary.skippedBySizingMm ?? 0} />
+            <Metric label="Other filters" value={summary.skippedByFilters ?? 0} />
+          </div>
+          {rows.length === 0 ? (
+            <MiniStatus>No setup debug events were produced for this run.</MiniStatus>
+          ) : (
+            <div className="hubert-lab__table hubert-lab__table--audit">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Side</th>
+                    <th>Band</th>
+                    <th>HA</th>
+                    <th>Valid</th>
+                    <th>Opened</th>
+                    <th>Reason</th>
+                    <th>L SL</th>
+                    <th>S SL</th>
+                    <th>Block L</th>
+                    <th>Block S</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((event, index) => (
+                    <tr key={`${event.setupId || event.side}-${event.candleTime}-${index}`}>
+                      <td>{dateText(event.candleTime)}</td>
+                      <td>{event.side}</td>
+                      <td>{event.bandTouchCondition ? "yes" : "no"}</td>
+                      <td>{event.haConfirmationCondition ? "yes" : "no"}</td>
+                      <td>{event.setupValid ? "yes" : "no"}</td>
+                      <td>{event.tradeOpened ? "yes" : "no"}</td>
+                      <td>{event.reason || "--"}</td>
+                      <td>{event.currentLongSlStreak ?? "--"}</td>
+                      <td>{event.currentShortSlStreak ?? "--"}</td>
+                      <td>{event.limiterBlockingLong === null ? "--" : event.limiterBlockingLong ? "yes" : "no"}</td>
+                      <td>{event.limiterBlockingShort === null ? "--" : event.limiterBlockingShort ? "yes" : "no"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+    </section>
   );
 }
 

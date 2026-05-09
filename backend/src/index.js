@@ -792,6 +792,11 @@ function sanitizeBacktestRecord(record) {
 
   return {
     ...rest,
+    diagnosticEventCount: record.diagnosticEventCount ?? record.diagnosticEvents?.length ?? 0,
+    diagnosticEvents: Array.isArray(record.diagnosticEvents)
+      ? record.diagnosticEvents.slice(-BACKTEST_EVENT_RESPONSE_LIMIT)
+      : [],
+    diagnosticSummary: record.diagnosticSummary ?? {},
     eventCount: record.eventCount ?? record.events?.length ?? 0,
     events: Array.isArray(record.events) ? record.events.slice(-BACKTEST_EVENT_RESPONSE_LIMIT) : [],
     setupAuditCount: record.setupAuditCount ?? record.setupAudits?.length ?? 0,

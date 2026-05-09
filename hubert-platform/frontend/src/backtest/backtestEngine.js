@@ -142,6 +142,10 @@ export function runBacktest({ rawCandles, settings, backtestConfig = {} }) {
   const eventsByIndex = mapEventsByIndex(tradeEvents);
   const setupAudits = strategy.setupAudits.map((audit) => ({ ...audit }));
   const auditBySetupId = new Map(setupAudits.map((audit) => [audit.setupId, audit]));
+  const diagnosticEvents = [...(strategy.diagnosticEvents ?? [])];
+  const diagnosticSummary = {
+    ...(strategy.diagnosticSummary ?? {}),
+  };
 
   function updateSetupAudit(setupId, patch) {
     const audit = auditBySetupId.get(setupId);
@@ -211,13 +215,43 @@ export function runBacktest({ rawCandles, settings, backtestConfig = {} }) {
       }
 
       if (!position) {
-        position = openPosition({
+        const nextPosition = openPosition({
           candle,
           config,
           direction: event.direction,
           equity,
           event,
         });
+        const invalidSizing =
+          !Number.isFinite(nextPosition.notional) ||
+          !Number.isFinite(nextPosition.quantity) ||
+          nextPosition.notional <= 0 ||
+          nextPosition.quantity <= 0 ||
+          !Number.isFinite(nextPosition.entryPrice) ||
+          nextPosition.entryPrice <= 0;
+
+        if (invalidSizing) {
+          diagnosticSummary.skippedBySizingMm = (diagnosticSummary.skippedBySizingMm ?? 0) + 1;
+          diagnosticEvents.push({
+            atrReady: true,
+            bandTouchCondition: false,
+            candleTime: candle.time,
+            currentLongSlStreak: null,
+            currentShortSlStreak: null,
+            index,
+            limiterBlockingLong: null,
+            limiterBlockingShort: null,
+            positionState: position?.direction ?? "NEUTRAL",
+            reason: "MM/sizing invalid",
+            setupId: event.setupId,
+            setupValid: true,
+            side: event.direction,
+            tradeOpened: false,
+            haConfirmationCondition: true,
+          });
+        }
+
+        position = nextPosition;
         updateSetupAudit(event.setupId, {
           entryIndex: index,
           entryTime: candle.time,
@@ -263,6 +297,8 @@ export function runBacktest({ rawCandles, settings, backtestConfig = {} }) {
 
   return {
     config,
+    diagnosticEvents,
+    diagnosticSummary,
     equityCurve,
     events: lifecycleEvents,
     metrics: calculateBacktestMetrics({
