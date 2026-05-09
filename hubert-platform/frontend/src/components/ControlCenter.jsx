@@ -3,9 +3,11 @@ import { runBacktest } from "../backtest/backtestEngine";
 
 const PANEL_TABS = [
   "System",
+  "Livestream",
   "Indicator",
   "Strategy Decks",
   "Backtests",
+  "Compare",
   "MM Decks",
   "Decision",
   "Battle Decks",
@@ -13,6 +15,7 @@ const PANEL_TABS = [
   "Crisis",
   "Analytics",
   "Communication",
+  "AI",
   "Favorites",
 ];
 
@@ -55,8 +58,8 @@ const defaultMmDeck = {
   fixedNotional: 100,
   mode: "run",
   name: "",
-  onePercentMovePercent: 2,
   oneSlPercent: 1,
+  positionPercent: 10,
 };
 
 const defaultBacktestForm = {
@@ -135,6 +138,18 @@ function fmt(value, digits = 2) {
   });
 }
 
+function hasKnownProfileBalance(rows = []) {
+  return rows.some((profile) => profile.futuresBalance !== null && Number.isFinite(Number(profile.futuresBalance)));
+}
+
+function totalProfileBalance(rows = []) {
+  return rows.reduce((sum, profile) => sum + Number(profile.futuresBalance ?? 0), 0);
+}
+
+function profileBalanceText(profile) {
+  return profile?.futuresBalance === null || profile?.futuresBalance === undefined ? "Syncing" : fmt(profile.futuresBalance);
+}
+
 function dateText(time) {
   if (!time) return "--";
   const value = typeof time === "number" ? time * 1000 : time;
@@ -148,6 +163,10 @@ function displayBotStatus(status) {
   if (status === "NEEDS_RECONCILIATION") return "Needs check";
   if (status === "EMERGENCY_STOP") return "Emergency";
   return status.replaceAll("_", " ");
+}
+
+function compact(value) {
+  return String(value ?? "").replace("-", "").toUpperCase();
 }
 
 function daysFromCandles(candles, interval) {
@@ -243,6 +262,29 @@ function sideBreakdown(trades = []) {
   });
 }
 
+function sizingAudit(trades = []) {
+  const sizes = trades.map((trade) => Number(trade.size ?? 0)).filter((value) => value > 0);
+  const leverages = trades.map((trade) => Number(trade.assumedLeverage ?? 0)).filter((value) => value > 0);
+  const risks = trades.map((trade) => Number(trade.riskAmount ?? 0)).filter((value) => value > 0);
+
+  return {
+    averageLeverage: average(leverages),
+    averageRisk: average(risks),
+    averageSize: average(sizes),
+    biggestExposure: sizes.length ? Math.max(...sizes) : 0,
+    maxSize: sizes.length ? Math.max(...sizes) : 0,
+    minSize: sizes.length ? Math.min(...sizes) : 0,
+    note:
+      sizes.length === 0
+        ? "No position sizing data is available yet."
+        : "ATR sizing changes position size when the SL distance changes. Fixed or percent sizing can look larger because it ignores the actual SL distance.",
+  };
+}
+
+function average(values) {
+  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+}
+
 function downloadText(fileName, text, type) {
   const blob = new Blob([text], { type });
   const url = URL.createObjectURL(blob);
@@ -301,9 +343,21 @@ export default function ControlCenter({
   const [mmDecks, setMmDecks] = useState([]);
   const [battleDecks, setBattleDecks] = useState([]);
   const [favorites, setFavorites] = useState([]);
+  const [livestream, setLivestream] = useState({ accountSummary: {}, positions: [] });
+  const [accountProfiles, setAccountProfiles] = useState([]);
   const [savedBacktests, setSavedBacktests] = useState([]);
   const [analytics, setAnalytics] = useState(null);
   const [communication, setCommunication] = useState({ alertTypes: {}, enabled: false, telegramChatId: "" });
+  const [aiContext, setAiContext] = useState({
+    includeAnalytics: true,
+    includeBacktests: true,
+    includeDecks: true,
+    includeLivePositions: true,
+    includeSystemStatus: true,
+  });
+  const [aiMessages, setAiMessages] = useState([]);
+  const [aiQuestion, setAiQuestion] = useState("");
+  const [compareIds, setCompareIds] = useState([]);
   const [strategyForm, setStrategyForm] = useState({ ...defaultStrategyDeck, ...settings, name: "" });
   const [mmForm, setMmForm] = useState(defaultMmDeck);
   const [backtestForm, setBacktestForm] = useState(defaultBacktestForm);
@@ -333,7 +387,9 @@ export default function ControlCenter({
   const selectedStrategy = strategyDecks.find((deck) => deck.id === decision.strategyDeckId);
   const selectedMm = mmDecks.find((deck) => deck.id === decision.mmDeckId);
   const selectedBattleDeck = battleDecks.find((deck) => deck.id === executionDeckId) ?? battleDecks[0];
-  const futuresBalance = Number(system?.state?.bingx?.activeExecutionBalance ?? 0);
+  const futuresBalance = hasKnownProfileBalance(accountProfiles)
+    ? totalProfileBalance(accountProfiles)
+    : Number(system?.state?.bingx?.activeExecutionBalance ?? 0);
   const decisionEstimate = useMemo(
     () => estimateDecision({ balance: futuresBalance, mmDeck: selectedMm, strategyDeck: selectedStrategy }),
     [futuresBalance, selectedMm, selectedStrategy],
@@ -354,9 +410,22 @@ export default function ControlCenter({
   }
 
   async function refreshAll() {
-    const [nextSystem, nextStrategy, nextMm, nextBattle, nextFavorites, nextBacktests, nextAnalytics, nextCommunication] =
+    const [
+      nextSystem,
+      nextLivestream,
+      nextAccounts,
+      nextStrategy,
+      nextMm,
+      nextBattle,
+      nextFavorites,
+      nextBacktests,
+      nextAnalytics,
+      nextCommunication,
+    ] =
       await Promise.all([
         apiFetch("/system/status"),
+        apiFetch("/livestream"),
+        apiFetch("/accounts/profiles"),
         apiFetch("/decks/strategy"),
         apiFetch("/decks/mm"),
         apiFetch("/decks/battle"),
@@ -366,6 +435,8 @@ export default function ControlCenter({
         apiFetch("/communication/settings"),
       ]);
     setSystem(nextSystem);
+    setLivestream(nextLivestream);
+    setAccountProfiles(nextAccounts);
     setStrategyDecks(nextStrategy);
     setMmDecks(nextMm);
     setBattleDecks(nextBattle);
@@ -410,6 +481,38 @@ export default function ControlCenter({
     };
     const saved = await saveCollectionItem("favorites", favorite);
     return saved;
+  }
+
+  async function saveAndFavorite(collection, category, item) {
+    const saved = await saveCollectionItem(collection, item);
+    await addFavorite(category, saved);
+    await refreshAll();
+    return saved;
+  }
+
+  async function renameFavorite(favorite) {
+    const name = window.prompt("New favorite name", favorite.name);
+    if (!name?.trim()) return null;
+    return saveCollectionItem("favorites", { ...favorite, name: name.trim() });
+  }
+
+  function prepareCrisisAction(position, action) {
+    setManualForm((current) => ({
+      ...current,
+      apiProfile: position.apiProfile ?? "main",
+      quantity: position.quantity ? Number(position.quantity).toFixed(3) : current.quantity,
+      stopPrice: position.stopLoss ?? current.stopPrice,
+      symbol: position.symbol ?? current.symbol ?? "SOLUSDT",
+      takeProfitPrice: position.takeProfit ?? current.takeProfitPrice,
+    }));
+    setPendingManualAction(action);
+    setActivePanel("Crisis");
+    if (!action) {
+      runAction("crisis-on-from-live", "Crisis ON", async () => {
+        await apiFetch("/execution/crisis/on", { method: "POST" });
+        await refreshAll();
+      });
+    }
   }
 
   function openFavorite(favorite) {
@@ -486,7 +589,7 @@ export default function ControlCenter({
   async function saveBacktest(result = backtestResult) {
     if (!result) throw new Error("Run a backtest first.");
     if (!result.name) throw new Error("Name this backtest before saving it.");
-    const saved = await saveCollectionItem("backtests", result);
+    const saved = await saveAndFavorite("backtests", "Backtests", result);
     setBacktestResult(saved);
   }
 
@@ -510,7 +613,7 @@ export default function ControlCenter({
       symbol: decision.symbol,
       timeframe: decision.timeframe,
     };
-    const saved = await saveCollectionItem("battleDecks", battleDeck);
+    const saved = await saveAndFavorite("battleDecks", "Battle Decks", battleDeck);
     setExecutionDeckId(saved.id);
   }
 
@@ -547,12 +650,22 @@ export default function ControlCenter({
 
       {panel === "System" && (
         <SystemPanel
+          accountProfiles={accountProfiles}
           backendUrl={BACKEND_URL}
           rawCandles={rawCandles}
           runAction={runAction}
           selectedInterval={selectedInterval}
           system={system}
           onRefresh={refreshAll}
+        />
+      )}
+
+      {panel === "Livestream" && (
+        <LivestreamPanel
+          accountProfiles={accountProfiles}
+          livestream={livestream}
+          onRefresh={() => runAction("refresh-live", "Refresh live stream", refreshAll)}
+          onPositionAction={prepareCrisisAction}
         />
       )}
 
@@ -568,6 +681,7 @@ export default function ControlCenter({
 
       {panel === "Strategy Decks" && (
         <StrategyDecksPanel
+          favorites={favorites}
           form={strategyForm}
           setForm={setStrategyForm}
           decks={strategyDecks}
@@ -576,12 +690,13 @@ export default function ControlCenter({
           onDuplicate={(deck) => setStrategyForm({ ...deck, id: undefined, name: `${deck.name} Copy` })}
           onEdit={setStrategyForm}
           onFavorite={(deck) => runAction(`fav-${deck.id}`, "Add favorite", () => addFavorite("Strategy Decks", deck))}
-          onSave={() => runAction("save-strategy", "Save Strategy Deck", () => saveCollectionItem("strategyDecks", strategyForm))}
+          onSave={() => runAction("save-strategy", "Save Strategy Deck", () => saveAndFavorite("strategyDecks", "Strategy Decks", strategyForm))}
         />
       )}
 
       {panel === "Backtests" && (
         <BacktestsPanel
+          favorites={favorites}
           form={backtestForm}
           mmDecks={mmDecks}
           result={backtestResult}
@@ -596,21 +711,32 @@ export default function ControlCenter({
         />
       )}
 
+      {panel === "Compare" && (
+        <BacktestComparePanel
+          compareIds={compareIds}
+          favorites={favorites}
+          savedBacktests={savedBacktests}
+          setCompareIds={setCompareIds}
+        />
+      )}
+
       {panel === "MM Decks" && (
         <MmDecksPanel
           decks={mmDecks}
+          favorites={favorites}
           form={mmForm}
           setForm={setMmForm}
           onDelete={(deck) => runAction(`delete-mm-${deck.id}`, "Delete MM deck", () => deleteCollectionItem("mmDecks", deck))}
           onDuplicate={(deck) => setMmForm({ ...deck, id: undefined, name: `${deck.name} Copy` })}
           onEdit={setMmForm}
           onFavorite={(deck) => runAction(`fav-mm-${deck.id}`, "Add favorite", () => addFavorite("MM Decks", deck))}
-          onSave={() => runAction("save-mm", "Save MM Deck", () => saveCollectionItem("mmDecks", mmForm))}
+          onSave={() => runAction("save-mm", "Save MM Deck", () => saveAndFavorite("mmDecks", "MM Decks", mmForm))}
         />
       )}
 
       {panel === "Decision" && (
         <DecisionPanel
+          accountProfiles={accountProfiles}
           decision={decision}
           estimate={decisionEstimate}
           mmDecks={mmDecks}
@@ -635,11 +761,13 @@ export default function ControlCenter({
 
       {panel === "Execution" && (
         <ExecutionPanel
+          accountProfiles={accountProfiles}
           battleDecks={battleDecks}
           executionDeckId={executionDeckId}
           rawCandles={rawCandles}
           selectedBattleDeck={selectedBattleDeck}
           setExecutionDeckId={setExecutionDeckId}
+          setActivePanel={setActivePanel}
           status={system}
           onAction={(path, label, body = {}) =>
             runAction(label, label, async () => {
@@ -654,6 +782,7 @@ export default function ControlCenter({
       {panel === "Crisis" && (
         <CrisisPanel
           form={manualForm}
+          livestream={livestream}
           message={manualMessage}
           pendingAction={pendingManualAction}
           setForm={setManualForm}
@@ -687,11 +816,43 @@ export default function ControlCenter({
         />
       )}
 
+      {panel === "AI" && (
+        <AiPanel
+          aiContext={aiContext}
+          messages={aiMessages}
+          question={aiQuestion}
+          setAiContext={setAiContext}
+          setMessages={setAiMessages}
+          setQuestion={setAiQuestion}
+          onAsk={() =>
+            runAction("ask-ai", "Ask AI", async () => {
+              if (!aiQuestion.trim()) throw new Error("Ask a question first.");
+              const userMessage = { role: "user", text: aiQuestion.trim(), time: new Date().toISOString() };
+              setAiMessages((current) => [...current, userMessage]);
+              setAiQuestion("");
+              const result = await apiFetch("/ai/chat", {
+                body: { context: aiContext, message: userMessage.text },
+                method: "POST",
+              });
+              setAiMessages((current) => [
+                ...current,
+                {
+                  role: "assistant",
+                  text: result.message,
+                  time: new Date().toISOString(),
+                },
+              ]);
+            })
+          }
+        />
+      )}
+
       {panel === "Favorites" && (
         <FavoritesPanel
           favorites={favorites}
           onDelete={(favorite) => runAction(`delete-fav-${favorite.id}`, "Remove favorite", () => deleteCollectionItem("favorites", favorite))}
           onOpen={openFavorite}
+          onRename={(favorite) => runAction(`rename-fav-${favorite.id}`, "Rename favorite", () => renameFavorite(favorite))}
         />
       )}
     </aside>
@@ -708,19 +869,19 @@ function estimateDecision({ balance, mmDeck, strategyDeck }) {
 
   const safeBalance = Number(balance || 0);
   const riskPercent = Number(mmDeck.oneSlPercent ?? 1);
-  const moveRisk = Number(mmDeck.onePercentMovePercent ?? 2);
+  const positionPercent = Number(mmDeck.positionPercent ?? mmDeck.onePercentMovePercent ?? 10);
   const notional =
     mmDeck.mode === "constant"
       ? Number(mmDeck.fixedNotional ?? 0)
       : strategyDeck.atrPositionSizing
         ? safeBalance * riskPercent
-        : safeBalance * moveRisk;
+        : safeBalance * (positionPercent / 100);
   const leverage = safeBalance > 0 && notional > 0 ? Math.max(1, Math.ceil(notional / safeBalance)) : 0;
   const margin = leverage > 0 ? notional / leverage : 0;
   const ready = safeBalance > 0 && notional > 0;
   const lossText = strategyDeck.atrPositionSizing
     ? `If the SL is 1% away, estimated loss at SL is ${fmt(safeBalance * riskPercent / 100)} USDT.`
-    : `A 1% move against the trade is about ${fmt(safeBalance * moveRisk / 100)} USDT.`;
+    : `A 1% move against this position is about ${fmt(notional * 0.01)} USDT.`;
 
   return {
     leverage,
@@ -737,9 +898,15 @@ function estimateDecision({ balance, mmDeck, strategyDeck }) {
   };
 }
 
-function SystemPanel({ backendUrl, rawCandles, runAction, selectedInterval, system, onRefresh }) {
+function SystemPanel({ accountProfiles, backendUrl, rawCandles, runAction, selectedInterval, system, onRefresh }) {
   const status = system?.state ?? {};
   const bingx = status.bingx ?? {};
+  const hasSystemBalance = bingx.activeExecutionBalance !== null &&
+    bingx.activeExecutionBalance !== undefined &&
+    Number.isFinite(Number(bingx.activeExecutionBalance));
+  const futuresBalance = hasKnownProfileBalance(accountProfiles)
+    ? totalProfileBalance(accountProfiles)
+    : Number(bingx.activeExecutionBalance ?? 0);
   const diagnostic = [
     "Choromanski Diagnostic Snapshot",
     `Frontend: online`,
@@ -747,7 +914,7 @@ function SystemPanel({ backendUrl, rawCandles, runAction, selectedInterval, syst
     `Backend: ${system ? "online" : "offline"}`,
     `Bot: ${displayBotStatus(status.botStatus)}`,
     `BingX keys: ${bingx.apiConfigured ? "configured" : "not configured"}`,
-    `Futures balance: ${fmt(bingx.activeExecutionBalance ?? 0)} USDT`,
+    `Futures balance: ${fmt(futuresBalance)} USDT`,
     `Chart interval: ${selectedInterval}`,
     `Loaded candles: ${rawCandles.length}`,
     `Last candle: ${dateText(rawCandles.at(-1)?.time)}`,
@@ -783,13 +950,32 @@ function SystemPanel({ backendUrl, rawCandles, runAction, selectedInterval, syst
         <Metric label="Backend" value={system ? "Online" : "Syncing"} />
         <Metric label="Bot" value={displayBotStatus(status.botStatus)} />
         <Metric label="BingX" value={system ? (bingx.apiConfigured ? "Keys ready" : "No keys") : "Checking"} />
-        <Metric label="Futures USDT" value={fmt(bingx.activeExecutionBalance ?? 0)} />
+        <Metric label="Futures USDT" value={hasKnownProfileBalance(accountProfiles) || hasSystemBalance ? fmt(futuresBalance) : "Syncing"} />
         <Metric label="BingX sync" value={dateText(bingx.lastSyncAt)} />
-        <Metric label="Backend heartbeat" value={dateText(status.heartbeatAt)} />
-        <Metric label="Last price tick" value={dateText(status.lastTickAt)} />
-        <Metric label="Last candle" value={dateText(rawCandles.at(-1)?.time)} />
         <Metric label="Backend uptime" value={system?.summary?.uptimeSeconds ? `${Math.floor(system.summary.uptimeSeconds / 60)} min` : "--"} />
         <Metric label="Open orders" value={system?.summary?.openOrdersCount ?? 0} />
+        <Metric label="Active Battle Deck" value={system?.summary?.activeBattleDeck?.name ?? "None"} />
+      </div>
+
+      <div className="hubert-lab__subhead"><strong>API Profiles</strong><span>{accountProfiles.length}</span></div>
+      <div className="hubert-lab__table">
+        <table>
+          <thead>
+            <tr><th>Profile</th><th>Status</th><th>Futures USDT</th><th>Positions</th><th>Orders</th><th>Last sync</th></tr>
+          </thead>
+          <tbody>
+            {accountProfiles.map((profile) => (
+              <tr key={profile.id}>
+                <td>{profile.label}</td>
+                <td>{profile.status}</td>
+                <td>{profileBalanceText(profile)}</td>
+                <td>{profile.openPositions}</td>
+                <td>{profile.openOrders}</td>
+                <td>{dateText(profile.lastSyncAt)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
 
       <div className="hubert-lab__table">
@@ -810,9 +996,99 @@ function SystemPanel({ backendUrl, rawCandles, runAction, selectedInterval, syst
           </tbody>
         </table>
       </div>
-      {(system?.dataAvailability ?? []).map((row) => (
-        <MiniStatus key={row.interval}>{row.note ?? `${row.label} data unavailable right now.`}</MiniStatus>
-      ))}
+      <MiniStatus>
+        Data availability uses the configured safe candle limits. If a timeframe reaches its limit, more history can be added by raising max candles or connecting an external data source.
+      </MiniStatus>
+    </section>
+  );
+}
+
+function LivestreamPanel({ accountProfiles = [], livestream, onPositionAction, onRefresh }) {
+  const summary = livestream?.accountSummary ?? {};
+  const positions = livestream?.positions ?? [];
+  const profileRows = accountProfiles.length ? accountProfiles : (summary.apiProfiles ?? []);
+  const hasProfileBalance = hasKnownProfileBalance(profileRows);
+  const combinedBalance = hasProfileBalance
+    ? totalProfileBalance(profileRows)
+    : Number(summary.totalCombinedFuturesBalance ?? 0);
+  const hasSummaryBalance = summary.totalCombinedFuturesBalance !== null &&
+    summary.totalCombinedFuturesBalance !== undefined &&
+    Number.isFinite(Number(summary.totalCombinedFuturesBalance));
+
+  return (
+    <section className="hubert-lab__section">
+      <div className="hubert-lab__actions">
+        <button type="button" onClick={onRefresh}>Refresh Live</button>
+      </div>
+      <div className="hubert-lab__metrics">
+        <Metric label="Futures balance" value={hasProfileBalance || hasSummaryBalance ? fmt(combinedBalance) : "Syncing"} />
+        <Metric label="Unrealized PnL" value={fmt(summary.totalUnrealizedPnl ?? 0)} />
+        <Metric label="Session PnL" value={fmt(summary.totalRealizedSessionPnl ?? 0)} />
+        <Metric label="Margin used" value={fmt(summary.totalMarginUsed ?? 0)} />
+        <Metric label="Open notional" value={fmt(summary.totalOpenNotional ?? 0)} />
+        <Metric label="Open positions" value={summary.totalOpenPositions ?? 0} />
+      </div>
+      <MiniStatus>Last refresh: {dateText(summary.lastRefreshAt)}</MiniStatus>
+      {profileRows.length > 0 && (
+        <div className="hubert-lab__table">
+          <table>
+            <thead>
+              <tr><th>Account</th><th>Status</th><th>Futures USDT</th><th>Positions</th><th>Orders</th></tr>
+            </thead>
+            <tbody>
+              {profileRows.map((profile) => (
+                <tr key={profile.id}>
+                  <td>{profile.label}</td>
+                  <td>{profile.status}</td>
+                  <td>{profileBalanceText(profile)}</td>
+                  <td>{profile.openPositions ?? 0}</td>
+                  <td>{profile.openOrders ?? 0}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {positions.length === 0 ? (
+        <MiniStatus>No live positions are open right now.</MiniStatus>
+      ) : (
+        <div className="hubert-live-stack">
+          {positions.map((position) => (
+            <div className="hubert-live-card" key={`${position.symbol}-${position.side}-${position.apiProfile}`}>
+              <div className="hubert-live-card__head">
+                <strong>{position.symbol} {position.side}</strong>
+                <span>{position.battleDeckName ?? "Manual"} · {position.timeframe ?? "--"} · {position.apiProfile}</span>
+              </div>
+              <div className="hubert-lab__metrics">
+                <Metric label="Strategy" value={position.strategyDeckName ?? "--"} />
+                <Metric label="MM" value={position.mmDeckName ?? "--"} />
+                <Metric label="Entry" value={fmt(position.entryPrice)} />
+                <Metric label="Mark" value={fmt(position.currentPrice)} />
+                <Metric label="Quantity" value={fmt(position.quantity, 3)} />
+                <Metric label="Notional" value={fmt(position.notionalSize)} />
+                <Metric label="Margin" value={fmt(position.marginUsed)} />
+                <Metric label="Leverage" value={position.leverage ? `${fmt(position.leverage, 1)}x` : "--"} />
+                <Metric label="SL" value={fmt(position.stopLoss)} />
+                <Metric label="TP" value={fmt(position.takeProfit)} />
+                <Metric label="PnL" value={`${fmt(position.unrealizedPnl)} / ${fmt(position.pnlPercent)}%`} />
+                <Metric label="Distance to SL" value={position.distanceToSl ? `${fmt(position.distanceToSl)} (${fmt(position.distanceToSlPercent)}%)` : "--"} />
+                <Metric label="Distance to TP" value={position.distanceToTp ? `${fmt(position.distanceToTp)} (${fmt(position.distanceToTpPercent)}%)` : "--"} />
+                <Metric label="Duration" value={position.durationSeconds ? `${Math.floor(position.durationSeconds / 60)} min` : "--"} />
+                <Metric label="Priority" value={position.botPriority === "manual" ? "Manual" : "Bot"} />
+                <Metric label="Last action" value={position.lastAction ?? "--"} />
+              </div>
+              <OrderTable orders={position.attachedOrders ?? []} />
+              <div className="hubert-lab__actions">
+                <button type="button" onClick={() => onPositionAction(position, "CLOSE_POSITION")}>Close Position</button>
+                <button type="button" onClick={() => onPositionAction(position, "MOVE_SL")}>Move SL</button>
+                <button type="button" onClick={() => onPositionAction(position, "MOVE_TP")}>Move TP</button>
+                <button type="button" onClick={() => onPositionAction(position, "CANCEL_ATTACHED_ORDERS")}>Cancel Orders</button>
+                <button type="button" onClick={() => onPositionAction(position, null)}>Crisis Control</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </section>
   );
 }
@@ -858,17 +1134,29 @@ function IndicatorPanel({ loadedDays, rawCandles, selectedInterval, settings, up
   );
 }
 
-function StrategyDecksPanel({ decks, form, onApplyChart, onDelete, onDuplicate, onEdit, onFavorite, onSave, setForm }) {
+function StrategyDecksPanel({ decks, favorites, form, onApplyChart, onDelete, onDuplicate, onEdit, onFavorite, onSave, setForm }) {
+  const favoriteDecks = favorites
+    .filter((favorite) => favorite.category === "Strategy Decks")
+    .map((favorite) => decks.find((deck) => deck.id === favorite.itemId))
+    .filter(Boolean);
+
   return (
     <section className="hubert-lab__section">
       <div className="hubert-lab__subhead">
-        <strong>Choose Strategy Deck</strong>
+        <strong>Strategy Deck Builder</strong>
         <button type="button" disabled={decks.length >= 100} onClick={() => setForm(defaultStrategyDeck)}>
           Create New Strategy Deck
         </button>
       </div>
       {decks.length >= 100 && <MiniStatus tone="bad">You have 100 strategy decks. Delete or archive one before creating a new deck.</MiniStatus>}
-      <DeckList decks={decks} onEdit={onEdit} onDelete={onDelete} onDuplicate={onDuplicate} onFavorite={onFavorite} extra={(deck) => <button type="button" onClick={() => onApplyChart(deck)}>Apply to Chart</button>} />
+      <MiniStatus>Saving a deck adds it to Favorites. Favorites is the main library.</MiniStatus>
+      {favoriteDecks.length > 0 && (
+        <CompactOpenRow
+          items={favoriteDecks}
+          label="Open favorite"
+          onOpen={onEdit}
+        />
+      )}
       <DeckEditor title="Strategy Deck Editor" form={form} onSave={onSave}>
         <TextField label="Deck name" value={form.name} onChange={(value) => setForm({ ...form, name: value })} />
         <TextField label="Symbol" value={form.symbol} onChange={(value) => setForm({ ...form, symbol: value.toUpperCase() })} />
@@ -892,14 +1180,28 @@ function StrategyDecksPanel({ decks, form, onApplyChart, onDelete, onDuplicate, 
             ["atrPositionSizing", "ATR position sizing"],
           ]}
         />
+        {form.id && (
+          <div className="hubert-lab__actions">
+            <button type="button" onClick={() => onApplyChart(form)}>Apply to Chart</button>
+            <button type="button" onClick={() => onDuplicate(form)}>Duplicate</button>
+            <button type="button" onClick={() => onFavorite(form)}>Favorite</button>
+            <button type="button" onClick={() => onDelete(form)}>Delete</button>
+          </div>
+        )}
       </DeckEditor>
     </section>
   );
 }
 
-function BacktestsPanel({ form, mmDecks, onDelete, onFavorite, onHide, onRun, onSave, result, savedBacktests, setForm, strategyDecks }) {
+function BacktestsPanel({ favorites, form, mmDecks, onDelete, onFavorite, onHide, onRun, onSave, result, savedBacktests, setForm, strategyDecks }) {
+  const favoriteBacktests = favorites
+    .filter((favorite) => favorite.category === "Backtests")
+    .map((favorite) => savedBacktests.find((item) => item.id === favorite.itemId))
+    .filter(Boolean);
+
   return (
     <section className="hubert-lab__section">
+      <MiniStatus>Saved backtests automatically go to Favorites. Use this panel for the current run.</MiniStatus>
       <div className="hubert-lab__grid">
         <TextField label="Backtest name" value={form.name} onChange={(value) => setForm({ ...form, name: value })} />
         <SelectField label="Strategy Deck" value={form.strategyDeckId || strategyDecks[0]?.id || ""} onChange={(value) => setForm({ ...form, strategyDeckId: value })} options={strategyDecks.map((deck) => [deck.id, deck.name])} />
@@ -914,45 +1216,170 @@ function BacktestsPanel({ form, mmDecks, onDelete, onFavorite, onHide, onRun, on
         <button type="button" onClick={onSave}>Name & Save</button>
       </div>
       <BacktestResult result={result} />
-      <div className="hubert-lab__subhead"><strong>Saved Backtests</strong><span>{savedBacktests.length}/200</span></div>
-      <DeckList
-        decks={savedBacktests.filter((item) => !item.hidden)}
-        extra={(item) => <button type="button" onClick={() => onHide(item)}>Hide</button>}
-        onDelete={onDelete}
-        onFavorite={onFavorite}
-      />
+      {favoriteBacktests.length > 0 && (
+        <>
+          <div className="hubert-lab__subhead"><strong>Favorite Backtests</strong><span>{favoriteBacktests.length}</span></div>
+          <DeckList
+            decks={favoriteBacktests.slice(0, 4)}
+            extra={(item) => <button type="button" onClick={() => onHide(item)}>Hide</button>}
+            onDelete={onDelete}
+            onFavorite={onFavorite}
+          />
+        </>
+      )}
     </section>
   );
 }
 
-function MmDecksPanel({ decks, form, onDelete, onDuplicate, onEdit, onFavorite, onSave, setForm }) {
+function BacktestComparePanel({ compareIds, favorites, savedBacktests, setCompareIds }) {
+  const favoriteBacktests = favorites
+    .filter((favorite) => favorite.category === "Backtests")
+    .map((favorite) => savedBacktests.find((item) => item.id === favorite.itemId))
+    .filter(Boolean);
+  const selected = compareIds
+    .map((id) => savedBacktests.find((item) => item.id === id))
+    .filter(Boolean)
+    .slice(0, 4);
+  const explanation = compareExplanation(selected);
+
+  function toggle(id) {
+    setCompareIds((current) =>
+      current.includes(id)
+        ? current.filter((item) => item !== id)
+        : current.length >= 4
+          ? current
+          : [...current, id],
+    );
+  }
+
+  return (
+    <section className="hubert-lab__section">
+      <MiniStatus>Select 2-4 favorite backtests.</MiniStatus>
+      <div className="hubert-lab__toggles">
+        {favoriteBacktests.map((test) => (
+          <label key={test.id}>
+            <input checked={compareIds.includes(test.id)} type="checkbox" onChange={() => toggle(test.id)} />
+            <span>{test.name}</span>
+          </label>
+        ))}
+      </div>
+      {selected.length < 2 ? (
+        <MiniStatus>Choose at least two saved favorite backtests to compare.</MiniStatus>
+      ) : (
+        <>
+          <MiniStatus>{explanation}</MiniStatus>
+          <MultiCurveChart title="Equity Curves" results={selected} curveKey="equity" />
+          <MultiCurveChart title="Drawdown Curves" results={selected} curveKey="drawdown" />
+          <div className="hubert-lab__table">
+            <table>
+              <thead>
+                <tr><th>Backtest</th><th>Net</th><th>Net %</th><th>DD</th><th>PF</th><th>Win</th><th>Trades</th><th>Avg</th><th>Best</th><th>Worst</th></tr>
+              </thead>
+              <tbody>
+                {selected.map((test) => {
+                  const metrics = test.metrics ?? {};
+                  const netPercent = metrics.startingBalance ? metrics.netProfit / metrics.startingBalance * 100 : (metrics.netProfit / (test.config?.startingBalance ?? 10000)) * 100;
+                  return (
+                    <tr key={test.id}>
+                      <td>{test.name}</td>
+                      <td>{fmt(metrics.netProfit)}</td>
+                      <td>{fmt(netPercent)}%</td>
+                      <td>{fmt(metrics.maxDrawdown)}%</td>
+                      <td>{fmt(metrics.profitFactor)}</td>
+                      <td>{fmt(metrics.winRate)}%</td>
+                      <td>{metrics.totalTrades ?? 0}</td>
+                      <td>{fmt(metrics.averageTrade)}</td>
+                      <td>{fmt(metrics.largestWin)}</td>
+                      <td>{fmt(metrics.largestLoss)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+function compareExplanation(results) {
+  if (results.length < 2) return "Select backtests to compare.";
+  const byProfit = [...results].sort((a, b) => Number(b.metrics?.netProfit ?? 0) - Number(a.metrics?.netProfit ?? 0));
+  const byDrawdown = [...results].sort((a, b) => Number(a.metrics?.maxDrawdown ?? Infinity) - Number(b.metrics?.maxDrawdown ?? Infinity));
+  return `${byProfit[0].name} earns more, while ${byDrawdown[0].name} has the lower drawdown. Use both numbers together, not one alone.`;
+}
+
+function MultiCurveChart({ curveKey, results, title }) {
+  const colors = ["#050505", "#5c5c5c", "#ffffff", "rgba(120,24,24,0.82)"];
+
+  return (
+    <div className="hubert-chart-box">
+      <strong>{title}</strong>
+      <span>{curveKey === "drawdown" ? "Higher line means deeper drawdown." : "Higher line means higher equity."}</span>
+      <svg className="hubert-lab__equity" viewBox="0 0 100 100" preserveAspectRatio="none">
+        {results.map((result, index) => (
+          <polyline
+            key={result.id}
+            points={curveKey === "drawdown" ? drawdownPolyline(result.equityCurve) : equityPolyline(result.equityCurve)}
+            stroke={colors[index % colors.length]}
+            style={{ stroke: colors[index % colors.length] }}
+          />
+        ))}
+      </svg>
+      <div className="hubert-chart-legend">
+        {results.map((result, index) => (
+          <span key={result.id}><b style={{ background: colors[index % colors.length] }} />{result.name}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MmDecksPanel({ decks, favorites, form, onDelete, onDuplicate, onEdit, onFavorite, onSave, setForm }) {
+  const favoriteDecks = favorites
+    .filter((favorite) => favorite.category === "MM Decks")
+    .map((favorite) => decks.find((deck) => deck.id === favorite.itemId))
+    .filter(Boolean);
+
   return (
     <section className="hubert-lab__section">
       <div className="hubert-lab__subhead">
-        <strong>Choose MM Deck</strong>
+        <strong>MM Deck Builder</strong>
         <button type="button" disabled={decks.length >= 100} onClick={() => setForm(defaultMmDeck)}>Create New MM Deck</button>
       </div>
       {decks.length >= 100 && <MiniStatus tone="bad">You have 100 MM decks. Delete or archive one before creating a new deck.</MiniStatus>}
-      <DeckList decks={decks} onEdit={onEdit} onDelete={onDelete} onDuplicate={onDuplicate} onFavorite={onFavorite} />
+      <MiniStatus>Saving an MM deck adds it to Favorites. Keep this panel focused on editing.</MiniStatus>
+      {favoriteDecks.length > 0 && (
+        <CompactOpenRow items={favoriteDecks} label="Open favorite" onOpen={onEdit} />
+      )}
       <DeckEditor title="MM Deck Editor" form={form} onSave={onSave}>
         <TextField label="MM deck name" value={form.name} onChange={(value) => setForm({ ...form, name: value })} />
         <SelectField label="Mode" value={form.mode} onChange={(value) => setForm({ ...form, mode: value })} options={[["run", "Run"], ["constant", "Constant"]]} />
         {form.mode === "run" ? (
           <>
-            <NumberField label="1 SL = % equity" value={form.oneSlPercent} step="0.1" onChange={(value) => setForm({ ...form, oneSlPercent: value })} help="When ATR sizing is ON, this is the total account loss if SL is hit." />
-            <NumberField label="1% price move = % equity" value={form.onePercentMovePercent} step="0.1" onChange={(value) => setForm({ ...form, onePercentMovePercent: value })} help="When ATR sizing is OFF, this defines raw market exposure." />
+            <NumberField label="Risk per SL hit = % equity" value={form.oneSlPercent} step="0.1" onChange={(value) => setForm({ ...form, oneSlPercent: value })} help="Used when the Strategy Deck has ATR position sizing ON." />
+            <NumberField label="Position size = % equity" value={form.positionPercent ?? 10} step="1" onChange={(value) => setForm({ ...form, positionPercent: value })} help="Used when the Strategy Deck has ATR position sizing OFF." />
           </>
         ) : (
           <NumberField label="Every trade = USDT" value={form.fixedNotional} step="10" onChange={(value) => setForm({ ...form, fixedNotional: value })} />
+        )}
+        {form.id && (
+          <div className="hubert-lab__actions">
+            <button type="button" onClick={() => onDuplicate(form)}>Duplicate</button>
+            <button type="button" onClick={() => onFavorite(form)}>Favorite</button>
+            <button type="button" onClick={() => onDelete(form)}>Delete</button>
+          </div>
         )}
       </DeckEditor>
     </section>
   );
 }
 
-function DecisionPanel({ decision, estimate, mmDecks, onCreate, setDecision, strategyDecks }) {
+function DecisionPanel({ accountProfiles, decision, estimate, mmDecks, onCreate, setDecision, strategyDecks }) {
   const strategy = strategyDecks.find((deck) => deck.id === decision.strategyDeckId);
   const mm = mmDecks.find((deck) => deck.id === decision.mmDeckId);
+  const selectedProfile = accountProfiles.find((profile) => profile.id === decision.apiProfile);
 
   return (
     <section className="hubert-lab__section">
@@ -962,7 +1389,7 @@ function DecisionPanel({ decision, estimate, mmDecks, onCreate, setDecision, str
         <SelectField label="MM Deck" value={decision.mmDeckId} onChange={(value) => setDecision({ ...decision, mmDeckId: value })} options={mmDecks.map((deck) => [deck.id, deck.name])} />
         <TextField label="Symbol" value={decision.symbol} onChange={(value) => setDecision({ ...decision, symbol: value.toUpperCase() })} />
         <SelectField label="Timeframe" value={decision.timeframe} onChange={(value) => setDecision({ ...decision, timeframe: value })} options={TIMEFRAMES.map((item) => [item.interval, item.label])} />
-        <SelectField label="API profile" value={decision.apiProfile} onChange={(value) => setDecision({ ...decision, apiProfile: value })} options={[["main", "Main Account"], ["15m-subaccount", "15m Subaccount"], ["30m-subaccount", "30m Subaccount"]]} />
+        <SelectField label="API profile" value={decision.apiProfile} onChange={(value) => setDecision({ ...decision, apiProfile: value })} options={(accountProfiles.length ? accountProfiles : [{ id: "main", label: "Main Account" }]).map((profile) => [profile.id, profile.label])} />
       </div>
       <MiniStatus tone={estimate.ready ? "good" : "bad"}>
         You selected {strategy?.name ?? "no Strategy Deck"} and {mm?.name ?? "no MM Deck"} for {decision.symbol} {decision.timeframe}.
@@ -970,6 +1397,9 @@ function DecisionPanel({ decision, estimate, mmDecks, onCreate, setDecision, str
       <div className="hubert-decision-lines">
         {estimate.lines.map((line) => <span key={line}>{line}</span>)}
       </div>
+      <MiniStatus>
+        {(selectedProfile?.status ?? "Profile status unknown")} · Balance {selectedProfile ? profileBalanceText(selectedProfile) : "Syncing"} USDT.
+      </MiniStatus>
       <MiniStatus>Recommended: use separate subaccount/API for each active interval on the same symbol to avoid position conflicts.</MiniStatus>
       <div className="hubert-lab__actions">
         <button type="button" onClick={onCreate}>Create Battle Deck</button>
@@ -993,10 +1423,14 @@ function BattleDecksPanel({ decks, onDelete, onDuplicate, onFavorite, onSend }) 
   );
 }
 
-function ExecutionPanel({ battleDecks, executionDeckId, onAction, rawCandles, selectedBattleDeck, setExecutionDeckId, status }) {
+function ExecutionPanel({ accountProfiles, battleDecks, executionDeckId, onAction, rawCandles, selectedBattleDeck, setActivePanel, setExecutionDeckId, status }) {
   const state = status?.state ?? {};
   const bingx = state.bingx ?? {};
-  const ready = Boolean(selectedBattleDeck && bingx.apiConfigured && Number(bingx.activeExecutionBalance ?? 0) > 0 && status);
+  const selectedProfile =
+    accountProfiles.find((profile) => profile.id === (selectedBattleDeck?.apiProfile ?? "main")) ??
+    accountProfiles[0];
+  const executionBalance = Number(selectedProfile?.futuresBalance ?? bingx.activeExecutionBalance ?? 0);
+  const ready = Boolean(selectedBattleDeck && bingx.apiConfigured && executionBalance > 0 && status);
   const exchangePosition = status?.summary?.openPosition ?? bingx.openPositions?.[0] ?? null;
   const openOrders = bingx.openOrders ?? [];
   const currentPrice = rawCandles.at(-1)?.close;
@@ -1013,8 +1447,9 @@ function ExecutionPanel({ battleDecks, executionDeckId, onAction, rawCandles, se
       <div className="hubert-lab__metrics">
         <Metric label="Bot status" value={displayBotStatus(state.botStatus)} />
         <Metric label="Active deck" value={selectedBattleDeck?.name ?? "--"} />
+        <Metric label="API profile" value={selectedBattleDeck?.apiProfile ?? "--"} />
         <Metric label="Current price" value={fmt(currentPrice)} />
-        <Metric label="Futures balance" value={fmt(bingx.activeExecutionBalance ?? 0)} />
+        <Metric label="Futures balance" value={fmt(executionBalance)} />
         <Metric label="Position" value={exchangePosition ? `${exchangePosition.symbol ?? selectedBattleDeck?.symbol} ${exchangePosition.positionSide ?? exchangePosition.side ?? ""}` : "None"} />
         <Metric label="Open orders" value={openOrders.length} />
         <Metric label="Last signal" value={state.lastStrategySignal?.direction ?? "--"} />
@@ -1022,6 +1457,7 @@ function ExecutionPanel({ battleDecks, executionDeckId, onAction, rawCandles, se
       </div>
       <div className="hubert-lab__actions hubert-lab__actions--sticky">
         <button disabled={!ready} type="button" onClick={() => onAction("/execution/start", "Start Bot", { battleDeckId: selectedBattleDeck?.id, confirm: "START_LIVE" })}>Start Bot</button>
+        <button type="button" onClick={() => setActivePanel("Livestream")}>Open Livestream</button>
         <button type="button" onClick={() => onAction("/execution/pause", "Pause Bot")}>Pause Bot</button>
         <button type="button" onClick={() => onAction("/execution/resume", "Resume Bot")}>Resume Bot</button>
         <button type="button" onClick={() => onAction("/execution/stop", "Stop Bot")}>Stop Bot</button>
@@ -1036,6 +1472,7 @@ function ExecutionPanel({ battleDecks, executionDeckId, onAction, rawCandles, se
 
 function CrisisPanel({
   form,
+  livestream,
   message,
   onCrisisOff,
   onCrisisOn,
@@ -1046,12 +1483,15 @@ function CrisisPanel({
   setPendingAction,
   symbol,
 }) {
+  const positions = livestream?.positions ?? [];
+  const activePosition = positions.find((position) => compact(position.symbol) === compact(form.symbol || symbol)) ?? positions[0];
   const actions = [
     ["MARKET_LONG", "Market Long", "Sends a real market long with the quantity below."],
     ["MARKET_SHORT", "Market Short", "Sends a real market short with the quantity below."],
     ["MOVE_SL", "Move SL", "Places a new stop-loss order for the open BingX position."],
     ["MOVE_TP", "Move TP", "Places a new take-profit order for the open BingX position."],
     ["CLOSE_POSITION", "Close Position", "Requests BingX to close the full symbol position."],
+    ["CLOSE_PARTIAL", "Close Partial", "Sends a reduce-only market order for the quantity below."],
     ["CANCEL_ALL", "Cancel All Orders", "Cancels open orders for this symbol."],
   ];
 
@@ -1065,6 +1505,7 @@ function CrisisPanel({
     if (!pendingAction) return;
     onManualAction({
       action: pendingAction,
+      apiProfile: form.apiProfile ?? activePosition?.apiProfile ?? "main",
       quantity: Number(form.quantity),
       stopPrice: Number(form.stopPrice),
       symbol: form.symbol || symbol || "SOLUSDT",
@@ -1075,6 +1516,25 @@ function CrisisPanel({
   return (
     <section className="hubert-lab__section">
       <MiniStatus>Crisis Management ON gives manual control priority. New bot entries stay blocked while you act.</MiniStatus>
+      {activePosition ? (
+        <div className="hubert-live-card">
+          <div className="hubert-live-card__head">
+            <strong>{activePosition.symbol} {activePosition.side}</strong>
+            <span>{activePosition.battleDeckName ?? "Exchange position"} · {activePosition.apiProfile}</span>
+          </div>
+          <div className="hubert-lab__metrics">
+            <Metric label="Entry" value={fmt(activePosition.entryPrice)} />
+            <Metric label="Mark" value={fmt(activePosition.currentPrice)} />
+            <Metric label="Quantity" value={fmt(activePosition.quantity, 3)} />
+            <Metric label="PnL" value={fmt(activePosition.unrealizedPnl)} />
+            <Metric label="SL" value={fmt(activePosition.stopLoss)} />
+            <Metric label="TP" value={fmt(activePosition.takeProfit)} />
+          </div>
+          <OrderTable orders={activePosition.attachedOrders ?? []} />
+        </div>
+      ) : (
+        <MiniStatus>No live position is currently reported. Manual open actions still require a symbol and quantity.</MiniStatus>
+      )}
       <div className="hubert-lab__actions">
         <button type="button" onClick={onCrisisOn}>Crisis Management ON</button>
         <button type="button" onClick={onCrisisOff}>Crisis Management OFF</button>
@@ -1143,13 +1603,22 @@ function CommunicationPanel({ communication, onSave, onTest, setCommunication })
           </select>
         </label>
         <TextField label="Telegram chat id" value={communication.telegramChatId ?? ""} onChange={(value) => setCommunication({ ...communication, telegramChatId: value })} />
-        <TextField label="Telegram bot token" value={communication.telegramBotToken ?? ""} onChange={(value) => setCommunication({ ...communication, telegramBotToken: value })} />
         <ReadOnly label="Token state" value={communication.telegramBotTokenConfigured ? "Configured" : "Not configured"} />
+        <ReadOnly label="Chat id state" value={communication.telegramChatId ? "Configured" : "Missing"} />
       </div>
       <ToggleGrid
         values={alertTypes}
         onChange={(key, value) => setCommunication({ ...communication, alertTypes: { ...alertTypes, [key]: value } })}
-        items={Object.keys(alertTypes).map((key) => [key, key.replace(/([A-Z])/g, " $1")])}
+        items={[
+          ["botStarted", "Bot started"],
+          ["botStopped", "Bot stopped"],
+          ["positionOpened", "Position opened"],
+          ["positionClosed", "Position closed"],
+          ["slMoved", "SL moved"],
+          ["tpMoved", "TP moved"],
+          ["orderRejected", "Error"],
+          ["dailySummary", "Daily summary"],
+        ]}
       />
       <div className="hubert-lab__actions">
         <button type="button" onClick={onSave}>Save Alerts</button>
@@ -1159,7 +1628,59 @@ function CommunicationPanel({ communication, onSave, onTest, setCommunication })
   );
 }
 
-function FavoritesPanel({ favorites, onDelete, onOpen }) {
+function AiPanel({ aiContext, messages, onAsk, question, setAiContext, setMessages, setQuestion }) {
+  const examples = [
+    "Explain why Backtest 1 made more than Backtest 2.",
+    "Is this drawdown dangerous?",
+    "Why can't I move SL?",
+    "Which deck is currently strongest?",
+    "Explain this platform error like I am a beginner.",
+  ];
+
+  return (
+    <section className="hubert-lab__section">
+      <MiniStatus>AI runs through the backend. If no key is configured, this panel will tell you cleanly.</MiniStatus>
+      <ToggleGrid
+        values={aiContext}
+        onChange={(key, value) => setAiContext({ ...aiContext, [key]: value })}
+        items={[
+          ["includeDecks", "Decks"],
+          ["includeBacktests", "Backtests"],
+          ["includeLivePositions", "Live positions"],
+          ["includeAnalytics", "Analytics"],
+          ["includeSystemStatus", "System status"],
+        ]}
+      />
+      <div className="hubert-ai-examples">
+        {examples.map((example) => (
+          <button key={example} type="button" onClick={() => setQuestion(example)}>{example}</button>
+        ))}
+      </div>
+      <label>
+        <span>Ask AI</span>
+        <textarea value={question} onChange={(event) => setQuestion(event.target.value)} />
+      </label>
+      <div className="hubert-lab__actions">
+        <button type="button" onClick={onAsk}>Send</button>
+        <button type="button" onClick={() => setMessages([])}>Clear</button>
+      </div>
+      <div className="hubert-chat-log">
+        {messages.length === 0 ? (
+          <MiniStatus>No AI messages yet.</MiniStatus>
+        ) : (
+          messages.map((message, index) => (
+            <div className="hubert-chat-message" data-role={message.role} key={`${message.time}-${index}`}>
+              <strong>{message.role === "user" ? "You" : "AI"}</strong>
+              <span>{message.text}</span>
+            </div>
+          ))
+        )}
+      </div>
+    </section>
+  );
+}
+
+function FavoritesPanel({ favorites, onDelete, onOpen, onRename }) {
   const groups = ["Strategy Decks", "MM Decks", "Battle Decks", "Backtests", "Analytics Reports"];
 
   return (
@@ -1169,7 +1690,12 @@ function FavoritesPanel({ favorites, onDelete, onOpen }) {
           <div className="hubert-lab__subhead"><strong>{group}</strong><span>{favorites.filter((item) => item.category === group).length}</span></div>
           <DeckList
             decks={favorites.filter((item) => item.category === group)}
-            extra={(favorite) => <button type="button" onClick={() => onOpen(favorite)}>Open</button>}
+            extra={(favorite) => (
+              <>
+                <button type="button" onClick={() => onOpen(favorite)}>Open</button>
+                <button type="button" onClick={() => onRename(favorite)}>Rename</button>
+              </>
+            )}
             onDelete={onDelete}
           />
         </div>
@@ -1190,6 +1716,26 @@ function DeckEditor({ children, form, onSave, title }) {
         <button type="button" onClick={onSave}>Save</button>
       </div>
     </div>
+  );
+}
+
+function CompactOpenRow({ items, label, onOpen }) {
+  return (
+    <label>
+      <span>{label}</span>
+      <select
+        value=""
+        onChange={(event) => {
+          const item = items.find((entry) => entry.id === event.target.value);
+          if (item) onOpen(item);
+        }}
+      >
+        <option value="">Choose</option>
+        {items.map((item) => (
+          <option key={item.id} value={item.id}>{item.name}</option>
+        ))}
+      </select>
+    </label>
   );
 }
 
@@ -1222,6 +1768,7 @@ function DeckList({ decks, extra, onDelete, onDuplicate, onEdit, onFavorite }) {
 function BacktestResult({ result }) {
   if (!result) return <MiniStatus>Run a backtest to see equity, trades, and analysis.</MiniStatus>;
   const metrics = result.metrics;
+  const audit = sizingAudit(result.trades);
 
   return (
     <>
@@ -1236,13 +1783,19 @@ function BacktestResult({ result }) {
         <Metric label="Best trade" value={fmt(metrics.largestWin)} />
         <Metric label="Worst trade" value={fmt(metrics.largestLoss)} />
       </div>
-      <svg className="hubert-lab__equity" viewBox="0 0 100 100" preserveAspectRatio="none">
-        <polyline points={equityPolyline(result.equityCurve)} />
-      </svg>
-      <svg className="hubert-lab__equity hubert-lab__equity--drawdown" viewBox="0 0 100 100" preserveAspectRatio="none">
-        <polyline points={drawdownPolyline(result.equityCurve)} />
-      </svg>
+      <SingleCurveChart title="Equity Curve" caption="Higher line means higher account equity." points={equityPolyline(result.equityCurve)} />
+      <SingleCurveChart title="Drawdown Curve" caption="Higher red line means deeper drawdown from the last equity peak." points={drawdownPolyline(result.equityCurve)} drawdown />
       <MiniStatus>{analyzeBacktest(result)}</MiniStatus>
+      <div className="hubert-lab__subhead"><strong>Position Sizing Audit</strong><span>transparent sizing</span></div>
+      <div className="hubert-lab__metrics">
+        <Metric label="Average size" value={fmt(audit.averageSize)} />
+        <Metric label="Min size" value={fmt(audit.minSize)} />
+        <Metric label="Max size" value={fmt(audit.maxSize)} />
+        <Metric label="Average leverage" value={`${fmt(audit.averageLeverage, 1)}x`} />
+        <Metric label="Average risk" value={fmt(audit.averageRisk)} />
+        <Metric label="Biggest exposure" value={fmt(audit.biggestExposure)} />
+      </div>
+      <MiniStatus>{audit.note}</MiniStatus>
       <div className="hubert-lab__actions">
         <button type="button" onClick={() => exportJson(`${result.name ?? "backtest"}.json`, result)}>Export JSON</button>
         <button type="button" onClick={() => exportCsv(`${result.name ?? "backtest"}-trades.csv`, result.trades)}>Export CSV</button>
@@ -1250,6 +1803,18 @@ function BacktestResult({ result }) {
       <SideBreakdown trades={result.trades} />
       <TradeTable trades={result.trades} />
     </>
+  );
+}
+
+function SingleCurveChart({ caption, drawdown = false, points, title }) {
+  return (
+    <div className="hubert-chart-box">
+      <strong>{title}</strong>
+      <span>{caption}</span>
+      <svg className={`hubert-lab__equity${drawdown ? " hubert-lab__equity--drawdown" : ""}`} viewBox="0 0 100 100" preserveAspectRatio="none">
+        <polyline points={points} />
+      </svg>
+    </div>
   );
 }
 
@@ -1280,15 +1845,18 @@ function TradeTable({ trades }) {
     <div className="hubert-lab__table">
       <table>
         <thead>
-          <tr><th>Time</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th></tr>
+          <tr><th>Time</th><th>Side</th><th>Size</th><th>Lev</th><th>Margin</th><th>SL dist</th><th>Risk</th><th>PnL</th><th>Reason</th></tr>
         </thead>
         <tbody>
           {(trades ?? []).slice(-80).map((trade, index) => (
             <tr key={trade.id ?? `${trade.entryTime}-${index}`}>
               <td>{dateText(trade.entryTime)}</td>
               <td>{trade.direction ?? trade.side}</td>
-              <td>{fmt(trade.entryPrice)}</td>
-              <td>{fmt(trade.exitPrice)}</td>
+              <td>{fmt(trade.size)}</td>
+              <td>{trade.assumedLeverage ? `${fmt(trade.assumedLeverage, 1)}x` : "--"}</td>
+              <td>{fmt(trade.marginRequired)}</td>
+              <td>{trade.slDistancePercent ? `${fmt(trade.slDistancePercent * 100)}%` : "--"}</td>
+              <td>{fmt(trade.riskAmount)}</td>
               <td>{fmt(trade.netPnl ?? trade.pnl)}</td>
               <td>{trade.exitReason ?? trade.reason ?? "--"}</td>
             </tr>

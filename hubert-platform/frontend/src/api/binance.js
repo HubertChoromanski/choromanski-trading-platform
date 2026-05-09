@@ -99,11 +99,11 @@ export async function fetchSolKlines(interval = "15m", limit = 1000) {
     throw new Error(`Unsupported Binance interval: ${interval}`);
   }
 
-  const requestedLimit = Math.max(1, Math.min(Number(limit) || 1000, 5000));
+  const requestedLimit = Math.max(1, Math.min(Number(limit) || 1000, 10000));
   const customInterval = CUSTOM_INTERVALS[interval];
   const requestInterval = customInterval?.base ?? interval;
   const requestLimit = customInterval
-    ? Math.min(5000, requestedLimit * (customInterval.minutes / intervalMinutes(requestInterval)) + 8)
+    ? Math.min(50000, requestedLimit * (customInterval.minutes / intervalMinutes(requestInterval)) + 8)
     : requestedLimit;
   const chunkLimit = 1000;
   let remaining = requestLimit;

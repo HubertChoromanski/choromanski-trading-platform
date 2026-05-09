@@ -53,9 +53,13 @@ function closePosition({ candle, equity, exitPrice, position, reason, slippagePe
       exitReason: reason,
       exitTime: candle.time,
       grossPnl,
+      assumedLeverage: position.assumedLeverage,
       netPnl,
+      marginRequired: position.marginRequired,
       returnPercent: position.notional === 0 ? 0 : (netPnl / position.notional) * 100,
+      riskAmount: position.riskAmount,
       setupId: position.setupId,
+      slDistancePercent: position.slDistancePercent,
       size: position.notional,
     },
   };
@@ -66,29 +70,36 @@ function openPosition({ candle, config, direction, equity, event }) {
   const entryPrice = applySlippage(rawEntry, direction, "entry", config.slippagePercent);
   const slDistancePercent = Math.abs(entryPrice - event.stopLoss) / entryPrice;
   const mmDeck = config.mmDeck;
+  const atrSizing = config.atrPositionSizing !== false;
   const notional =
     mmDeck?.mode === "constant"
       ? Number(mmDeck.fixedNotional ?? 0)
-      : mmDeck && config.atrPositionSizing !== false
+      : mmDeck && atrSizing
         ? slDistancePercent > 0
-          ? (equity * (Number(mmDeck.oneSlPercent ?? 1) / 100)) / slDistancePercent
+          ? (equity * (Number(mmDeck.oneSlPercent ?? mmDeck.riskPerSlPercent ?? 1) / 100)) / slDistancePercent
           : 0
         : mmDeck
-          ? equity * Number(mmDeck.onePercentMovePercent ?? 1)
+          ? equity * (Number(mmDeck.positionPercent ?? mmDeck.onePercentMovePercent ?? 10) / 100)
           : equity * (config.positionSizePercent / 100);
   const quantity = entryPrice === 0 ? 0 : notional / entryPrice;
   const entryCommission = notional * (config.commissionPercent / 100);
+  const assumedLeverage = equity > 0 && notional > 0 ? Math.max(1, Math.ceil(notional / equity)) : 1;
+  const riskAmount = mmDeck && atrSizing ? equity * (Number(mmDeck.oneSlPercent ?? mmDeck.riskPerSlPercent ?? 1) / 100) : slDistancePercent * notional;
 
   return {
+    assumedLeverage,
     commissionRate: config.commissionPercent / 100,
     direction,
     entryCommission,
     entryIndex: event.index,
     entryPrice,
     entryTime: event.time,
+    marginRequired: notional / assumedLeverage,
     notional,
     quantity,
+    riskAmount,
     setupId: event.setupId,
+    slDistancePercent,
     stopLoss: event.stopLoss,
   };
 }

@@ -89,9 +89,9 @@ async function requestKlines({ endTime, interval, limit, symbol }) {
 export async function fetchCandles({ limit = 1000, symbol, timeframe }) {
   const custom = CUSTOM_INTERVALS[timeframe];
   const interval = custom?.base ?? timeframe;
-  const requestedLimit = Math.max(1, Math.min(Number(limit) || 1000, 5000));
+  const requestedLimit = Math.max(1, Math.min(Number(limit) || 1000, 10000));
   const requestLimit = custom
-    ? Math.min(5000, requestedLimit * (custom.minutes / intervalMinutes(interval)) + 8)
+    ? Math.min(50000, requestedLimit * (custom.minutes / intervalMinutes(interval)) + 8)
     : requestedLimit;
   const chunks = [];
   let endTime = undefined;

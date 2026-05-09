@@ -34,9 +34,11 @@ const timeframes = [
 ];
 const toolButtons = [
   "System",
+  "Livestream",
   "Indicator",
   "Strategy Decks",
   "Backtests",
+  "Compare",
   "MM Decks",
   "Decision",
   "Battle Decks",
@@ -44,6 +46,7 @@ const toolButtons = [
   "Crisis",
   "Analytics",
   "Communication",
+  "AI",
   "Favorites",
 ];
 const defaultSettings = {
@@ -88,7 +91,7 @@ function historyDaysToLimit(interval, days) {
   };
   const minutes = minutesByInterval[interval] ?? 15;
   const requested = Math.ceil(Number(days || 31) * 1440 / minutes);
-  const maxLimit = interval === "4h" ? 2000 : 5000;
+  const maxLimit = interval === "4h" ? 5000 : 10000;
 
   return Math.max(100, Math.min(maxLimit, requested));
 }

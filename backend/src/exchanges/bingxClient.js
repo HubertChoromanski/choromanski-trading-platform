@@ -97,6 +97,16 @@ export function createBingxClient({
       });
     },
 
+    async placeReduceOnlyMarketOrder(symbol, side, quantity) {
+      return request("POST", "/openApi/swap/v2/trade/order", {
+        quantity,
+        reduceOnly: true,
+        side,
+        symbol: normalizeSymbol(symbol),
+        type: "MARKET",
+      });
+    },
+
     async placeStopLoss(symbol, side, stopPrice, quantity) {
       const closeSide = side === "BUY" ? "SELL" : "BUY";
       return request("POST", "/openApi/swap/v2/trade/order", {

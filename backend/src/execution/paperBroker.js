@@ -6,7 +6,7 @@ export function calculatePaperPositionSize({ entryPrice, equity, risk, stopLoss 
     mode === "fixed-usdt"
       ? Number(risk.fixedNotional ?? 0)
       : mode === "percent-move"
-        ? equity * Number(risk.priceMoveRiskPercent ?? 1)
+        ? equity * (Number(risk.priceMoveRiskPercent ?? 10) / 100)
         : slDistancePercent > 0
           ? riskAmount / slDistancePercent
           : 0;

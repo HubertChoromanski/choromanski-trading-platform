@@ -22,13 +22,25 @@ await store.setState({
 });
 const botRunner = createBotRunner({ bingxClient, store });
 
+const DEFAULT_MAX_CANDLES = {
+  "10m": 10000,
+  "15m": 10000,
+  "20m": 10000,
+  "30m": 10000,
+  "1h": 10000,
+  "4h": 5000,
+};
+const maxCandlesPerTimeframe = {
+  ...DEFAULT_MAX_CANDLES,
+  ...JSON.parse(process.env.MAX_CANDLES_PER_TIMEFRAME_JSON || "{}"),
+};
 const TIMEFRAMES = [
-  { label: "10m", interval: "10m", minutes: 10, maxCandles: 3000 },
-  { label: "15m", interval: "15m", minutes: 15, maxCandles: 3000 },
-  { label: "20m", interval: "20m", minutes: 20, maxCandles: 3000 },
-  { label: "30m", interval: "30m", minutes: 30, maxCandles: 3000 },
-  { label: "1H", interval: "1h", minutes: 60, maxCandles: 3000 },
-  { label: "4H", interval: "4h", minutes: 240, maxCandles: 2000 },
+  { label: "10m", interval: "10m", minutes: 10, maxCandles: maxCandlesPerTimeframe["10m"] },
+  { label: "15m", interval: "15m", minutes: 15, maxCandles: maxCandlesPerTimeframe["15m"] },
+  { label: "20m", interval: "20m", minutes: 20, maxCandles: maxCandlesPerTimeframe["20m"] },
+  { label: "30m", interval: "30m", minutes: 30, maxCandles: maxCandlesPerTimeframe["30m"] },
+  { label: "1H", interval: "1h", minutes: 60, maxCandles: maxCandlesPerTimeframe["1h"] },
+  { label: "4H", interval: "4h", minutes: 240, maxCandles: maxCandlesPerTimeframe["4h"] },
 ];
 
 const COLLECTION_ROUTES = {
@@ -38,6 +50,16 @@ const COLLECTION_ROUTES = {
   "/favorites": { name: "favorites", limit: 500 },
   "/backtests": { name: "backtests", limit: 200 },
 };
+const apiProfiles = createApiProfiles();
+let availabilityCache = {
+  expiresAt: 0,
+  rows: [],
+};
+let apiProfilesCache = {
+  expiresAt: 0,
+  rows: [],
+};
+let apiProfilesPromise = null;
 
 if (bingxClient.auth.configured) {
   try {
@@ -210,6 +232,130 @@ function safePublicCommunication(settings) {
   };
 }
 
+function createApiProfiles() {
+  const profiles = new Map();
+  const addProfile = ({ id, key, label, secret }) => {
+    const normalizedId = String(id).toLowerCase();
+    profiles.set(normalizedId, {
+      client: createBingxClient({ apiKey: key, apiSecret: secret }),
+      id: normalizedId,
+      label,
+      type: normalizedId === "main" ? "main" : "subaccount",
+    });
+  };
+
+  addProfile({
+    id: "main",
+    key: process.env.BINGX_PROFILE_MAIN_KEY || process.env.BINGX_API_KEY,
+    label: "Main Account",
+    secret: process.env.BINGX_PROFILE_MAIN_SECRET || process.env.BINGX_API_SECRET,
+  });
+
+  Object.entries(process.env).forEach(([key, value]) => {
+    const match = key.match(/^BINGX_PROFILE_(.+)_KEY$/u);
+
+    if (!match || match[1] === "MAIN") return;
+
+    const profileKey = match[1];
+    const secret = process.env[`BINGX_PROFILE_${profileKey}_SECRET`];
+    const label = process.env[`BINGX_PROFILE_${profileKey}_LABEL`] ?? `${profileKey.replaceAll("_", " ")} Account`;
+    addProfile({
+      id: profileKey.toLowerCase().replaceAll("_", "-"),
+      key: value,
+      label,
+      secret,
+    });
+  });
+
+  return profiles;
+}
+
+function getApiProfileClient(profileId = "main") {
+  return apiProfiles.get(String(profileId || "main").toLowerCase())?.client ?? bingxClient;
+}
+
+async function publicApiProfiles() {
+  if (apiProfilesCache.expiresAt > Date.now() && apiProfilesCache.rows.length > 0) {
+    return apiProfilesCache.rows;
+  }
+
+  if (apiProfilesPromise) {
+    return apiProfilesPromise;
+  }
+
+  apiProfilesPromise = loadPublicApiProfiles();
+
+  try {
+    return await apiProfilesPromise;
+  } finally {
+    apiProfilesPromise = null;
+  }
+}
+
+async function loadPublicApiProfiles() {
+  const rows = [];
+
+  for (const profile of apiProfiles.values()) {
+    const cached = apiProfilesCache.rows.find((row) => row.id === profile.id);
+    const configured = profile.client.auth.configured;
+    let futuresBalance = null;
+    let lastSyncAt = null;
+    let openOrders = [];
+    let openPositions = [];
+    let status = configured ? "configured" : "missing keys";
+
+    if (configured) {
+      try {
+        const [balance, positions, orders] = await Promise.all([
+          profile.client.getPerpetualFuturesBalance(),
+          profile.client.getOpenPositions(),
+          profile.client.getOpenOrders(),
+        ]);
+        futuresBalance = extractBalanceAmount(balance);
+        openPositions = normalizeExchangeList(positions).filter((position) => positionAmount(position) > 0);
+        openOrders = normalizeExchangeList(orders);
+        lastSyncAt = new Date().toISOString();
+        status = "connected";
+      } catch (error) {
+        futuresBalance = cached?.futuresBalance ?? null;
+        openPositions = Array.from({ length: Number(cached?.openPositions ?? 0) });
+        openOrders = Array.from({ length: Number(cached?.openOrders ?? 0) });
+        lastSyncAt = cached?.lastSyncAt ?? null;
+        status = `sync delayed: ${humanBackendError(error)}`;
+      }
+    }
+
+    rows.push({
+      configured,
+      futuresBalance,
+      id: profile.id,
+      label: profile.label,
+      lastSyncAt,
+      openOrders: openOrders.length,
+      openPositions: openPositions.length,
+      status,
+      type: profile.type,
+    });
+  }
+
+  apiProfilesCache = {
+    expiresAt: Date.now() + 15_000,
+    rows,
+  };
+
+  return rows;
+}
+
+function humanBackendError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("API keys")) return "API keys are missing";
+  if (message.includes("HTTP 401")) return "BingX rejected the API key";
+  if (message.includes("HTTP 429") || message.includes("100410") || message.includes("frequency limit")) {
+    return "BingX is cooling down this endpoint. Wait a moment and refresh.";
+  }
+  return message;
+}
+
 function publicStatusPayload() {
   const state = store.getState();
   const trades = store.getTrades();
@@ -249,6 +395,135 @@ function publicStatusPayload() {
   };
 }
 
+function attachedOrdersForPosition(orders, position) {
+  const symbol = compactSymbol(position.symbol);
+  return orders.filter((order) => compactSymbol(order.symbol) === symbol);
+}
+
+function orderPrice(order) {
+  return Number(order.stopPrice ?? order.price ?? order.avgPrice ?? order.triggerPrice ?? 0);
+}
+
+function findAttachedPrice(orders, matcher) {
+  const order = orders.find((item) => matcher(String(item.type ?? item.orderType ?? "").toUpperCase()));
+  const price = order ? orderPrice(order) : null;
+  return Number.isFinite(price) && price > 0 ? price : null;
+}
+
+function positionEntryPrice(position) {
+  return Number(position.avgPrice ?? position.entryPrice ?? position.positionAvgPrice ?? position.openPrice ?? 0);
+}
+
+function positionMarkPrice(position) {
+  return Number(position.markPrice ?? position.currentPrice ?? position.lastPrice ?? positionEntryPrice(position));
+}
+
+function positionLeverage(position) {
+  return Number(position.leverage ?? position.marginLeverage ?? 0);
+}
+
+function positionMargin(position) {
+  return Number(position.margin ?? position.usedMargin ?? position.positionMargin ?? 0);
+}
+
+function positionPnl(position) {
+  return Number(position.unrealizedProfit ?? position.unrealizedPnl ?? position.pnl ?? 0);
+}
+
+function buildLivestreamPayload(apiProfileRows = []) {
+  const state = store.getState();
+  const battleDecks = store.getCollection("battleDecks");
+  const strategyDecks = store.getCollection("strategyDecks");
+  const mmDecks = store.getCollection("mmDecks");
+  const profiles = store.getProfiles().filter(isLiveExecutionProfile);
+  const openOrders = normalizeExchangeList(state.bingx?.openOrders);
+  const exchangePositions = normalizeExchangeList(state.bingx?.openPositions).filter(
+    (position) => positionAmount(position) > 0,
+  );
+  const localPositions = profiles
+    .filter((profile) => profile.live?.openPosition)
+    .map((profile) => ({
+      profile,
+      position: profile.live.openPosition,
+    }));
+  const positions = exchangePositions.map((exchangePosition) => {
+    const matchingProfile =
+      profiles.find((profile) => compactSymbol(profile.symbol) === compactSymbol(exchangePosition.symbol)) ??
+      localPositions.find((item) => compactSymbol(item.profile.symbol) === compactSymbol(exchangePosition.symbol))?.profile;
+    const battleDeck = battleDecks.find((deck) => `battle-${deck.id}` === matchingProfile?.id);
+    const strategyDeck =
+      strategyDecks.find((deck) => deck.id === battleDeck?.strategyDeckId) ?? battleDeck?.strategySnapshot;
+    const mmDeck = mmDecks.find((deck) => deck.id === battleDeck?.mmDeckId) ?? battleDeck?.mmSnapshot;
+    const orders = attachedOrdersForPosition(openOrders, exchangePosition);
+    const entryPrice = positionEntryPrice(exchangePosition);
+    const markPrice = positionMarkPrice(exchangePosition);
+    const quantity = positionAmount(exchangePosition);
+    const side = positionSide(exchangePosition);
+    const stopLoss = findAttachedPrice(orders, (type) => type.includes("STOP"));
+    const takeProfit = findAttachedPrice(orders, (type) => type.includes("TAKE_PROFIT") || type.includes("PROFIT"));
+    const notional = markPrice * quantity;
+    const pnl = positionPnl(exchangePosition);
+    const openTime = exchangePosition.updateTime ?? exchangePosition.openTime ?? exchangePosition.time ?? null;
+    const distanceToSl = stopLoss ? Math.abs(markPrice - stopLoss) : null;
+    const distanceToTp = takeProfit ? Math.abs(markPrice - takeProfit) : null;
+    const lastAction = String(state.lastExecutionDecision ?? "");
+
+    return {
+      apiProfile: profileApiId(matchingProfile),
+      attachedOrders: orders,
+      battleDeckId: battleDeck?.id ?? null,
+      battleDeckName: battleDeck?.name ?? "Exchange position",
+      botPriority: state.crisisMode ? "manual" : "bot",
+      currentPrice: markPrice,
+      distanceToSl,
+      distanceToSlPercent: stopLoss && markPrice ? distanceToSl / markPrice * 100 : null,
+      distanceToTp,
+      distanceToTpPercent: takeProfit && markPrice ? distanceToTp / markPrice * 100 : null,
+      durationSeconds: openTime ? Math.max(0, Math.floor((Date.now() - Number(openTime)) / 1000)) : null,
+      entryPrice,
+      lastAction: isPaperish(lastAction) ? null : lastAction || null,
+      leverage: positionLeverage(exchangePosition),
+      liquidationPrice: Number(exchangePosition.liquidationPrice ?? exchangePosition.liqPrice ?? 0) || null,
+      marginUsed: positionMargin(exchangePosition),
+      mmDeckName: mmDeck?.name ?? null,
+      notionalSize: notional,
+      openTime,
+      pnlPercent: notional ? pnl / notional * 100 : null,
+      quantity,
+      realizedSessionPnl: calculateAnalytics(store.getTrades()).totalPnl,
+      side,
+      sourceProfileId: matchingProfile?.id ?? null,
+      strategyDeckName: strategyDeck?.name ?? null,
+      stopLoss,
+      symbol: compactSymbol(exchangePosition.symbol),
+      takeProfit,
+      timeframe: battleDeck?.timeframe ?? matchingProfile?.timeframe ?? null,
+      unrealizedPnl: pnl,
+    };
+  });
+  const totalFuturesBalance = apiProfileRows.length
+    ? apiProfileRows.reduce((sum, profile) => sum + Number(profile.futuresBalance ?? 0), 0)
+    : Number(state.bingx?.activeExecutionBalance ?? 0);
+  const totalUnrealizedPnl = positions.reduce((sum, position) => sum + Number(position.unrealizedPnl ?? 0), 0);
+  const totalOpenNotional = positions.reduce((sum, position) => sum + Number(position.notionalSize ?? 0), 0);
+  const totalMarginUsed = positions.reduce((sum, position) => sum + Number(position.marginUsed ?? 0), 0);
+
+  return {
+    accountSummary: {
+      apiProfiles: apiProfileRows,
+      lastRefreshAt: new Date().toISOString(),
+      totalCombinedFuturesBalance: totalFuturesBalance,
+      totalMarginUsed,
+      totalOpenNotional,
+      totalOpenPositions: positions.length,
+      totalRealizedSessionPnl: calculateAnalytics(store.getTrades()).totalPnl,
+      totalUnrealizedPnl,
+    },
+    openOrders,
+    positions,
+  };
+}
+
 function calculateAnalytics(trades) {
   const closed = trades.filter((trade) => Number.isFinite(Number(trade.pnl ?? trade.netPnl)));
   const pnl = closed.map((trade) => Number(trade.pnl ?? trade.netPnl ?? 0));
@@ -280,9 +555,11 @@ function calculateAnalytics(trades) {
 }
 
 async function dataAvailability() {
-  const rows = [];
+  if (availabilityCache.expiresAt > Date.now() && availabilityCache.rows.length > 0) {
+    return availabilityCache.rows;
+  }
 
-  for (const timeframe of TIMEFRAMES) {
+  const rows = await Promise.all(TIMEFRAMES.map(async (timeframe) => {
     try {
       const candles = await fetchCandles({
         limit: timeframe.maxCandles,
@@ -292,26 +569,33 @@ async function dataAvailability() {
       const first = candles[0];
       const last = candles.at(-1);
       const availableDays = candles.length * timeframe.minutes / 1440;
-      rows.push({
+      return {
         ...timeframe,
         availableDays,
         candles: candles.length,
         firstCandleTime: first?.time ?? null,
         lastCandleTime: last?.time ?? null,
-        note: `${timeframe.label} has ${candles.length} candles available, which is about ${Math.floor(availableDays)} days. If you request more, the platform will use the maximum available ${Math.floor(availableDays)} days.`,
+        note:
+          candles.length >= timeframe.maxCandles
+            ? `Exchange API currently provides at least ${Math.floor(availableDays)} days at this configured limit. More history can be enabled by raising max candles or adding an external data source.`
+            : `Exchange API returned ${Math.floor(availableDays)} days for this timeframe. More history may require an external data source.`,
         ok: true,
-      });
+      };
     } catch (error) {
-      rows.push({
+      return {
         ...timeframe,
         availableDays: 0,
         candles: 0,
         error: error instanceof Error ? error.message : String(error),
         ok: false,
-      });
+      };
     }
-  }
+  }));
 
+  availabilityCache = {
+    expiresAt: Date.now() + 5 * 60_000,
+    rows,
+  };
   return rows;
 }
 
@@ -351,7 +635,7 @@ function deckToProfile(battleDeck, existingProfile = {}) {
           : strategy.atrPositionSizing === false
             ? "percent-move"
             : "risk-based",
-      priceMoveRiskPercent: Number(mm.onePercentMovePercent ?? 1),
+      priceMoveRiskPercent: Number(mm.positionPercent ?? mm.onePercentMovePercent ?? 10),
       riskPerTradePercent: Number(mm.riskPercent ?? mm.oneSlPercent ?? 1),
       startingBalance: Number(mm.startingBalance ?? 0),
       takeProfitRr: Number(mm.takeProfitRr ?? 2),
@@ -388,6 +672,23 @@ function compactSymbol(symbol) {
   return String(symbol ?? "").replace("-", "").toUpperCase();
 }
 
+function isPaperish(value) {
+  return String(value ?? "").toLowerCase().includes("paper");
+}
+
+function isLiveExecutionProfile(profile) {
+  return (
+    profile?.executionMode === "live" &&
+    !isPaperish(profile?.id) &&
+    !isPaperish(profile?.account?.apiProfile)
+  );
+}
+
+function profileApiId(profile) {
+  const apiId = profile?.account?.apiProfile;
+  return apiId && !isPaperish(apiId) ? apiId : "main";
+}
+
 function positionAmount(position) {
   return Math.abs(Number(position.positionAmt ?? position.positionAmount ?? position.quantity ?? position.availableAmt ?? 0));
 }
@@ -401,8 +702,9 @@ function positionSide(position) {
 
 async function executeManualAction(body) {
   const state = store.getState();
+  const client = getApiProfileClient(body.apiProfile ?? "main");
 
-  if (!bingxClient.auth.configured) {
+  if (!client.auth.configured) {
     return { ok: false, message: "BingX keys are not configured." };
   }
 
@@ -421,13 +723,28 @@ async function executeManualAction(body) {
     if (!Number.isFinite(quantity) || quantity <= 0) {
       return { ok: false, message: "Enter a valid order quantity first." };
     }
-    result = await bingxClient.placeMarketOrder(symbol, action === "MARKET_LONG" ? "BUY" : "SELL", quantity);
+    result = await client.placeMarketOrder(symbol, action === "MARKET_LONG" ? "BUY" : "SELL", quantity);
   } else if (action === "CLOSE_POSITION") {
-    result = await bingxClient.closePosition(symbol);
-  } else if (action === "CANCEL_ALL") {
-    result = await bingxClient.cancelOpenOrders(symbol);
+    result = await client.closePosition(symbol);
+  } else if (action === "CLOSE_PARTIAL") {
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return { ok: false, message: "Enter a valid partial close quantity first." };
+    }
+    const positions = normalizeExchangeList(await client.getOpenPositions(symbol)).filter(
+      (position) => compactSymbol(position.symbol) === compactSymbol(symbol) && positionAmount(position) > 0,
+    );
+    const position = positions[0];
+
+    if (!position) {
+      return { ok: false, message: "No open position found on BingX for this symbol." };
+    }
+
+    const closeSide = positionSide(position) === "LONG" ? "SELL" : "BUY";
+    result = await client.placeReduceOnlyMarketOrder(symbol, closeSide, quantity);
+  } else if (action === "CANCEL_ALL" || action === "CANCEL_ATTACHED_ORDERS") {
+    result = await client.cancelOpenOrders(symbol);
   } else if (["MOVE_SL", "MOVE_TP"].includes(action)) {
-    const positions = normalizeExchangeList(await bingxClient.getOpenPositions(symbol)).filter(
+    const positions = normalizeExchangeList(await client.getOpenPositions(symbol)).filter(
       (position) => compactSymbol(position.symbol) === compactSymbol(symbol) && positionAmount(position) > 0,
     );
     const position = positions[0];
@@ -443,12 +760,12 @@ async function executeManualAction(body) {
       if (!Number.isFinite(stopPrice) || stopPrice <= 0) {
         return { ok: false, message: "Enter a valid SL price first." };
       }
-      result = await bingxClient.placeStopLoss(symbol, side, stopPrice, inferredQuantity);
+      result = await client.placeStopLoss(symbol, side, stopPrice, inferredQuantity);
     } else {
       if (!Number.isFinite(takeProfitPrice) || takeProfitPrice <= 0) {
         return { ok: false, message: "Enter a valid TP price first." };
       }
-      result = await bingxClient.placeTakeProfit(symbol, side, takeProfitPrice, inferredQuantity);
+      result = await client.placeTakeProfit(symbol, side, takeProfitPrice, inferredQuantity);
     }
   } else {
     return { ok: false, message: "Choose a manual action first." };
@@ -551,6 +868,93 @@ async function sendTelegramTest(settings) {
   };
 }
 
+function buildAiContext(flags = {}) {
+  const include = {
+    analytics: flags.includeAnalytics !== false,
+    backtests: flags.includeBacktests !== false,
+    decks: flags.includeDecks !== false,
+    livePositions: flags.includeLivePositions !== false,
+    systemStatus: flags.includeSystemStatus !== false,
+  };
+
+  return {
+    analytics: include.analytics ? calculateAnalytics(store.getTrades()) : undefined,
+    backtests: include.backtests ? store.getCollection("backtests").slice(-20) : undefined,
+    decks: include.decks
+      ? {
+          battleDecks: store.getCollection("battleDecks"),
+          mmDecks: store.getCollection("mmDecks"),
+          strategyDecks: store.getCollection("strategyDecks"),
+        }
+      : undefined,
+    live: include.livePositions ? buildLivestreamPayload() : undefined,
+    system: include.systemStatus ? publicStatusPayload() : undefined,
+  };
+}
+
+async function runAiChat(body) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  const provider = process.env.AI_PROVIDER ?? "openai";
+  const model = process.env.AI_MODEL ?? "gpt-4.1-mini";
+
+  if (provider !== "openai") {
+    return {
+      ok: false,
+      message: "AI provider is not supported yet. Set AI_PROVIDER=openai.",
+    };
+  }
+
+  if (!apiKey) {
+    return {
+      configured: false,
+      ok: false,
+      message: "AI is not connected yet. Add OPENAI_API_KEY on backend to enable this panel.",
+    };
+  }
+
+  const context = buildAiContext(body.context ?? {});
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    body: JSON.stringify({
+      input: [
+        {
+          content:
+            "You are the Choromański Trading Platform analyst. Explain things simply, use the provided platform data only, and never tell the user to place a trade.",
+          role: "system",
+        },
+        {
+          content: `Platform data:\n${JSON.stringify(context).slice(0, 120000)}\n\nUser question:\n${body.message}`,
+          role: "user",
+        },
+      ],
+      max_output_tokens: 900,
+      model,
+    }),
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    method: "POST",
+  });
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    return {
+      ok: false,
+      message: payload.error?.message || "AI request failed.",
+    };
+  }
+
+  return {
+    configured: true,
+    message:
+      payload.output_text ??
+      payload.output?.flatMap((item) => item.content ?? []).map((part) => part.text).filter(Boolean).join("\n") ??
+      "AI returned an empty answer.",
+    model,
+    ok: true,
+  };
+}
+
 async function readBody(request) {
   const chunks = [];
 
@@ -604,6 +1008,18 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "GET" && pathname === "/execution/status") {
       sendJson(response, 200, publicStatusPayload());
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/accounts/profiles") {
+      sendJson(response, 200, await publicApiProfiles());
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/livestream") {
+      const apiProfileRows = await publicApiProfiles();
+      const payload = buildLivestreamPayload(apiProfileRows);
+      sendJson(response, 200, payload);
       return;
     }
 
@@ -783,6 +1199,12 @@ const server = http.createServer(async (request, response) => {
         }),
       );
       sendJson(response, result.ok ? 200 : 400, result);
+      return;
+    }
+
+    if (request.method === "POST" && pathname === "/ai/chat") {
+      const body = await readBody(request);
+      sendJson(response, 200, await runAiChat(body));
       return;
     }
 
