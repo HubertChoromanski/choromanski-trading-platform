@@ -31,6 +31,10 @@ const TIMEFRAMES = [
   { label: "1H", interval: "1h", minutes: 60 },
   { label: "4H", interval: "4h", minutes: 240 },
 ];
+const PREVIEW_CURVE_POINTS = 420;
+const TRADE_TABLE_PAGE_SIZE = 50;
+const STORED_BACKTEST_EVENT_LIMIT = 1000;
+// TODO: Sweep Backtesting should return as a fast comparison mode: run many parameter combinations without rendering charts and output a compact ranked table only.
 
 const defaultStrategyDeck = {
   allowLong: true,
@@ -150,6 +154,60 @@ function profileBalanceText(profile) {
   return profile?.futuresBalance === null || profile?.futuresBalance === undefined ? "Syncing" : fmt(profile.futuresBalance);
 }
 
+function isBlank(value) {
+  return value === "" || value === null || value === undefined;
+}
+
+function requireNumber(value, label, { min = -Infinity, positive = false } = {}) {
+  if (!value && typeof value === "object") {
+    throw new Error(`${label} needs a valid number.`);
+  }
+
+  const number = Number(value);
+
+  if (isBlank(value) || !Number.isFinite(number) || number < min || (positive && number <= 0)) {
+    throw new Error(`${label} needs a valid number.`);
+  }
+
+  return number;
+}
+
+function normalizeStrategyDeck(deck) {
+  return {
+    ...deck,
+    atrLength: requireNumber(deck.atrLength, "ATR length", { positive: true }),
+    atrMultiplier: requireNumber(deck.atrMultiplier, "ATR multiplier", { positive: true }),
+    bandwidth: requireNumber(deck.bandwidth, "Bandwidth", { positive: true }),
+    envelopeMultiplier: requireNumber(deck.envelopeMultiplier, "NWE multiplier", { positive: true }),
+    maxSameSideFailures: requireNumber(deck.maxSameSideFailures, "Max same-side failures", { min: 0 }),
+  };
+}
+
+function normalizeMmDeck(deck) {
+  if (deck.mode === "constant") {
+    return {
+      ...deck,
+      fixedNotional: requireNumber(deck.fixedNotional, "Fixed position size", { positive: true }),
+    };
+  }
+
+  return {
+    ...deck,
+    oneSlPercent: requireNumber(deck.oneSlPercent, "Risk per SL hit", { positive: true }),
+    positionPercent: requireNumber(deck.positionPercent, "Position size", { positive: true }),
+  };
+}
+
+function normalizeBacktestForm(form) {
+  return {
+    ...form,
+    commissionPercent: requireNumber(form.commissionPercent, "Commission", { min: 0 }),
+    lastDays: requireNumber(form.lastDays, "Last X days", { positive: true }),
+    slippagePercent: requireNumber(form.slippagePercent, "Slippage", { min: 0 }),
+    startingBalance: requireNumber(form.startingBalance, "Starting balance", { positive: true }),
+  };
+}
+
 function dateText(time) {
   if (!time) return "--";
   const value = typeof time === "number" ? time * 1000 : time;
@@ -216,15 +274,34 @@ function analyzeBacktest(result) {
   return "This deck lost money in the tested window. Review whether losses come from one side or from sideways market behavior.";
 }
 
+function sampleCurve(curve = [], maxPoints = PREVIEW_CURVE_POINTS) {
+  if (curve.length <= maxPoints) return curve;
+  const step = (curve.length - 1) / (maxPoints - 1);
+  const sampled = [];
+  let previousIndex = -1;
+
+  for (let index = 0; index < maxPoints; index += 1) {
+    const sourceIndex = Math.min(curve.length - 1, Math.round(index * step));
+
+    if (sourceIndex !== previousIndex) {
+      sampled.push(curve[sourceIndex]);
+      previousIndex = sourceIndex;
+    }
+  }
+
+  return sampled;
+}
+
 function equityPolyline(equityCurve) {
-  if (!equityCurve?.length) return "";
-  const values = equityCurve.map((point) => point.equity);
+  const curve = sampleCurve(equityCurve);
+  if (!curve?.length) return "";
+  const values = curve.map((point) => point.equity);
   const min = Math.min(...values);
   const max = Math.max(...values);
   const span = max - min || 1;
-  return equityCurve
+  return curve
     .map((point, index) => {
-      const x = equityCurve.length === 1 ? 0 : (index / (equityCurve.length - 1)) * 100;
+      const x = curve.length === 1 ? 0 : (index / (curve.length - 1)) * 100;
       const y = 100 - ((point.equity - min) / span) * 100;
       return `${x.toFixed(2)},${y.toFixed(2)}`;
     })
@@ -232,9 +309,10 @@ function equityPolyline(equityCurve) {
 }
 
 function drawdownPolyline(equityCurve) {
-  if (!equityCurve?.length) return "";
-  let peak = equityCurve[0]?.equity ?? 0;
-  const values = equityCurve.map((point) => {
+  const curve = sampleCurve(equityCurve);
+  if (!curve?.length) return "";
+  let peak = curve[0]?.equity ?? 0;
+  const values = curve.map((point) => {
     peak = Math.max(peak, point.equity);
     return peak > 0 ? ((peak - point.equity) / peak) * 100 : 0;
   });
@@ -309,6 +387,20 @@ function exportCsv(fileName, trades = []) {
   downloadText(fileName, [headers.join(","), ...rows].join("\n"), "text/csv");
 }
 
+function compactBacktestResult(result) {
+  if (!result) return result;
+
+  const { sourceCandles, ...rest } = result;
+
+  return {
+    ...rest,
+    eventCount: result.events?.length ?? 0,
+    events: result.events?.slice(-STORED_BACKTEST_EVENT_LIMIT) ?? [],
+    setupAuditCount: result.setupAudits?.length ?? 0,
+    setupAudits: result.setupAudits?.slice(-STORED_BACKTEST_EVENT_LIMIT) ?? [],
+  };
+}
+
 function Help({ text }) {
   return (
     <span className="hubert-help" tabIndex="0" aria-label={text}>
@@ -345,6 +437,11 @@ export default function ControlCenter({
   const [favorites, setFavorites] = useState([]);
   const [livestream, setLivestream] = useState({ accountSummary: {}, positions: [] });
   const [accountProfiles, setAccountProfiles] = useState([]);
+  const [aiStatus, setAiStatus] = useState({
+    configured: false,
+    message: "Checking AI connection...",
+    ok: false,
+  });
   const [savedBacktests, setSavedBacktests] = useState([]);
   const [analytics, setAnalytics] = useState(null);
   const [communication, setCommunication] = useState({ alertTypes: {}, enabled: false, telegramChatId: "" });
@@ -352,6 +449,7 @@ export default function ControlCenter({
     includeAnalytics: true,
     includeBacktests: true,
     includeDecks: true,
+    includeErrors: true,
     includeLivePositions: true,
     includeSystemStatus: true,
   });
@@ -421,6 +519,7 @@ export default function ControlCenter({
       nextBacktests,
       nextAnalytics,
       nextCommunication,
+      nextAiStatus,
     ] =
       await Promise.all([
         apiFetch("/system/status"),
@@ -433,6 +532,7 @@ export default function ControlCenter({
         apiFetch("/backtests"),
         apiFetch("/analytics"),
         apiFetch("/communication/settings"),
+        apiFetch("/ai/status"),
       ]);
     setSystem(nextSystem);
     setLivestream(nextLivestream);
@@ -441,9 +541,10 @@ export default function ControlCenter({
     setMmDecks(nextMm);
     setBattleDecks(nextBattle);
     setFavorites(nextFavorites);
-    setSavedBacktests(nextBacktests);
+    setSavedBacktests(nextBacktests.map(compactBacktestResult));
     setAnalytics(nextAnalytics);
     setCommunication(nextCommunication);
+    setAiStatus(nextAiStatus);
     if (!executionDeckId && nextBattle[0]) setExecutionDeckId(nextBattle[0].id);
   }
 
@@ -452,14 +553,16 @@ export default function ControlCenter({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function saveCollectionItem(collection, item) {
+  async function saveCollectionItem(collection, item, shouldRefresh = true) {
     const route = collectionRoutes[collection];
     const hasId = Boolean(item.id);
     const saved = await apiFetch(hasId ? `${route}/${encodeURIComponent(item.id)}` : route, {
       body: item,
       method: hasId ? "PUT" : "POST",
     });
-    await refreshAll();
+    if (shouldRefresh) {
+      await refreshAll();
+    }
     return saved;
   }
 
@@ -479,12 +582,12 @@ export default function ControlCenter({
       name: item.name,
       shortDescription: item.symbol ? `${item.symbol} ${item.timeframe ?? ""}` : category,
     };
-    const saved = await saveCollectionItem("favorites", favorite);
+    const saved = await saveCollectionItem("favorites", favorite, false);
     return saved;
   }
 
   async function saveAndFavorite(collection, category, item) {
-    const saved = await saveCollectionItem(collection, item);
+    const saved = await saveCollectionItem(collection, item, false);
     await addFavorite(category, saved);
     await refreshAll();
     return saved;
@@ -555,10 +658,13 @@ export default function ControlCenter({
   }
 
   function runBrowserBacktest() {
-    const deck = strategyDecks.find((item) => item.id === backtestForm.strategyDeckId) ?? strategyDecks[0];
-    const mmDeck = mmDecks.find((item) => item.id === backtestForm.mmDeckId);
-    if (!deck) throw new Error("Create or choose a Strategy Deck first.");
-    const candles = filterCandlesByBacktestForm(rawCandles, backtestForm);
+    const form = normalizeBacktestForm(backtestForm);
+    const rawDeck = strategyDecks.find((item) => item.id === form.strategyDeckId) ?? strategyDecks[0];
+    if (!rawDeck) throw new Error("Create or choose a Strategy Deck first.");
+    const deck = normalizeStrategyDeck(rawDeck);
+    const rawMmDeck = form.mmDeckId ? mmDecks.find((item) => item.id === form.mmDeckId) : null;
+    const mmDeck = rawMmDeck ? normalizeMmDeck(rawMmDeck) : null;
+    const candles = filterCandlesByBacktestForm(rawCandles, form);
     if (candles.length < 550) {
       throw new Error("Not enough candles are loaded for this backtest. Request more history days or use a larger timeframe.");
     }
@@ -573,14 +679,14 @@ export default function ControlCenter({
       rawCandles: candles,
       settings: strategyToSettings(deck, settings),
     });
-    const named = {
+    const named = compactBacktestResult({
       ...result,
       createdAt: new Date().toISOString(),
       id: `backtest-${Date.now()}`,
-      name: backtestForm.name || `${deck.name} ${new Date().toLocaleDateString()}`,
+      name: form.name || `${deck.name} ${new Date().toLocaleDateString()}`,
       strategyDeckId: deck.id,
       strategyDeckName: deck.name,
-    };
+    });
     setBacktestResult(named);
     onBacktestResult(named);
     return named;
@@ -589,7 +695,7 @@ export default function ControlCenter({
   async function saveBacktest(result = backtestResult) {
     if (!result) throw new Error("Run a backtest first.");
     if (!result.name) throw new Error("Name this backtest before saving it.");
-    const saved = await saveAndFavorite("backtests", "Backtests", result);
+    const saved = await saveAndFavorite("backtests", "Backtests", compactBacktestResult(result));
     setBacktestResult(saved);
   }
 
@@ -597,19 +703,21 @@ export default function ControlCenter({
     if (!decision.battleName.trim()) throw new Error("Name this Battle Deck first.");
     if (!selectedStrategy) throw new Error("Choose a Strategy Deck first.");
     if (!selectedMm) throw new Error("Choose an MM Deck first.");
+    const strategySnapshot = normalizeStrategyDeck(selectedStrategy);
+    const mmSnapshot = normalizeMmDeck(selectedMm);
     const battleDeck = {
       accountLabel: decision.apiProfile === "main" ? "Main Account" : decision.apiProfile,
       accountType: decision.apiProfile === "main" ? "main" : "subaccount",
       apiProfile: decision.apiProfile,
       createdAt: new Date().toISOString(),
       estimate: decisionEstimate,
-      mmDeckId: selectedMm.id,
-      mmSnapshot: { ...selectedMm },
+      mmDeckId: mmSnapshot.id,
+      mmSnapshot,
       name: decision.battleName,
       readiness: decisionEstimate.ready ? "ready" : "needs attention",
       status: "inactive",
-      strategyDeckId: selectedStrategy.id,
-      strategySnapshot: { ...selectedStrategy },
+      strategyDeckId: strategySnapshot.id,
+      strategySnapshot,
       symbol: decision.symbol,
       timeframe: decision.timeframe,
     };
@@ -690,7 +798,7 @@ export default function ControlCenter({
           onDuplicate={(deck) => setStrategyForm({ ...deck, id: undefined, name: `${deck.name} Copy` })}
           onEdit={setStrategyForm}
           onFavorite={(deck) => runAction(`fav-${deck.id}`, "Add favorite", () => addFavorite("Strategy Decks", deck))}
-          onSave={() => runAction("save-strategy", "Save Strategy Deck", () => saveAndFavorite("strategyDecks", "Strategy Decks", strategyForm))}
+          onSave={() => runAction("save-strategy", "Save Strategy Deck", () => saveAndFavorite("strategyDecks", "Strategy Decks", normalizeStrategyDeck(strategyForm)))}
         />
       )}
 
@@ -730,7 +838,7 @@ export default function ControlCenter({
           onDuplicate={(deck) => setMmForm({ ...deck, id: undefined, name: `${deck.name} Copy` })}
           onEdit={setMmForm}
           onFavorite={(deck) => runAction(`fav-mm-${deck.id}`, "Add favorite", () => addFavorite("MM Decks", deck))}
-          onSave={() => runAction("save-mm", "Save MM Deck", () => saveAndFavorite("mmDecks", "MM Decks", mmForm))}
+          onSave={() => runAction("save-mm", "Save MM Deck", () => saveAndFavorite("mmDecks", "MM Decks", normalizeMmDeck(mmForm)))}
         />
       )}
 
@@ -818,6 +926,7 @@ export default function ControlCenter({
 
       {panel === "AI" && (
         <AiPanel
+          aiStatus={aiStatus}
           aiContext={aiContext}
           messages={aiMessages}
           question={aiQuestion}
@@ -1103,13 +1212,13 @@ function IndicatorPanel({ loadedDays, rawCandles, selectedInterval, settings, up
         Requested {fmt(requestedDays, 0)} days, available about {fmt(loadedDays, 0)} days. Using {fmt(usedDays, 0)} days.
       </MiniStatus>
       <div className="hubert-lab__grid">
-        <NumberField label="History days" value={settings.historyDays ?? 31} min="1" max="1000" onChange={(value) => updateSetting("historyDays", value)} help="Choose time in days. The platform converts it into candles for this timeframe." />
+        <NumberField commitEmpty={false} label="History days" value={settings.historyDays ?? 31} min="1" max="1000" onChange={(value) => updateSetting("historyDays", value)} help="Choose time in days. The platform converts it into candles for this timeframe." />
         <ReadOnly label="Loaded candles" value={`${rawCandles.length} on ${selectedInterval}`} />
-        <NumberField label="Bandwidth" value={settings.bandwidth} step="0.5" onChange={(value) => updateSetting("bandwidth", value)} />
-        <NumberField label="NWE multiplier" value={settings.envelopeMultiplier} step="0.1" onChange={(value) => updateSetting("envelopeMultiplier", value)} />
-        <NumberField label="ATR length" value={settings.atrLength} step="1" onChange={(value) => updateSetting("atrLength", value)} />
-        <NumberField label="ATR multiplier" value={settings.atrMultiplier} step="0.1" onChange={(value) => updateSetting("atrMultiplier", value)} />
-        <NumberField label="Max same-side failures" value={settings.maxSameSideFailures} step="1" onChange={(value) => updateSetting("maxSameSideFailures", value)} />
+        <NumberField commitEmpty={false} label="Bandwidth" value={settings.bandwidth} step="0.5" onChange={(value) => updateSetting("bandwidth", value)} />
+        <NumberField commitEmpty={false} label="NWE multiplier" value={settings.envelopeMultiplier} step="0.1" onChange={(value) => updateSetting("envelopeMultiplier", value)} />
+        <NumberField commitEmpty={false} label="ATR length" value={settings.atrLength} step="1" onChange={(value) => updateSetting("atrLength", value)} />
+        <NumberField commitEmpty={false} label="ATR multiplier" value={settings.atrMultiplier} step="0.1" onChange={(value) => updateSetting("atrMultiplier", value)} />
+        <NumberField commitEmpty={false} label="Max same-side failures" value={settings.maxSameSideFailures} step="1" onChange={(value) => updateSetting("maxSameSideFailures", value)} />
         <label>
           <span>Strategy source <Help text="Pine HA parity uses Heikin Ashi values like the TradingView reference." /></span>
           <select value={settings.strategySource} onChange={(event) => updateSetting("strategySource", event.target.value)}>
@@ -1312,24 +1421,34 @@ function compareExplanation(results) {
 
 function MultiCurveChart({ curveKey, results, title }) {
   const colors = ["#050505", "#5c5c5c", "#ffffff", "rgba(120,24,24,0.82)"];
+  const polylines = useMemo(
+    () =>
+      results.map((result, index) => ({
+        color: colors[index % colors.length],
+        id: result.id,
+        name: result.name,
+        points: curveKey === "drawdown" ? drawdownPolyline(result.equityCurve) : equityPolyline(result.equityCurve),
+      })),
+    [curveKey, results],
+  );
 
   return (
     <div className="hubert-chart-box">
       <strong>{title}</strong>
       <span>{curveKey === "drawdown" ? "Higher line means deeper drawdown." : "Higher line means higher equity."}</span>
       <svg className="hubert-lab__equity" viewBox="0 0 100 100" preserveAspectRatio="none">
-        {results.map((result, index) => (
+        {polylines.map((line) => (
           <polyline
-            key={result.id}
-            points={curveKey === "drawdown" ? drawdownPolyline(result.equityCurve) : equityPolyline(result.equityCurve)}
-            stroke={colors[index % colors.length]}
-            style={{ stroke: colors[index % colors.length] }}
+            key={line.id}
+            points={line.points}
+            stroke={line.color}
+            style={{ stroke: line.color }}
           />
         ))}
       </svg>
       <div className="hubert-chart-legend">
-        {results.map((result, index) => (
-          <span key={result.id}><b style={{ background: colors[index % colors.length] }} />{result.name}</span>
+        {polylines.map((line) => (
+          <span key={line.id}><b style={{ background: line.color }} />{line.name}</span>
         ))}
       </div>
     </div>
@@ -1628,7 +1747,7 @@ function CommunicationPanel({ communication, onSave, onTest, setCommunication })
   );
 }
 
-function AiPanel({ aiContext, messages, onAsk, question, setAiContext, setMessages, setQuestion }) {
+function AiPanel({ aiContext, aiStatus, messages, onAsk, question, setAiContext, setMessages, setQuestion }) {
   const examples = [
     "Explain why Backtest 1 made more than Backtest 2.",
     "Is this drawdown dangerous?",
@@ -1639,7 +1758,9 @@ function AiPanel({ aiContext, messages, onAsk, question, setAiContext, setMessag
 
   return (
     <section className="hubert-lab__section">
-      <MiniStatus>AI runs through the backend. If no key is configured, this panel will tell you cleanly.</MiniStatus>
+      <MiniStatus tone={aiStatus?.configured ? "good" : "neutral"}>
+        {aiStatus?.message ?? "AI runs through the backend. If no key is configured, this panel will tell you cleanly."}
+      </MiniStatus>
       <ToggleGrid
         values={aiContext}
         onChange={(key, value) => setAiContext({ ...aiContext, [key]: value })}
@@ -1649,6 +1770,7 @@ function AiPanel({ aiContext, messages, onAsk, question, setAiContext, setMessag
           ["includeLivePositions", "Live positions"],
           ["includeAnalytics", "Analytics"],
           ["includeSystemStatus", "System status"],
+          ["includeErrors", "Recent errors"],
         ]}
       />
       <div className="hubert-ai-examples">
@@ -1766,9 +1888,12 @@ function DeckList({ decks, extra, onDelete, onDuplicate, onEdit, onFavorite }) {
 }
 
 function BacktestResult({ result }) {
+  const audit = useMemo(() => sizingAudit(result?.trades ?? []), [result?.trades]);
+  const equityPoints = useMemo(() => equityPolyline(result?.equityCurve), [result?.equityCurve]);
+  const drawdownPoints = useMemo(() => drawdownPolyline(result?.equityCurve), [result?.equityCurve]);
+
   if (!result) return <MiniStatus>Run a backtest to see equity, trades, and analysis.</MiniStatus>;
   const metrics = result.metrics;
-  const audit = sizingAudit(result.trades);
 
   return (
     <>
@@ -1783,8 +1908,8 @@ function BacktestResult({ result }) {
         <Metric label="Best trade" value={fmt(metrics.largestWin)} />
         <Metric label="Worst trade" value={fmt(metrics.largestLoss)} />
       </div>
-      <SingleCurveChart title="Equity Curve" caption="Higher line means higher account equity." points={equityPolyline(result.equityCurve)} />
-      <SingleCurveChart title="Drawdown Curve" caption="Higher red line means deeper drawdown from the last equity peak." points={drawdownPolyline(result.equityCurve)} drawdown />
+      <SingleCurveChart title="Equity Curve" caption="Higher line means higher account equity. Preview capped for speed." points={equityPoints} />
+      <SingleCurveChart title="Drawdown Curve" caption="Higher red line means deeper drawdown from the last equity peak. Preview capped for speed." points={drawdownPoints} drawdown />
       <MiniStatus>{analyzeBacktest(result)}</MiniStatus>
       <div className="hubert-lab__subhead"><strong>Position Sizing Audit</strong><span>transparent sizing</span></div>
       <div className="hubert-lab__metrics">
@@ -1841,29 +1966,49 @@ function SideBreakdown({ trades }) {
 }
 
 function TradeTable({ trades }) {
+  const [page, setPage] = useState(0);
+  const orderedTrades = useMemo(() => (trades ?? []).slice().reverse(), [trades]);
+  const totalPages = Math.max(1, Math.ceil(orderedTrades.length / TRADE_TABLE_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages - 1);
+  const visibleTrades = orderedTrades.slice(
+    safePage * TRADE_TABLE_PAGE_SIZE,
+    safePage * TRADE_TABLE_PAGE_SIZE + TRADE_TABLE_PAGE_SIZE,
+  );
+
+  useEffect(() => {
+    setPage(0);
+  }, [trades]);
+
   return (
-    <div className="hubert-lab__table">
-      <table>
-        <thead>
-          <tr><th>Time</th><th>Side</th><th>Size</th><th>Lev</th><th>Margin</th><th>SL dist</th><th>Risk</th><th>PnL</th><th>Reason</th></tr>
-        </thead>
-        <tbody>
-          {(trades ?? []).slice(-80).map((trade, index) => (
-            <tr key={trade.id ?? `${trade.entryTime}-${index}`}>
-              <td>{dateText(trade.entryTime)}</td>
-              <td>{trade.direction ?? trade.side}</td>
-              <td>{fmt(trade.size)}</td>
-              <td>{trade.assumedLeverage ? `${fmt(trade.assumedLeverage, 1)}x` : "--"}</td>
-              <td>{fmt(trade.marginRequired)}</td>
-              <td>{trade.slDistancePercent ? `${fmt(trade.slDistancePercent * 100)}%` : "--"}</td>
-              <td>{fmt(trade.riskAmount)}</td>
-              <td>{fmt(trade.netPnl ?? trade.pnl)}</td>
-              <td>{trade.exitReason ?? trade.reason ?? "--"}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <>
+      <div className="hubert-lab__actions">
+        <button disabled={safePage === 0} type="button" onClick={() => setPage((current) => Math.max(0, current - 1))}>Newer</button>
+        <span>Trades page {safePage + 1} / {totalPages} · {orderedTrades.length} trades</span>
+        <button disabled={safePage >= totalPages - 1} type="button" onClick={() => setPage((current) => Math.min(totalPages - 1, current + 1))}>Older</button>
+      </div>
+      <div className="hubert-lab__table">
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Side</th><th>Size</th><th>Lev</th><th>Margin</th><th>SL dist</th><th>Risk</th><th>PnL</th><th>Reason</th></tr>
+          </thead>
+          <tbody>
+            {visibleTrades.map((trade, index) => (
+              <tr key={trade.id ?? `${trade.entryTime}-${safePage}-${index}`}>
+                <td>{dateText(trade.entryTime)}</td>
+                <td>{trade.direction ?? trade.side}</td>
+                <td>{fmt(trade.size)}</td>
+                <td>{trade.assumedLeverage ? `${fmt(trade.assumedLeverage, 1)}x` : "--"}</td>
+                <td>{fmt(trade.marginRequired)}</td>
+                <td>{trade.slDistancePercent ? `${fmt(trade.slDistancePercent * 100)}%` : "--"}</td>
+                <td>{fmt(trade.riskAmount)}</td>
+                <td>{fmt(trade.netPnl ?? trade.pnl)}</td>
+                <td>{trade.exitReason ?? trade.reason ?? "--"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
   );
 }
 
@@ -1880,7 +2025,7 @@ function OrderTable({ orders }) {
         </thead>
         <tbody>
           {orders.slice(-20).map((order, index) => (
-            <tr key={order.orderId ?? order.id ?? index}>
+            <tr key={`${order.orderId ?? order.id ?? "order"}-${order.type ?? order.orderType ?? "type"}-${order.stopPrice ?? order.price ?? index}-${index}`}>
               <td>{order.symbol ?? "--"}</td>
               <td>{order.type ?? order.orderType ?? "--"}</td>
               <td>{order.side ?? order.positionSide ?? "--"}</td>
@@ -1933,11 +2078,37 @@ function ToggleGrid({ items, onChange, values }) {
   );
 }
 
-function NumberField({ help, label, max, min, onChange, step = "1", value }) {
+function NumberField({ commitEmpty = true, help, label, max, min, onChange, step = "1", value }) {
+  const [draft, setDraft] = useState(value ?? "");
+
+  useEffect(() => {
+    setDraft(value ?? "");
+  }, [value]);
+
   return (
     <label>
       <span>{label} {help && <Help text={help} />}</span>
-      <input min={min} max={max} step={step} type="number" value={value ?? ""} onChange={(event) => onChange(Number(event.target.value))} />
+      <input
+        inputMode="decimal"
+        min={min}
+        max={max}
+        step={step}
+        type="text"
+        value={draft}
+        onBlur={() => {
+          if (draft === "" && !commitEmpty) {
+            setDraft(value ?? "");
+          }
+        }}
+        onChange={(event) => {
+          const nextValue = event.target.value;
+          setDraft(nextValue);
+
+          if (nextValue !== "" || commitEmpty) {
+            onChange(nextValue);
+          }
+        }}
+      />
     </label>
   );
 }

@@ -50,6 +50,7 @@ const COLLECTION_ROUTES = {
   "/favorites": { name: "favorites", limit: 500 },
   "/backtests": { name: "backtests", limit: 200 },
 };
+const BACKTEST_EVENT_RESPONSE_LIMIT = 1000;
 const apiProfiles = createApiProfiles();
 let availabilityCache = {
   expiresAt: 0,
@@ -785,10 +786,26 @@ async function executeManualAction(body) {
   };
 }
 
+function sanitizeBacktestRecord(record) {
+  if (!record || typeof record !== "object") return record;
+  const { sourceCandles, ...rest } = record;
+
+  return {
+    ...rest,
+    eventCount: record.eventCount ?? record.events?.length ?? 0,
+    events: Array.isArray(record.events) ? record.events.slice(-BACKTEST_EVENT_RESPONSE_LIMIT) : [],
+    setupAuditCount: record.setupAuditCount ?? record.setupAudits?.length ?? 0,
+    setupAudits: Array.isArray(record.setupAudits)
+      ? record.setupAudits.slice(-BACKTEST_EVENT_RESPONSE_LIMIT)
+      : [],
+  };
+}
+
 async function handleCollectionRoute({ body, method, pathname, response }) {
   for (const [basePath, config] of Object.entries(COLLECTION_ROUTES)) {
     if (pathname === basePath && method === "GET") {
-      sendJson(response, 200, store.getCollection(config.name));
+      const rows = store.getCollection(config.name);
+      sendJson(response, 200, config.name === "backtests" ? rows.map(sanitizeBacktestRecord) : rows);
       return true;
     }
 
@@ -804,7 +821,10 @@ async function handleCollectionRoute({ body, method, pathname, response }) {
         return true;
       }
 
-      sendJson(response, 200, await store.upsertCollectionItem(config.name, body));
+      sendJson(response, 200, await store.upsertCollectionItem(
+        config.name,
+        config.name === "backtests" ? sanitizeBacktestRecord(body) : body,
+      ));
       return true;
     }
 
@@ -821,7 +841,11 @@ async function handleCollectionRoute({ body, method, pathname, response }) {
         return true;
       }
 
-      sendJson(response, 200, await store.upsertCollectionItem(config.name, { ...body, id }));
+      const nextBody = { ...body, id };
+      sendJson(response, 200, await store.upsertCollectionItem(
+        config.name,
+        config.name === "backtests" ? sanitizeBacktestRecord(nextBody) : nextBody,
+      ));
       return true;
     }
   }
@@ -873,11 +897,12 @@ function buildAiContext(flags = {}) {
     analytics: flags.includeAnalytics !== false,
     backtests: flags.includeBacktests !== false,
     decks: flags.includeDecks !== false,
+    errors: flags.includeErrors !== false,
     livePositions: flags.includeLivePositions !== false,
     systemStatus: flags.includeSystemStatus !== false,
   };
 
-  return {
+  return sanitizeForAi({
     analytics: include.analytics ? calculateAnalytics(store.getTrades()) : undefined,
     backtests: include.backtests ? store.getCollection("backtests").slice(-20) : undefined,
     decks: include.decks
@@ -887,15 +912,65 @@ function buildAiContext(flags = {}) {
           strategyDecks: store.getCollection("strategyDecks"),
         }
       : undefined,
+    recentErrors: include.errors
+      ? store.getLogs()
+          .filter((log) => {
+            const text = `${log.message ?? ""} ${JSON.stringify(log.context ?? {})}`.toLowerCase();
+            return text.includes("error") || text.includes("failed") || text.includes("reject") || text.includes("warning");
+          })
+          .slice(-30)
+      : undefined,
     live: include.livePositions ? buildLivestreamPayload() : undefined,
     system: include.systemStatus ? publicStatusPayload() : undefined,
+  });
+}
+
+function aiStatusPayload() {
+  const provider = process.env.AI_PROVIDER ?? "openai";
+  const model = process.env.AI_MODEL ?? "gpt-4.1-mini";
+  const configured = provider === "openai" && Boolean(process.env.OPENAI_API_KEY);
+
+  return {
+    configured,
+    message: configured
+      ? "AI is connected through the backend."
+      : "AI is not connected yet. Add OPENAI_API_KEY on backend to enable this panel.",
+    model,
+    ok: configured,
+    provider,
   };
+}
+
+function sanitizeForAi(value, depth = 0) {
+  if (depth > 8) return "[trimmed]";
+  if (Array.isArray(value)) {
+    return value.slice(0, 80).map((item) => sanitizeForAi(item, depth + 1));
+  }
+
+  if (!value || typeof value !== "object") {
+    if (typeof value === "string" && /(?:sk-[a-z0-9_-]+|api[_-]?secret|api[_-]?key|secret=|token=)/iu.test(value)) {
+      return "[redacted]";
+    }
+
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => {
+      if (/(secret|token|password|authorization|api[-_]?key|private|env)/iu.test(key)) {
+        return [key, "[redacted]"];
+      }
+
+      return [key, sanitizeForAi(entry, depth + 1)];
+    }),
+  );
 }
 
 async function runAiChat(body) {
   const apiKey = process.env.OPENAI_API_KEY;
   const provider = process.env.AI_PROVIDER ?? "openai";
   const model = process.env.AI_MODEL ?? "gpt-4.1-mini";
+  const message = String(body.message ?? "").trim();
 
   if (provider !== "openai") {
     return {
@@ -912,29 +987,48 @@ async function runAiChat(body) {
     };
   }
 
+  if (!message) {
+    return {
+      configured: true,
+      ok: false,
+      message: "Ask a question first.",
+    };
+  }
+
   const context = buildAiContext(body.context ?? {});
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    body: JSON.stringify({
-      input: [
-        {
-          content:
-            "You are the Choromański Trading Platform analyst. Explain things simply, use the provided platform data only, and never tell the user to place a trade.",
-          role: "system",
-        },
-        {
-          content: `Platform data:\n${JSON.stringify(context).slice(0, 120000)}\n\nUser question:\n${body.message}`,
-          role: "user",
-        },
-      ],
-      max_output_tokens: 900,
-      model,
-    }),
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    method: "POST",
-  });
+  let response;
+
+  try {
+    response = await fetch("https://api.openai.com/v1/responses", {
+      body: JSON.stringify({
+        input: [
+          {
+            content:
+              "You are the Choromański Trading Platform analyst. Explain things simply, use the provided platform data only, and never tell the user to place a trade.",
+            role: "system",
+          },
+          {
+            content: `Platform data:\n${JSON.stringify(context).slice(0, 120000)}\n\nUser question:\n${message}`,
+            role: "user",
+          },
+        ],
+        max_output_tokens: 900,
+        model,
+      }),
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      method: "POST",
+    });
+  } catch (error) {
+    return {
+      configured: true,
+      ok: false,
+      message: error instanceof Error ? error.message : "AI request failed.",
+    };
+  }
+
   const payload = await response.json().catch(() => ({}));
 
   if (!response.ok) {
@@ -1199,6 +1293,11 @@ const server = http.createServer(async (request, response) => {
         }),
       );
       sendJson(response, result.ok ? 200 : 400, result);
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/ai/status") {
+      sendJson(response, 200, aiStatusPayload());
       return;
     }
 

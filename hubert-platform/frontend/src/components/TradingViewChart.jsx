@@ -65,6 +65,8 @@ const defaultSettings = {
   showSl: true,
   showTrigger: false,
 };
+const MAX_BACKTEST_CHART_MARKERS = 500;
+const MAX_STRATEGY_LINE_EVENTS = 220;
 
 function formatMeasurementValue(value) {
   const prefix = value > 0 ? "+" : "";
@@ -96,6 +98,21 @@ function historyDaysToLimit(interval, days) {
   return Math.max(100, Math.min(maxLimit, requested));
 }
 
+function toIncrementalHeikenAshi(rawCandle, previousHa) {
+  const close = (rawCandle.open + rawCandle.high + rawCandle.low + rawCandle.close) / 4;
+  const open = previousHa
+    ? (previousHa.open + previousHa.close) / 2
+    : (rawCandle.open + rawCandle.close) / 2;
+
+  return {
+    close,
+    high: Math.max(rawCandle.high, open, close),
+    low: Math.min(rawCandle.low, open, close),
+    open,
+    time: rawCandle.time,
+  };
+}
+
 export default function TradingViewChart() {
   const [persistedState] = useState(readPlatformState);
   const chartContainerRef = useRef(null);
@@ -108,6 +125,9 @@ export default function TradingViewChart() {
   const strategyMarkersRef = useRef(null);
   const strategyLineSeriesRef = useRef([]);
   const strategyCacheRef = useRef({ key: "", events: [] });
+  const heikenAshiCacheRef = useRef([]);
+  const pendingLiveCandlesRef = useRef(null);
+  const liveRenderFrameRef = useRef(0);
   const rawCandlesRef = useRef([]);
   const fitAfterRenderRef = useRef(false);
   const requestIdRef = useRef(0);
@@ -255,7 +275,7 @@ export default function TradingViewChart() {
 
   function handleBacktestResult(result) {
     setBacktestResult(result);
-    setBacktestMarkers(result ? toBacktestMarkers(result.trades) : []);
+    setBacktestMarkers(result ? toBacktestMarkers(result.trades).slice(-MAX_BACKTEST_CHART_MARKERS) : []);
   }
 
   function buildExportState() {
@@ -389,6 +409,7 @@ export default function TradingViewChart() {
             (event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE && settings.showBenchmarks) ||
             (event.type === STRATEGY_EVENT_TYPES.SETUP_INVALIDATED && settings.showNegated),
         )
+        .slice(-MAX_STRATEGY_LINE_EVENTS)
         .forEach((event) => {
           if (!Number.isFinite(event.trigger) || !Number.isFinite(event.stopLoss)) {
             return;
@@ -497,6 +518,7 @@ export default function TradingViewChart() {
 
       const markerEvents = filterStrategyEvents(strategyEvents, settings);
 
+      heikenAshiCacheRef.current = heikenAshiCandles;
       candleSeriesRef.current.setData(heikenAshiCandles);
       upperSeriesRef.current?.setData(settings.showBands ? toLineData(envelope, "upper") : []);
       lowerSeriesRef.current?.setData(settings.showBands ? toLineData(envelope, "lower") : []);
@@ -513,6 +535,38 @@ export default function TradingViewChart() {
     },
     [backtestMarkers, renderStrategyLines, settings],
   );
+
+  const scheduleLiveCandleUpdate = useCallback((candles) => {
+    pendingLiveCandlesRef.current = candles;
+
+    if (liveRenderFrameRef.current) {
+      return;
+    }
+
+    liveRenderFrameRef.current = window.requestAnimationFrame(() => {
+      liveRenderFrameRef.current = 0;
+      const nextCandles = pendingLiveCandlesRef.current;
+      const latestRaw = nextCandles?.[nextCandles.length - 1];
+
+      if (!latestRaw || !candleSeriesRef.current || !realPriceSeriesRef.current) {
+        return;
+      }
+
+      const haCache = heikenAshiCacheRef.current;
+      const previousHa = haCache[haCache.length - 2];
+      const latestHa = toIncrementalHeikenAshi(latestRaw, previousHa);
+
+      if (haCache.length === nextCandles.length) {
+        haCache[haCache.length - 1] = latestHa;
+      }
+
+      candleSeriesRef.current.update(latestHa);
+      realPriceSeriesRef.current.update({
+        time: latestRaw.time,
+        value: latestRaw.close,
+      });
+    });
+  }, []);
 
   useEffect(() => {
     const container = chartContainerRef.current;
@@ -648,6 +702,10 @@ export default function TradingViewChart() {
     });
 
     return () => {
+      if (liveRenderFrameRef.current) {
+        window.cancelAnimationFrame(liveRenderFrameRef.current);
+        liveRenderFrameRef.current = 0;
+      }
       clearStrategyLines();
       chartRef.current = null;
       candleSeriesRef.current = null;
@@ -710,7 +768,18 @@ export default function TradingViewChart() {
         updatedCandles = [...currentCandles.slice(0, -1), nextCandle];
       }
 
-      setRawCandles(updatedCandles);
+      if (updatedCandles === currentCandles) {
+        return;
+      }
+
+      rawCandlesRef.current = updatedCandles;
+
+      if (nextCandle.isClosed || nextCandle.time > lastCandle?.time) {
+        setRawCandles(updatedCandles);
+        return;
+      }
+
+      scheduleLiveCandleUpdate(updatedCandles);
     }
 
     async function loadMarketData() {
@@ -760,7 +829,7 @@ export default function TradingViewChart() {
       ignore = true;
       closeSocket?.();
     };
-  }, [historyLimit, selectedInterval]);
+  }, [historyLimit, scheduleLiveCandleUpdate, selectedInterval]);
 
   useEffect(() => {
     if (rawCandles.length > 0) {
