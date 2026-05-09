@@ -54,28 +54,79 @@ function aggregateCandles(candles, targetMinutes) {
   return [...buckets.values()].sort((left, right) => left.time - right.time);
 }
 
-export async function fetchCandles({ limit = 1000, symbol, timeframe }) {
-  const custom = CUSTOM_INTERVALS[timeframe];
-  const interval = custom?.base ?? timeframe;
-  const requestLimit = custom ? Math.min(1000, limit * (custom.minutes / 5) + 8) : limit;
+function intervalMinutes(interval) {
+  if (interval.endsWith("m")) return Number(interval.replace("m", ""));
+  if (interval.endsWith("h")) return Number(interval.replace("h", "")) * 60;
+  return 1;
+}
+
+async function requestKlines({ endTime, interval, limit, symbol }) {
   const params = new URLSearchParams({
     symbol,
-    interval: timeframe === "1h" || timeframe === "4h" ? timeframe : interval,
-    limit: String(Math.min(1000, requestLimit)),
+    interval,
+    limit: String(limit),
   });
+
+  if (endTime) {
+    params.set("endTime", String(endTime));
+  }
+
   const response = await fetch(`${BINANCE_BASE_URL}/klines?${params.toString()}`);
 
   if (!response.ok) {
     throw new Error(`Binance request failed: ${response.status}`);
   }
 
-  const candles = (await response.json()).map(normalizeKline);
+  const payload = await response.json();
 
-  if (custom) {
-    return aggregateCandles(candles, custom.minutes).slice(-limit);
+  if (!Array.isArray(payload)) {
+    throw new Error("Binance returned an invalid kline payload.");
   }
 
-  return candles.slice(-limit);
+  return payload.map(normalizeKline);
+}
+
+export async function fetchCandles({ limit = 1000, symbol, timeframe }) {
+  const custom = CUSTOM_INTERVALS[timeframe];
+  const interval = custom?.base ?? timeframe;
+  const requestedLimit = Math.max(1, Math.min(Number(limit) || 1000, 5000));
+  const requestLimit = custom
+    ? Math.min(5000, requestedLimit * (custom.minutes / intervalMinutes(interval)) + 8)
+    : requestedLimit;
+  const chunks = [];
+  let endTime = undefined;
+  let remaining = requestLimit;
+
+  while (remaining > 0) {
+    const batchLimit = Math.min(1000, remaining);
+    const candles = await requestKlines({ endTime, interval, limit: batchLimit, symbol });
+
+    if (candles.length === 0) {
+      break;
+    }
+
+    chunks.unshift(candles);
+    remaining -= candles.length;
+    endTime = candles[0].openTime - 1;
+
+    if (candles.length < batchLimit) {
+      break;
+    }
+  }
+
+  const deduped = new Map();
+  chunks.flat().forEach((candle) => {
+    deduped.set(candle.time, candle);
+  });
+  const candles = [...deduped.values()]
+    .sort((left, right) => left.time - right.time)
+    .slice(-requestLimit);
+
+  if (custom) {
+    return aggregateCandles(candles, custom.minutes).slice(-requestedLimit);
+  }
+
+  return candles.slice(-requestedLimit);
 }
 
 export async function runStrategyForProfile(profile) {

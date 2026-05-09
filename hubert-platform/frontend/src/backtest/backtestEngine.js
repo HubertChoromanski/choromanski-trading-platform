@@ -64,7 +64,18 @@ function closePosition({ candle, equity, exitPrice, position, reason, slippagePe
 function openPosition({ candle, config, direction, equity, event }) {
   const rawEntry = event.trigger ?? candle.close;
   const entryPrice = applySlippage(rawEntry, direction, "entry", config.slippagePercent);
-  const notional = equity * (config.positionSizePercent / 100);
+  const slDistancePercent = Math.abs(entryPrice - event.stopLoss) / entryPrice;
+  const mmDeck = config.mmDeck;
+  const notional =
+    mmDeck?.mode === "constant"
+      ? Number(mmDeck.fixedNotional ?? 0)
+      : mmDeck && config.atrPositionSizing !== false
+        ? slDistancePercent > 0
+          ? (equity * (Number(mmDeck.oneSlPercent ?? 1) / 100)) / slDistancePercent
+          : 0
+        : mmDeck
+          ? equity * Number(mmDeck.onePercentMovePercent ?? 1)
+          : equity * (config.positionSizePercent / 100);
   const quantity = entryPrice === 0 ? 0 : notional / entryPrice;
   const entryCommission = notional * (config.commissionPercent / 100);
 

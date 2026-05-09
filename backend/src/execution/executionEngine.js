@@ -233,8 +233,8 @@ export async function processLiveProfileExecution({
   await logger("risk approved", { mode: "live", profileId: profile.id, setupId: entryEvent.setupId });
   const side = entryEvent.direction === "LONG" ? "BUY" : "SELL";
   await bingxClient.setMarginMode(profile.symbol, updatedProfile.risk.marginMode ?? "isolated");
-  await bingxClient.setLeverage(profile.symbol, updatedProfile.risk.leverage, "LONG");
-  await bingxClient.setLeverage(profile.symbol, updatedProfile.risk.leverage, "SHORT");
+  await bingxClient.setLeverage(profile.symbol, sizing.leverage, "LONG");
+  await bingxClient.setLeverage(profile.symbol, sizing.leverage, "SHORT");
   const marketOrder = await bingxClient.placeMarketOrder(profile.symbol, side, quantity);
   await logger("order sent", { mode: "live", order: marketOrder, profileId: profile.id });
   await store.upsertOrder({

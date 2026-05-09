@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -104,16 +104,51 @@ const defaultExecutionConfig = {
   updatedAt: null,
 };
 
+const collectionDefaults = {
+  analytics: [],
+  backtests: [],
+  battleDecks: [],
+  communication: {
+    alertTypes: {
+      apiDisconnected: true,
+      backendRestarted: true,
+      botPaused: true,
+      botStarted: true,
+      botStopped: true,
+      crisisModeEnabled: true,
+      dailySummary: true,
+      newSignal: false,
+      orderRejected: true,
+      positionClosed: true,
+      positionOpened: true,
+      reconciliationNeeded: true,
+      slMoved: true,
+      tpMoved: true,
+      weeklySummary: true,
+    },
+    enabled: false,
+    telegramBotTokenConfigured: false,
+    telegramChatId: "",
+  },
+  favorites: [],
+  mmDecks: [],
+  strategyDecks: [],
+};
+
 async function ensureDataDir() {
   await mkdir(DATA_DIR, { recursive: true });
 }
 
 async function readJson(fileName, fallback) {
   await ensureDataDir();
+  const filePath = path.join(DATA_DIR, fileName);
 
   try {
-    return JSON.parse(await readFile(path.join(DATA_DIR, fileName), "utf8"));
-  } catch {
+    return JSON.parse(await readFile(filePath, "utf8"));
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      await rename(filePath, `${filePath}.bad-${Date.now()}`).catch(() => {});
+    }
     await writeJson(fileName, fallback);
     return structuredClone(fallback);
   }
@@ -121,17 +156,27 @@ async function readJson(fileName, fallback) {
 
 async function writeJson(fileName, value) {
   await ensureDataDir();
-  await writeFile(path.join(DATA_DIR, fileName), `${JSON.stringify(value, null, 2)}\n`);
+  const filePath = path.join(DATA_DIR, fileName);
+  const tempPath = `${filePath}.tmp`;
+  await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`);
+  await rename(tempPath, filePath);
 }
 
 export async function createStateStore() {
   const store = {
+    analytics: await readJson("analytics.json", collectionDefaults.analytics),
+    backtests: await readJson("backtests.json", collectionDefaults.backtests),
+    battleDecks: await readJson("battle-decks.json", collectionDefaults.battleDecks),
+    communication: await readJson("communication.json", collectionDefaults.communication),
     equity: await readJson("equity.json", []),
     executionConfig: await readJson("execution-config.json", defaultExecutionConfig),
+    favorites: await readJson("favorites.json", collectionDefaults.favorites),
     logs: await readJson("logs.json", []),
+    mmDecks: await readJson("mm-decks.json", collectionDefaults.mmDecks),
     orders: await readJson("orders.json", []),
     profiles: (await readJson("profiles.json", defaultProfiles)).map(normalizeProfile),
     state: normalizeState(await readJson("state.json", defaultState)),
+    strategyDecks: await readJson("strategy-decks.json", collectionDefaults.strategyDecks),
     trades: await readJson("trades.json", []),
   };
 
@@ -146,9 +191,21 @@ export async function createStateStore() {
     await writeJson("state.json", store.state);
   }
 
+  if (store.state.botStatus === "PAPER_RUNNING" || store.state.botStatus === "PAPER") {
+    store.state = {
+      ...store.state,
+      botStatus: "STOPPED",
+      lastError: "",
+    };
+    await writeJson("state.json", store.state);
+  }
+
   async function persist(key) {
     const fileNames = {
+      battleDecks: "battle-decks.json",
       executionConfig: "execution-config.json",
+      mmDecks: "mm-decks.json",
+      strategyDecks: "strategy-decks.json",
     };
     await writeJson(fileNames[key] ?? `${key}.json`, store[key]);
   }
@@ -169,6 +226,9 @@ export async function createStateStore() {
     },
     getOrders() {
       return store.orders;
+    },
+    getCollection(name) {
+      return store[name];
     },
     getProfiles() {
       return store.profiles;
@@ -198,6 +258,38 @@ export async function createStateStore() {
       store.profiles = profiles.map(normalizeProfile);
       await persist("profiles");
       return store.profiles;
+    },
+    async setCollection(name, value) {
+      store[name] = value;
+      await persist(name);
+      return store[name];
+    },
+    async upsertCollectionItem(name, item) {
+      const now = new Date().toISOString();
+      const current = Array.isArray(store[name]) ? store[name] : [];
+      const nextItem = {
+        createdAt: item.createdAt ?? now,
+        id: item.id ?? `${name}-${Date.now()}`,
+        updatedAt: now,
+        ...item,
+      };
+      const existingIndex = current.findIndex((entry) => entry.id === nextItem.id);
+
+      if (existingIndex >= 0) {
+        current[existingIndex] = nextItem;
+      } else {
+        current.push(nextItem);
+      }
+
+      store[name] = current;
+      await persist(name);
+      return nextItem;
+    },
+    async deleteCollectionItem(name, id) {
+      const current = Array.isArray(store[name]) ? store[name] : [];
+      store[name] = current.filter((item) => item.id !== id);
+      await persist(name);
+      return store[name];
     },
     async setState(patch) {
       store.state = {

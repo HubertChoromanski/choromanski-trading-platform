@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CandlestickSeries,
   CrosshairMode,
@@ -14,19 +14,12 @@ import {
   filterStrategyEvents,
   toStrategyMarkers,
 } from "../engine/strategyEngine";
-import {
-  createDefaultExecutionProfiles,
-  deployStrategyToProfile,
-} from "../execution/executionProfiles";
 import { toHeikenAshi } from "../indicators/heikenAshi";
 import { calculateNadarayaEnvelope, toLineData } from "../indicators/nadaraya";
-import ExecutionPanel from "./ExecutionPanel";
-import StrategyLab from "./StrategyLab";
+import ControlCenter from "./ControlCenter";
 import {
   PLATFORM_STORAGE_KEY,
-  STRATEGY_LAB_STORAGE_KEY,
   readPlatformState,
-  readStrategyLabState,
   writeStoredJson,
 } from "../utils/persistence";
 import "../styles/chart.css";
@@ -39,7 +32,20 @@ const timeframes = [
   { label: "1H", interval: "1h" },
   { label: "4H", interval: "4h" },
 ];
-const toolButtons = ["Indicators", "Strategy", "Execution"];
+const toolButtons = [
+  "System",
+  "Indicator",
+  "Strategy Decks",
+  "Backtests",
+  "MM Decks",
+  "Decision",
+  "Battle Decks",
+  "Execution",
+  "Crisis",
+  "Analytics",
+  "Communication",
+  "Favorites",
+];
 const defaultSettings = {
   strategySource: "pine-ha",
   bandwidth: 8,
@@ -47,6 +53,7 @@ const defaultSettings = {
   atrLength: 14,
   atrMultiplier: 1.2,
   maxSameSideFailures: 2,
+  historyDays: 31,
   historyLimit: 3000,
   showBands: true,
   showEntries: true,
@@ -68,6 +75,22 @@ function getBarIndex(time, candles) {
   }
 
   return candles.findIndex((candle) => candle.time === time);
+}
+
+function historyDaysToLimit(interval, days) {
+  const minutesByInterval = {
+    "10m": 10,
+    "15m": 15,
+    "20m": 20,
+    "30m": 30,
+    "1h": 60,
+    "4h": 240,
+  };
+  const minutes = minutesByInterval[interval] ?? 15;
+  const requested = Math.ceil(Number(days || 31) * 1440 / minutes);
+  const maxLimit = interval === "4h" ? 2000 : 5000;
+
+  return Math.max(100, Math.min(maxLimit, requested));
 }
 
 export default function TradingViewChart() {
@@ -98,9 +121,6 @@ export default function TradingViewChart() {
   const [settingsPanel, setSettingsPanel] = useState(null);
   const [backtestResult, setBacktestResult] = useState(null);
   const [backtestMarkers, setBacktestMarkers] = useState([]);
-  const [executionProfiles, setExecutionProfiles] = useState(
-    persistedState.executionProfiles ?? createDefaultExecutionProfiles(),
-  );
   const [saveStatus, setSaveStatus] = useState({
     state: "Saved",
     lastSavedAt: persistedState.lastSavedAt ?? null,
@@ -111,6 +131,10 @@ export default function TradingViewChart() {
     end: null,
   });
   const [measurementView, setMeasurementView] = useState(null);
+  const historyLimit = useMemo(
+    () => historyDaysToLimit(selectedInterval, settings.historyDays ?? settings.historyLimit),
+    [selectedInterval, settings.historyDays, settings.historyLimit],
+  );
 
   const projectMeasurementPoint = useCallback((point) => {
     if (!point || !chartRef.current || !realPriceSeriesRef.current) {
@@ -226,14 +250,6 @@ export default function TradingViewChart() {
     setSelectedInterval(interval);
   }
 
-  function updateExecutionProfiles(updater) {
-    setSaveStatus((currentStatus) => ({
-      ...currentStatus,
-      state: "Unsaved changes",
-    }));
-    setExecutionProfiles(updater);
-  }
-
   function handleBacktestResult(result) {
     setBacktestResult(result);
     setBacktestMarkers(result ? toBacktestMarkers(result.trades) : []);
@@ -242,11 +258,9 @@ export default function TradingViewChart() {
   function buildExportState() {
     return {
       chartTimeframe: selectedInterval,
-      executionProfiles,
       exportedAt: new Date().toISOString(),
       indicatorSettings: settings,
       lastSavedAt: saveStatus.lastSavedAt,
-      strategyLab: readStrategyLabState(),
       version: 1,
     };
   }
@@ -276,12 +290,6 @@ export default function TradingViewChart() {
     if (imported.indicatorSettings) {
       setSettings({ ...defaultSettings, ...imported.indicatorSettings });
     }
-    if (Array.isArray(imported.executionProfiles)) {
-      setExecutionProfiles(imported.executionProfiles);
-    }
-    if (imported.strategyLab) {
-      writeStoredJson(STRATEGY_LAB_STORAGE_KEY, imported.strategyLab);
-    }
     setSaveStatus({ state: "Unsaved changes", lastSavedAt: saveStatus.lastSavedAt });
     event.target.value = "";
   }
@@ -296,17 +304,6 @@ export default function TradingViewChart() {
       maxSameSideFailures: config.maxSameSideFailures ?? currentSettings.maxSameSideFailures,
       strategySource: config.strategySource ?? currentSettings.strategySource,
     }));
-  }
-
-  function deployStrategyConfigToExecution(config, interval = selectedInterval, sourceName = "Strategy Lab") {
-    setExecutionProfiles((currentProfiles) =>
-      currentProfiles.map((profile) =>
-        profile.interval === interval
-          ? deployStrategyToProfile(profile, config, sourceName)
-          : profile,
-      ),
-    );
-    setSettingsPanel("Execution");
   }
 
   function resetChartView() {
@@ -326,7 +323,6 @@ export default function TradingViewChart() {
       const lastSavedAt = new Date().toISOString();
       writeStoredJson(PLATFORM_STORAGE_KEY, {
         chartTimeframe: selectedInterval,
-        executionProfiles,
         indicatorSettings: settings,
         lastSavedAt,
         version: 1,
@@ -335,7 +331,7 @@ export default function TradingViewChart() {
     }, 350);
 
     return () => window.clearTimeout(timeoutId);
-  }, [executionProfiles, selectedInterval, settings]);
+  }, [selectedInterval, settings]);
 
   const clearStrategyLines = useCallback(() => {
     if (!chartRef.current) {
@@ -706,7 +702,7 @@ export default function TradingViewChart() {
       let updatedCandles = currentCandles;
 
       if (!lastCandle || nextCandle.time > lastCandle.time) {
-        updatedCandles = [...currentCandles, nextCandle].slice(-settings.historyLimit);
+        updatedCandles = [...currentCandles, nextCandle].slice(-historyLimit);
       } else if (nextCandle.time === lastCandle.time) {
         updatedCandles = [...currentCandles.slice(0, -1), nextCandle];
       }
@@ -719,7 +715,7 @@ export default function TradingViewChart() {
       setError("");
 
       try {
-        const candles = await fetchSolKlines(selectedInterval, settings.historyLimit);
+        const candles = await fetchSolKlines(selectedInterval, historyLimit);
 
         if (ignore || requestIdRef.current !== requestId) {
           return;
@@ -761,7 +757,7 @@ export default function TradingViewChart() {
       ignore = true;
       closeSocket?.();
     };
-  }, [selectedInterval, settings.historyLimit]);
+  }, [historyLimit, selectedInterval]);
 
   useEffect(() => {
     if (rawCandles.length > 0) {
@@ -799,9 +795,7 @@ export default function TradingViewChart() {
               data-active={settingsPanel === label}
               key={label}
               onClick={() => {
-                if (label === "Indicators" || label === "Strategy" || label === "Execution") {
-                  setSettingsPanel((currentPanel) => (currentPanel === label ? null : label));
-                }
+                setSettingsPanel((currentPanel) => (currentPanel === label ? null : label));
               }}
               type="button"
             >
@@ -829,32 +823,18 @@ export default function TradingViewChart() {
         <span>{saveStatus.lastSavedAt ? `Last saved at ${new Date(saveStatus.lastSavedAt).toLocaleString()}` : "Autosave ready"}</span>
       </div>
 
-      {settingsPanel === "Indicators" && (
-        <SettingsPanel settings={settings} updateSetting={updateSetting} />
-      )}
-
-      {settingsPanel === "Strategy" && (
-        <StrategyLab
-          backtestResult={backtestResult}
+      {settingsPanel && (
+        <ControlCenter
+          activePanel={settingsPanel}
           onApplyChart={applyStrategyConfigToChart}
           onBacktestResult={handleBacktestResult}
           onClose={() => setSettingsPanel(null)}
-          onDeployExecution={deployStrategyConfigToExecution}
           rawCandles={rawCandles}
           selectedInterval={selectedInterval}
+          setActivePanel={setSettingsPanel}
           setSelectedInterval={updateSelectedInterval}
           settings={settings}
           updateSetting={updateSetting}
-        />
-      )}
-
-      {settingsPanel === "Execution" && (
-        <ExecutionPanel
-          onClose={() => setSettingsPanel(null)}
-          profiles={executionProfiles}
-          rawCandles={rawCandles}
-          selectedInterval={selectedInterval}
-          setProfiles={updateExecutionProfiles}
         />
       )}
 
@@ -958,121 +938,5 @@ function MeasurementOverlay({ measurementView }) {
         </foreignObject>
       )}
     </svg>
-  );
-}
-
-function SettingsPanel({ settings, updateSetting }) {
-  return (
-    <aside className="hubert-settings" aria-label="Strategy settings">
-      <div className="hubert-settings__header">
-        <strong>Strategy Settings</strong>
-        <span>Choromański V1</span>
-      </div>
-
-      <label>
-        <span>Strategy source</span>
-        <select
-          value={settings.strategySource}
-          onChange={(event) => updateSetting("strategySource", event.target.value)}
-        >
-          <option value="pine-ha">Pine HA parity</option>
-          <option value="raw-exchange">Raw exchange</option>
-        </select>
-      </label>
-
-      <label>
-        <span>Nadaraya bandwidth</span>
-        <input
-          min="1"
-          max="40"
-          step="0.5"
-          type="number"
-          value={settings.bandwidth}
-          onChange={(event) => updateSetting("bandwidth", Number(event.target.value))}
-        />
-      </label>
-
-      <label>
-        <span>Nadaraya multiplier</span>
-        <input
-          min="0.5"
-          max="10"
-          step="0.1"
-          type="number"
-          value={settings.envelopeMultiplier}
-          onChange={(event) => updateSetting("envelopeMultiplier", Number(event.target.value))}
-        />
-      </label>
-
-      <label>
-        <span>ATR length</span>
-        <input
-          min="1"
-          max="100"
-          step="1"
-          type="number"
-          value={settings.atrLength}
-          onChange={(event) => updateSetting("atrLength", Number(event.target.value))}
-        />
-      </label>
-
-      <label>
-        <span>ATR multiplier</span>
-        <input
-          min="0.1"
-          max="10"
-          step="0.1"
-          type="number"
-          value={settings.atrMultiplier}
-          onChange={(event) => updateSetting("atrMultiplier", Number(event.target.value))}
-        />
-      </label>
-
-      <label>
-        <span>Max same-side failures</span>
-        <input
-          min="1"
-          max="10"
-          step="1"
-          type="number"
-          value={settings.maxSameSideFailures}
-          onChange={(event) => updateSetting("maxSameSideFailures", Number(event.target.value))}
-        />
-      </label>
-
-      <label>
-        <span>History limit</span>
-        <select
-          value={settings.historyLimit}
-          onChange={(event) => updateSetting("historyLimit", Number(event.target.value))}
-        >
-          <option value="500">500</option>
-          <option value="1000">1000</option>
-          <option value="2000">2000</option>
-          <option value="3000">3000</option>
-          <option value="5000">5000</option>
-        </select>
-      </label>
-
-      <div className="hubert-settings__toggles">
-        {[
-          ["showBands", "Show bands"],
-          ["showEntries", "Show confirmed entries"],
-          ["showBenchmarks", "Show benchmark candidates"],
-          ["showNegated", "Show negated setups"],
-          ["showSl", "Show SL lines"],
-          ["showTrigger", "Show trigger lines"],
-        ].map(([key, label]) => (
-          <label key={key}>
-            <input
-              checked={settings[key]}
-              type="checkbox"
-              onChange={(event) => updateSetting(key, event.target.checked)}
-            />
-            <span>{label}</span>
-          </label>
-        ))}
-      </div>
-    </aside>
   );
 }
