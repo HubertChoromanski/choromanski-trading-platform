@@ -35,6 +35,7 @@ const DEBUG_REASONS = {
   BAND_MISSING: "no band touch",
   HA_MISSING: "HA confirmation missing",
   HISTORY_MISSING: "missing candle/history",
+  FAILED_OPPOSITE_SETUP_LIMIT: "Failed opposite setup limit closed current position",
   OTHER_FILTER: "other filter",
   SL_LIMITER: "SL limiter blocked",
   SIZING_INVALID: "MM/sizing invalid",
@@ -181,6 +182,10 @@ function isDirectionBlocked(direction, longFailures, shortFailures, maxFailures)
   return failureCountForDirection(direction, longFailures, shortFailures) >= maxFailures;
 }
 
+function failedSetupLimitReached(direction, longFailures, shortFailures, maxFailures) {
+  return isDirectionBlocked(direction, longFailures, shortFailures, maxFailures);
+}
+
 function createDebugRow(candle, band, flags) {
   return {
     time: candle.time,
@@ -255,6 +260,11 @@ function makeBlockedEvent(direction, index, candle, longFailures, shortFailures,
     index,
     candle,
     {
+      blockReason: `Skipped ${direction}: consecutive ${direction} SL limit reached`,
+      consecutiveLongFailuresAfter: longFailures,
+      consecutiveLongFailuresBefore: longFailures,
+      consecutiveShortFailuresAfter: shortFailures,
+      consecutiveShortFailuresBefore: shortFailures,
       failureCount: failureCountForDirection(direction, longFailures, shortFailures),
       maxSameSideFailures: maxFailures,
       status: "BLOCKED",
@@ -266,7 +276,12 @@ function makeDiagnosticEvent({
   activeSetup,
   atrReady = true,
   bandTouchCondition,
+  blockReason = "",
   candle,
+  consecutiveLongFailuresAfter = null,
+  consecutiveLongFailuresBefore = null,
+  consecutiveShortFailuresAfter = null,
+  consecutiveShortFailuresBefore = null,
   config,
   direction,
   haConfirmationCondition,
@@ -274,26 +289,37 @@ function makeDiagnosticEvent({
   longFailures,
   position,
   reason,
+  failedOppositeCount = null,
+  resetReason = "",
   setupId = "",
   setupValid = false,
   shortFailures,
   tradeOpened = false,
+  tradeExitReason = "",
 }) {
   return {
     atrReady,
     bandTouchCondition: Boolean(bandTouchCondition),
+    blockReason,
     candleTime: candle.time,
+    consecutiveLongFailuresAfter,
+    consecutiveLongFailuresBefore,
+    consecutiveShortFailuresAfter,
+    consecutiveShortFailuresBefore,
     currentLongSlStreak: longFailures,
     currentShortSlStreak: shortFailures,
+    failedOppositeCount,
     index,
     limiterBlockingLong: isDirectionBlocked("LONG", longFailures, shortFailures, config.maxSameSideFailures),
     limiterBlockingShort: isDirectionBlocked("SHORT", longFailures, shortFailures, config.maxSameSideFailures),
     positionState: position,
     reason,
+    resetReason,
     setupId: setupId || activeSetup?.setupId || "",
     setupValid: Boolean(setupValid),
     side: direction,
     tradeOpened: Boolean(tradeOpened),
+    tradeExitReason,
     haConfirmationCondition: Boolean(haConfirmationCondition),
   };
 }
@@ -362,8 +388,6 @@ export function evaluateChoromanskiStrategy({
   let setupSequence = 0;
   let consecutiveLongFailures = 0;
   let consecutiveShortFailures = 0;
-  const blockedDirections = new Set();
-
   for (let index = 1; index < sourceCandles.length; index += 1) {
     const candle = sourceCandles[index];
     const previousCandle = sourceCandles[index - 1];
@@ -380,24 +404,31 @@ export function evaluateChoromanskiStrategy({
     diagnosticSummary.totalEvaluatedCandles += 1;
 
     if (activePosition && index > activePosition.entryIndex && positionStopped(activePosition, candle)) {
+      const consecutiveLongFailuresBefore = consecutiveLongFailures;
+      const consecutiveShortFailuresBefore = consecutiveShortFailures;
+      if (activePosition.direction === "LONG") {
+        consecutiveLongFailures += 1;
+      } else {
+        consecutiveShortFailures += 1;
+      }
       const exitEvent = makeEvent(
         STRATEGY_EVENT_TYPES.POSITION_EXITED,
         activePosition,
         index,
         candle,
         {
+          consecutiveLongFailuresAfter: consecutiveLongFailures,
+          consecutiveLongFailuresBefore,
+          consecutiveShortFailuresAfter: consecutiveShortFailures,
+          consecutiveShortFailuresBefore,
           exitPrice: activePosition.stopLoss,
           exitReason: "SL",
           status: SETUP_STATUSES.CLOSED,
+          tradeExitReason: "SL",
         },
       );
       events.push(exitEvent);
       addLifecycle(debug, exitEvent);
-      if (activePosition.direction === "LONG") {
-        consecutiveLongFailures += 1;
-      } else {
-        consecutiveShortFailures += 1;
-      }
       updateAudit(auditBySetupId, activePosition.setupId, {
         exitIndex: index,
         exitTime: candle.time,
@@ -436,10 +467,11 @@ export function evaluateChoromanskiStrategy({
           consecutiveLongFailures,
           consecutiveShortFailures,
           config.maxSameSideFailures,
-          )
+        )
       ) {
         diagnosticEvents.push(makeDiagnosticEvent({
           bandTouchCondition: true,
+          blockReason: "Skipped LONG: consecutive LONG SL limit reached",
           candle,
           config,
           direction: "LONG",
@@ -452,20 +484,17 @@ export function evaluateChoromanskiStrategy({
           shortFailures: consecutiveShortFailures,
         }));
         incrementDiagnosticReason(diagnosticSummary, DEBUG_REASONS.SL_LIMITER, "LONG");
-        if (!blockedDirections.has("LONG")) {
-          const blockedEvent = makeBlockedEvent(
-            "LONG",
-            index,
-            candle,
-            consecutiveLongFailures,
-            consecutiveShortFailures,
-            config.maxSameSideFailures,
-          );
-          events.push(blockedEvent);
-          addLifecycle(debug, blockedEvent);
-          debug.blocked = "LONG";
-          blockedDirections.add("LONG");
-        }
+        const blockedEvent = makeBlockedEvent(
+          "LONG",
+          index,
+          candle,
+          consecutiveLongFailures,
+          consecutiveShortFailures,
+          config.maxSameSideFailures,
+        );
+        events.push(blockedEvent);
+        addLifecycle(debug, blockedEvent);
+        debug.blocked = "LONG";
       } else {
         if (!longHaConfirmation) {
           diagnosticEvents.push(makeDiagnosticEvent({
@@ -527,10 +556,11 @@ export function evaluateChoromanskiStrategy({
           consecutiveLongFailures,
           consecutiveShortFailures,
           config.maxSameSideFailures,
-          )
+        )
       ) {
         diagnosticEvents.push(makeDiagnosticEvent({
           bandTouchCondition: true,
+          blockReason: "Skipped SHORT: consecutive SHORT SL limit reached",
           candle,
           config,
           direction: "SHORT",
@@ -543,20 +573,17 @@ export function evaluateChoromanskiStrategy({
           shortFailures: consecutiveShortFailures,
         }));
         incrementDiagnosticReason(diagnosticSummary, DEBUG_REASONS.SL_LIMITER, "SHORT");
-        if (!blockedDirections.has("SHORT")) {
-          const blockedEvent = makeBlockedEvent(
-            "SHORT",
-            index,
-            candle,
-            consecutiveLongFailures,
-            consecutiveShortFailures,
-            config.maxSameSideFailures,
-          );
-          events.push(blockedEvent);
-          addLifecycle(debug, blockedEvent);
-          debug.blocked = debug.blocked ? `${debug.blocked},SHORT` : "SHORT";
-          blockedDirections.add("SHORT");
-        }
+        const blockedEvent = makeBlockedEvent(
+          "SHORT",
+          index,
+          candle,
+          consecutiveLongFailures,
+          consecutiveShortFailures,
+          config.maxSameSideFailures,
+        );
+        events.push(blockedEvent);
+        addLifecycle(debug, blockedEvent);
+        debug.blocked = debug.blocked ? `${debug.blocked},SHORT` : "SHORT";
       } else {
         if (!shortHaConfirmation) {
           diagnosticEvents.push(makeDiagnosticEvent({
@@ -619,6 +646,16 @@ export function evaluateChoromanskiStrategy({
 
     if (benchmarkConfirmed) {
       activeSetup = makeSetup(waitingBenchmark, index, candle, atr[index], config.atrMultiplier);
+      const consecutiveLongFailuresBefore = consecutiveLongFailures;
+      const consecutiveShortFailuresBefore = consecutiveShortFailures;
+      let resetReason = "";
+      if (activeSetup.direction === "LONG" && consecutiveShortFailures > 0) {
+        consecutiveShortFailures = 0;
+        resetReason = "LONG setup reset SHORT failure streak";
+      } else if (activeSetup.direction === "SHORT" && consecutiveLongFailures > 0) {
+        consecutiveLongFailures = 0;
+        resetReason = "SHORT setup reset LONG failure streak";
+      }
       if (activeSetup.direction === "LONG") {
         diagnosticSummary.validLongSetups += 1;
       } else {
@@ -627,6 +664,10 @@ export function evaluateChoromanskiStrategy({
       diagnosticEvents.push(makeDiagnosticEvent({
         bandTouchCondition: activeSetup.signalIndex === index,
         candle,
+        consecutiveLongFailuresAfter: consecutiveLongFailures,
+        consecutiveLongFailuresBefore,
+        consecutiveShortFailuresAfter: consecutiveShortFailures,
+        consecutiveShortFailuresBefore,
         config,
         direction: activeSetup.direction,
         haConfirmationCondition: true,
@@ -634,6 +675,7 @@ export function evaluateChoromanskiStrategy({
         longFailures: consecutiveLongFailures,
         position,
         reason: DEBUG_REASONS.OTHER_FILTER,
+        resetReason,
         setupId: activeSetup.setupId,
         setupValid: true,
         shortFailures: consecutiveShortFailures,
@@ -654,6 +696,11 @@ export function evaluateChoromanskiStrategy({
         index,
         candle,
         {
+          consecutiveLongFailuresAfter: consecutiveLongFailures,
+          consecutiveLongFailuresBefore,
+          consecutiveShortFailuresAfter: consecutiveShortFailures,
+          consecutiveShortFailuresBefore,
+          resetReason,
           status: SETUP_STATUSES.PENDING,
         },
       );
@@ -663,6 +710,11 @@ export function evaluateChoromanskiStrategy({
         index,
         candle,
         {
+          consecutiveLongFailuresAfter: consecutiveLongFailures,
+          consecutiveLongFailuresBefore,
+          consecutiveShortFailuresAfter: consecutiveShortFailures,
+          consecutiveShortFailuresBefore,
+          resetReason,
           status: SETUP_STATUSES.PENDING,
         },
       );
@@ -714,31 +766,56 @@ export function evaluateChoromanskiStrategy({
       const triggered = setupTriggered(activeSetup, candle);
 
       if (invalidated) {
+        const consecutiveLongFailuresBefore = consecutiveLongFailures;
+        const consecutiveShortFailuresBefore = consecutiveShortFailures;
+        if (activeSetup.direction === "LONG") {
+          consecutiveLongFailures += 1;
+        } else {
+          consecutiveShortFailures += 1;
+        }
         const invalidatedEvent = makeEvent(
           STRATEGY_EVENT_TYPES.SETUP_INVALIDATED,
           activeSetup,
           index,
           candle,
           {
+            consecutiveLongFailuresAfter: consecutiveLongFailures,
+            consecutiveLongFailuresBefore,
+            consecutiveShortFailuresAfter: consecutiveShortFailures,
+            consecutiveShortFailuresBefore,
             status: SETUP_STATUSES.INVALIDATED,
             triggerTouched: triggered,
           },
         );
         events.push(invalidatedEvent);
         addLifecycle(debug, invalidatedEvent);
-        if (activeSetup.direction === "LONG") {
-          consecutiveLongFailures += 1;
-        } else {
-          consecutiveShortFailures += 1;
-        }
+        const failedOppositeCount = failureCountForDirection(
+          activeSetup.direction,
+          consecutiveLongFailures,
+          consecutiveShortFailures,
+        );
+        const shouldCloseActivePositionForOppositeFailures =
+          activePosition &&
+          activePosition.direction !== activeSetup.direction &&
+          failedSetupLimitReached(
+            activeSetup.direction,
+            consecutiveLongFailures,
+            consecutiveShortFailures,
+            config.maxSameSideFailures,
+          );
         diagnosticEvents.push(makeDiagnosticEvent({
           activeSetup,
           bandTouchCondition: false,
           candle,
+          consecutiveLongFailuresAfter: consecutiveLongFailures,
+          consecutiveLongFailuresBefore,
+          consecutiveShortFailuresAfter: consecutiveShortFailures,
+          consecutiveShortFailuresBefore,
           config,
           direction: activeSetup.direction,
           haConfirmationCondition: activeSetup.direction === "LONG" ? longHaConfirmation : shortHaConfirmation,
           index,
+          failedOppositeCount,
           longFailures: consecutiveLongFailures,
           position,
           reason: DEBUG_REASONS.OTHER_FILTER,
@@ -752,6 +829,58 @@ export function evaluateChoromanskiStrategy({
           invalidationTime: candle.time,
           status: SETUP_STATUSES.INVALIDATED,
         });
+        if (shouldCloseActivePositionForOppositeFailures) {
+          const exitEvent = makeEvent(
+            STRATEGY_EVENT_TYPES.POSITION_EXITED,
+            activePosition,
+            index,
+            candle,
+            {
+              consecutiveLongFailuresAfter: consecutiveLongFailures,
+              consecutiveLongFailuresBefore,
+              consecutiveShortFailuresAfter: consecutiveShortFailures,
+              consecutiveShortFailuresBefore,
+              exitPrice: activeSetup.stopLoss,
+              exitReason: "FAILED_OPPOSITE_SETUP_LIMIT",
+              failedOppositeCount,
+              failedSetupDirection: activeSetup.direction,
+              failedSetupId: activeSetup.setupId,
+              status: SETUP_STATUSES.CLOSED,
+              tradeExitReason: "FAILED_OPPOSITE_SETUP_LIMIT",
+            },
+          );
+          events.push(exitEvent);
+          addLifecycle(debug, exitEvent);
+          diagnosticEvents.push(makeDiagnosticEvent({
+            activeSetup,
+            bandTouchCondition: false,
+            candle,
+            consecutiveLongFailuresAfter: consecutiveLongFailures,
+            consecutiveLongFailuresBefore,
+            consecutiveShortFailuresAfter: consecutiveShortFailures,
+            consecutiveShortFailuresBefore,
+            config,
+            direction: activeSetup.direction,
+            failedOppositeCount,
+            haConfirmationCondition: activeSetup.direction === "LONG" ? longHaConfirmation : shortHaConfirmation,
+            index,
+            longFailures: consecutiveLongFailures,
+            position,
+            reason: DEBUG_REASONS.FAILED_OPPOSITE_SETUP_LIMIT,
+            setupId: activeSetup.setupId,
+            setupValid: false,
+            shortFailures: consecutiveShortFailures,
+            tradeExitReason: "FAILED_OPPOSITE_SETUP_LIMIT",
+          }));
+          updateAudit(auditBySetupId, activePosition.setupId, {
+            exitIndex: index,
+            exitTime: candle.time,
+            exitReason: "FAILED_OPPOSITE_SETUP_LIMIT",
+            status: SETUP_STATUSES.CLOSED,
+          });
+          activePosition = null;
+          position = STRATEGY_STATES.NEUTRAL;
+        }
         activeSetup = null;
       } else if (triggered) {
         if (activePosition && activePosition.direction !== activeSetup.direction) {
@@ -761,9 +890,14 @@ export function evaluateChoromanskiStrategy({
             index,
             candle,
             {
+              consecutiveLongFailuresAfter: consecutiveLongFailures,
+              consecutiveLongFailuresBefore: consecutiveLongFailures,
+              consecutiveShortFailuresAfter: consecutiveShortFailures,
+              consecutiveShortFailuresBefore: consecutiveShortFailures,
               exitPrice: activeSetup.trigger,
               exitReason: "REVERSAL",
               status: SETUP_STATUSES.CLOSED,
+              tradeExitReason: "REVERSAL",
             },
           );
           events.push(exitEvent);
@@ -776,12 +910,28 @@ export function evaluateChoromanskiStrategy({
           });
         }
 
+        const consecutiveLongFailuresBefore = consecutiveLongFailures;
+        const consecutiveShortFailuresBefore = consecutiveShortFailures;
+        let resetReason = "";
+        if (activeSetup.direction === "LONG" && consecutiveShortFailures > 0) {
+          consecutiveShortFailures = 0;
+          resetReason = "LONG entry reset SHORT failure streak";
+        } else if (activeSetup.direction === "SHORT" && consecutiveLongFailures > 0) {
+          consecutiveLongFailures = 0;
+          resetReason = "SHORT entry reset LONG failure streak";
+        }
+
         const entryEvent = makeEvent(
           STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED,
           activeSetup,
           index,
           candle,
           {
+            consecutiveLongFailuresAfter: consecutiveLongFailures,
+            consecutiveLongFailuresBefore,
+            consecutiveShortFailuresAfter: consecutiveShortFailures,
+            consecutiveShortFailuresBefore,
+            resetReason,
             status: SETUP_STATUSES.ENTERED,
           },
         );
@@ -791,8 +941,13 @@ export function evaluateChoromanskiStrategy({
           index,
           candle,
           {
+            consecutiveLongFailuresAfter: consecutiveLongFailures,
+            consecutiveLongFailuresBefore,
+            consecutiveShortFailuresAfter: consecutiveShortFailures,
+            consecutiveShortFailuresBefore,
             entryIndex: index,
             entryTime: candle.time,
+            resetReason,
             status: SETUP_STATUSES.ENTERED,
           },
         );
@@ -809,6 +964,10 @@ export function evaluateChoromanskiStrategy({
           activeSetup,
           bandTouchCondition: false,
           candle,
+          consecutiveLongFailuresAfter: consecutiveLongFailures,
+          consecutiveLongFailuresBefore,
+          consecutiveShortFailuresAfter: consecutiveShortFailures,
+          consecutiveShortFailuresBefore,
           config,
           direction: activeSetup.direction,
           haConfirmationCondition: activeSetup.direction === "LONG" ? longHaConfirmation : shortHaConfirmation,
@@ -816,18 +975,12 @@ export function evaluateChoromanskiStrategy({
           longFailures: consecutiveLongFailures,
           position,
           reason: "",
+          resetReason,
           setupId: activeSetup.setupId,
           setupValid: true,
           shortFailures: consecutiveShortFailures,
           tradeOpened: true,
         }));
-        if (activeSetup.direction === "LONG") {
-          consecutiveShortFailures = 0;
-          blockedDirections.delete("SHORT");
-        } else {
-          consecutiveLongFailures = 0;
-          blockedDirections.delete("LONG");
-        }
         updateAudit(auditBySetupId, activeSetup.setupId, {
           entryIndex: index,
           entryTime: candle.time,
