@@ -32,6 +32,7 @@ const TIMEFRAMES = [
   { label: "4H", interval: "4h", minutes: 240 },
 ];
 const PREVIEW_CURVE_POINTS = 420;
+const BACKTEST_CHART_TRADE_LIMIT = 500;
 const TRADE_TABLE_PAGE_SIZE = 50;
 const STORED_BACKTEST_EVENT_LIMIT = 1000;
 // TODO: Sweep Backtesting should return as a fast comparison mode: run many parameter combinations without rendering charts and output a compact ranked table only.
@@ -259,6 +260,13 @@ function filterCandlesByBacktestForm(rawCandles, form) {
   return rawCandles.filter((candle) => candle.time >= from && candle.time <= to);
 }
 
+function rangeFromBacktestCandles(candles = []) {
+  return {
+    from: candles[0]?.time ?? null,
+    to: candles.at(-1)?.time ?? null,
+  };
+}
+
 function analyzeBacktest(result) {
   if (!result) return "Run a backtest to see the story behind the numbers.";
   const { metrics } = result;
@@ -404,6 +412,16 @@ function compactBacktestResult(result) {
   };
 }
 
+function renderedBacktestTradeCount(result, candles = []) {
+  if (!result) return 0;
+  const candleTimes = candles.length ? new Set(candles.map((candle) => candle.time)) : null;
+
+  return (result.trades ?? [])
+    .slice(-BACKTEST_CHART_TRADE_LIMIT)
+    .filter((trade) => trade.entryTime && (!candleTimes || candleTimes.has(trade.entryTime)))
+    .length;
+}
+
 function Help({ text }) {
   return (
     <span className="hubert-help" tabIndex="0" aria-label={text}>
@@ -422,9 +440,14 @@ function MiniStatus({ children, tone = "neutral" }) {
 
 export default function ControlCenter({
   activePanel,
+  activeBacktestSession,
+  backtestAnalysisActive,
   onApplyChart,
+  onAnalyzeBacktest,
   onBacktestResult,
+  onClearBacktest,
   onClose,
+  onExitBacktestAnalysis,
   rawCandles,
   selectedInterval,
   setActivePanel,
@@ -462,7 +485,7 @@ export default function ControlCenter({
   const [strategyForm, setStrategyForm] = useState({ ...defaultStrategyDeck, ...settings, name: "" });
   const [mmForm, setMmForm] = useState(defaultMmDeck);
   const [backtestForm, setBacktestForm] = useState(defaultBacktestForm);
-  const [backtestResult, setBacktestResult] = useState(null);
+  const [backtestResult, setBacktestResult] = useState(activeBacktestSession?.result ?? null);
   const [decision, setDecision] = useState({
     apiProfile: "main",
     battleName: "",
@@ -555,6 +578,10 @@ export default function ControlCenter({
     runAction("initial-load", "Sync platform", refreshAll);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    setBacktestResult(activeBacktestSession?.result ?? null);
+  }, [activeBacktestSession?.id, activeBacktestSession?.result]);
 
   async function saveCollectionItem(collection, item, shouldRefresh = true) {
     const route = collectionRoutes[collection];
@@ -682,16 +709,30 @@ export default function ControlCenter({
       rawCandles: candles,
       settings: strategyToSettings(deck, settings),
     });
+    const analysisRange = rangeFromBacktestCandles(candles);
+    const analysisSettings = strategyToSettings(deck, settings);
     const named = compactBacktestResult({
       ...result,
+      analysisRange,
+      analysisSettings,
       createdAt: new Date().toISOString(),
       id: `backtest-${Date.now()}`,
+      mmDeckId: mmDeck?.id ?? "",
+      mmDeckName: mmDeck?.name ?? "No MM deck",
       name: form.name || `${deck.name} ${new Date().toLocaleDateString()}`,
       strategyDeckId: deck.id,
       strategyDeckName: deck.name,
+      timeframe: selectedInterval,
     });
     setBacktestResult(named);
-    onBacktestResult(named);
+    onBacktestResult(named, {
+      candles,
+      mmDeckName: mmDeck?.name ?? "No MM deck",
+      range: analysisRange,
+      settings: analysisSettings,
+      strategyDeckName: deck.name,
+      timeframe: selectedInterval,
+    });
     return named;
   }
 
@@ -807,6 +848,8 @@ export default function ControlCenter({
 
       {panel === "Backtests" && (
         <BacktestsPanel
+          analysisActive={backtestAnalysisActive}
+          analysisSession={activeBacktestSession}
           favorites={favorites}
           form={backtestForm}
           mmDecks={mmDecks}
@@ -817,6 +860,15 @@ export default function ControlCenter({
           onDelete={(item) => runAction(`delete-backtest-${item.id}`, "Delete backtest", () => deleteCollectionItem("backtests", item))}
           onFavorite={(item) => runAction(`fav-backtest-${item.id}`, "Add favorite", () => addFavorite("Backtests", item))}
           onHide={(item) => runAction(`hide-backtest-${item.id}`, "Hide backtest", () => saveCollectionItem("backtests", { ...item, hidden: true }))}
+          onAnalyze={() => runAction("analyze-backtest", "Analyze on Chart", onAnalyzeBacktest)}
+          onClear={() => runAction("clear-backtest", "Clear result", async () => {
+            setBacktestResult(null);
+            onClearBacktest();
+          })}
+          onExitAnalysis={() => runAction("exit-backtest-analysis", "Exit analysis", async () => {
+            setBacktestResult(null);
+            onExitBacktestAnalysis();
+          })}
           onRun={() => runAction("run-backtest", "Run backtest", async () => runBrowserBacktest())}
           onSave={() => runAction("save-backtest", "Save backtest", () => saveBacktest())}
         />
@@ -1305,11 +1357,32 @@ function StrategyDecksPanel({ decks, favorites, form, onApplyChart, onDelete, on
   );
 }
 
-function BacktestsPanel({ favorites, form, mmDecks, onDelete, onFavorite, onHide, onRun, onSave, result, savedBacktests, setForm, strategyDecks }) {
+function BacktestsPanel({
+  analysisActive,
+  analysisSession,
+  favorites,
+  form,
+  mmDecks,
+  onAnalyze,
+  onClear,
+  onDelete,
+  onExitAnalysis,
+  onFavorite,
+  onHide,
+  onRun,
+  onSave,
+  result,
+  savedBacktests,
+  setForm,
+  strategyDecks,
+}) {
   const favoriteBacktests = favorites
     .filter((favorite) => favorite.category === "Backtests")
     .map((favorite) => savedBacktests.find((item) => item.id === favorite.itemId))
     .filter(Boolean);
+  const tableTradeCount = result?.trades?.length ?? 0;
+  const renderedTrades = renderedBacktestTradeCount(result, analysisSession?.candles);
+  const hasTradeRenderMismatch = result && renderedTrades !== tableTradeCount;
 
   return (
     <section className="hubert-lab__section">
@@ -1327,6 +1400,29 @@ function BacktestsPanel({ favorites, form, mmDecks, onDelete, onFavorite, onHide
         <button type="button" onClick={onRun}>Run Backtest</button>
         <button type="button" onClick={onSave}>Name & Save</button>
       </div>
+      {result && (
+        <div className="hubert-analysis-card">
+          <div>
+            <strong>{analysisActive ? "Backtest Analysis Mode is active" : "Backtest result is ready"}</strong>
+            <span>
+              {analysisSession?.strategyDeckName ?? result.strategyDeckName ?? "Strategy Deck"} · {analysisSession?.timeframe ?? result.timeframe ?? "--"} · {dateText((analysisSession?.range ?? result.analysisRange)?.from)} → {dateText((analysisSession?.range ?? result.analysisRange)?.to)}
+            </span>
+            <span>
+              Trades in table: {tableTradeCount} · rendered on chart: {renderedTrades}
+            </span>
+            {hasTradeRenderMismatch && (
+              <span className="hubert-analysis-card__warning">
+                Chart markers are capped for speed; use the table for the full record.
+              </span>
+            )}
+          </div>
+          <div className="hubert-lab__actions">
+            <button type="button" onClick={onAnalyze}>Analyze on Chart</button>
+            <button type="button" onClick={onExitAnalysis}>Exit Analysis</button>
+            <button type="button" onClick={onClear}>Clear Result</button>
+          </div>
+        </div>
+      )}
       <BacktestResult result={result} />
       {favoriteBacktests.length > 0 && (
         <>

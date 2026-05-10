@@ -61,6 +61,8 @@ function closePosition({ candle, equity, exitPrice, position, reason, slippagePe
       setupId: position.setupId,
       slDistancePercent: position.slDistancePercent,
       size: position.notional,
+      stopLoss: position.stopLoss,
+      takeProfit: position.takeProfit ?? null,
     },
   };
 }

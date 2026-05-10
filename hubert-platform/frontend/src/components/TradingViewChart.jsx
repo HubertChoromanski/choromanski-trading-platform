@@ -7,7 +7,6 @@ import {
   createSeriesMarkers,
 } from "lightweight-charts";
 import { createSolKlineSocket, fetchSolKlines } from "../api/binance";
-import { toBacktestMarkers } from "../backtest/backtestEngine";
 import {
   STRATEGY_EVENT_TYPES,
   evaluateChoromanskiStrategy,
@@ -66,7 +65,15 @@ const defaultSettings = {
   showTrigger: false,
 };
 const MAX_BACKTEST_CHART_MARKERS = 500;
+const MAX_BACKTEST_DEBUG_MARKERS = 80;
 const MAX_STRATEGY_LINE_EVENTS = 220;
+const defaultBacktestOverlaySettings = {
+  showDebug: false,
+  showExits: true,
+  showPnlLabels: true,
+  showSlTp: true,
+  showTrades: true,
+};
 
 function formatMeasurementValue(value) {
   const prefix = value > 0 ? "+" : "";
@@ -80,6 +87,137 @@ function getBarIndex(time, candles) {
   }
 
   return candles.findIndex((candle) => candle.time === time);
+}
+
+function formatChartPrice(value) {
+  return Number.isFinite(Number(value)) ? Number(value).toFixed(2) : "--";
+}
+
+function formatChartPnl(value) {
+  if (!Number.isFinite(Number(value))) return "";
+  const prefix = Number(value) > 0 ? "+" : "";
+
+  return `${prefix}${Number(value).toFixed(2)}`;
+}
+
+function formatChartTime(value) {
+  if (!value) return "--";
+
+  return new Date(Number(value) * 1000).toLocaleString();
+}
+
+function compactReason(reason = "") {
+  const normalized = String(reason).toLowerCase();
+
+  if (normalized.includes("limiter")) return "SL limiter";
+  if (normalized.includes("ha")) return "HA missing";
+  if (normalized.includes("position")) return "In position";
+  if (normalized.includes("sizing") || normalized.includes("mm")) return "MM invalid";
+  if (normalized.includes("history")) return "Missing data";
+  if (normalized.includes("band")) return "Band missing";
+
+  return "Candidate";
+}
+
+function rangeFromCandles(candles = []) {
+  return {
+    from: candles[0]?.time ?? null,
+    to: candles.at(-1)?.time ?? null,
+  };
+}
+
+function filterCandlesByRange(candles = [], range = {}) {
+  if (!range.from && !range.to) return candles;
+
+  return candles.filter((candle) => {
+    const afterStart = !range.from || candle.time >= range.from;
+    const beforeEnd = !range.to || candle.time <= range.to;
+
+    return afterStart && beforeEnd;
+  });
+}
+
+function candleTimeSet(candles = []) {
+  return new Set(candles.map((candle) => candle.time));
+}
+
+function isRenderableTrade(trade, times) {
+  return Boolean(trade?.entryTime && (!times || times.has(trade.entryTime)));
+}
+
+function renderedTradeCount(result, candles = [], overlaySettings = defaultBacktestOverlaySettings) {
+  if (!result || !overlaySettings.showTrades) return 0;
+  const times = candles.length ? candleTimeSet(candles) : null;
+
+  return (result.trades ?? [])
+    .slice(-MAX_BACKTEST_CHART_MARKERS)
+    .filter((trade) => isRenderableTrade(trade, times))
+    .length;
+}
+
+function toBacktestAnalysisMarkers(result, overlaySettings = defaultBacktestOverlaySettings, candles = []) {
+  if (!result) return [];
+  const times = candles.length ? candleTimeSet(candles) : null;
+
+  const tradeMarkers = overlaySettings.showTrades
+    ? (result.trades ?? [])
+      .slice(-MAX_BACKTEST_CHART_MARKERS)
+      .filter((trade) => isRenderableTrade(trade, times))
+      .flatMap((trade, index) => {
+        const side = trade.direction === "LONG" ? "LONG" : "SHORT";
+        const entryText = overlaySettings.showPnlLabels
+          ? `${side} ${formatChartPrice(trade.entryPrice)}`
+          : side;
+        const exitReason = trade.exitReason ?? "EXIT";
+        const exitText = overlaySettings.showPnlLabels
+          ? `${exitReason} ${formatChartPnl(trade.netPnl)}`
+          : exitReason;
+        const markers = [
+          {
+            color: trade.direction === "LONG" ? "#f5f5f5" : "#050505",
+            id: `analysis-entry-${trade.setupId ?? index}`,
+            position: trade.direction === "LONG" ? "belowBar" : "aboveBar",
+            shape: trade.direction === "LONG" ? "arrowUp" : "arrowDown",
+            size: 1.12,
+            text: entryText,
+            time: trade.entryTime,
+          },
+        ];
+
+        if (overlaySettings.showExits) {
+          markers.push({
+            color: "rgba(110, 20, 20, 0.78)",
+            id: `analysis-exit-${trade.setupId ?? index}`,
+            position: trade.direction === "LONG" ? "aboveBar" : "belowBar",
+            shape: "square",
+            size: 0.72,
+            text: exitText,
+            time: trade.exitTime,
+          });
+        }
+
+        return markers;
+      })
+    : [];
+
+  if (!overlaySettings.showDebug) {
+    return tradeMarkers;
+  }
+
+  const debugMarkers = (result.diagnosticEvents ?? [])
+    .filter((event) => !event.tradeOpened && event.reason && (event.bandTouchCondition || event.setupId))
+    .slice(-MAX_BACKTEST_DEBUG_MARKERS)
+    .map((event, index) => ({
+      color: "rgba(44, 44, 44, 0.5)",
+      id: `analysis-debug-${event.setupId ?? event.index}-${index}`,
+      position: "inBar",
+      shape: "circle",
+      size: 0.36,
+      text: compactReason(event.reason),
+      time: event.candleTime,
+    }));
+
+  return [...debugMarkers, ...tradeMarkers];
 }
 
 function historyDaysToLimit(interval, days) {
@@ -128,6 +266,7 @@ export default function TradingViewChart() {
   const heikenAshiCacheRef = useRef([]);
   const pendingLiveCandlesRef = useRef(null);
   const liveRenderFrameRef = useRef(0);
+  const analysisModeRef = useRef(false);
   const rawCandlesRef = useRef([]);
   const fitAfterRenderRef = useRef(false);
   const requestIdRef = useRef(0);
@@ -142,8 +281,9 @@ export default function TradingViewChart() {
     ...(persistedState.indicatorSettings ?? {}),
   });
   const [settingsPanel, setSettingsPanel] = useState(null);
-  const [backtestResult, setBacktestResult] = useState(null);
-  const [backtestMarkers, setBacktestMarkers] = useState([]);
+  const [activeBacktestSession, setActiveBacktestSession] = useState(null);
+  const [backtestAnalysisActive, setBacktestAnalysisActive] = useState(false);
+  const [backtestOverlaySettings, setBacktestOverlaySettings] = useState(defaultBacktestOverlaySettings);
   const [saveStatus, setSaveStatus] = useState({
     state: "Saved",
     lastSavedAt: persistedState.lastSavedAt ?? null,
@@ -158,6 +298,11 @@ export default function TradingViewChart() {
     () => historyDaysToLimit(selectedInterval, settings.historyDays ?? settings.historyLimit),
     [selectedInterval, settings.historyDays, settings.historyLimit],
   );
+  const activeAnalysisSession = backtestAnalysisActive ? activeBacktestSession : null;
+
+  useEffect(() => {
+    analysisModeRef.current = Boolean(activeAnalysisSession);
+  }, [activeAnalysisSession]);
 
   const projectMeasurementPoint = useCallback((point) => {
     if (!point || !chartRef.current || !realPriceSeriesRef.current) {
@@ -273,9 +418,45 @@ export default function TradingViewChart() {
     setSelectedInterval(interval);
   }
 
-  function handleBacktestResult(result) {
-    setBacktestResult(result);
-    setBacktestMarkers(result ? toBacktestMarkers(result.trades).slice(-MAX_BACKTEST_CHART_MARKERS) : []);
+  function handleBacktestResult(result, context = {}) {
+    if (!result) {
+      setActiveBacktestSession(null);
+      setBacktestAnalysisActive(false);
+      fitAfterRenderRef.current = true;
+      return;
+    }
+
+    const analysisCandles = context.candles?.length
+      ? context.candles
+      : filterCandlesByRange(rawCandlesRef.current, result.analysisRange);
+    const session = {
+      candles: analysisCandles,
+      createdAt: new Date().toISOString(),
+      id: result.id ?? `analysis-${Date.now()}`,
+      mmDeckName: context.mmDeckName ?? result.mmDeckName ?? "No MM deck",
+      range: context.range ?? result.analysisRange ?? rangeFromCandles(analysisCandles),
+      result,
+      settings: context.settings ?? result.analysisSettings ?? settings,
+      strategyDeckName: context.strategyDeckName ?? result.strategyDeckName ?? "Strategy Deck",
+      timeframe: context.timeframe ?? result.timeframe ?? selectedInterval,
+    };
+
+    setActiveBacktestSession(session);
+    setBacktestAnalysisActive(true);
+    fitAfterRenderRef.current = true;
+  }
+
+  function analyzeBacktestOnChart() {
+    if (!activeBacktestSession) return;
+    setBacktestAnalysisActive(true);
+    fitAfterRenderRef.current = true;
+  }
+
+  function exitBacktestAnalysis() {
+    setActiveBacktestSession(null);
+    setBacktestAnalysisActive(false);
+    fitAfterRenderRef.current = true;
+    clearStrategyLines();
   }
 
   function buildExportState() {
@@ -457,86 +638,138 @@ export default function TradingViewChart() {
     ],
   );
 
+  const renderBacktestLines = useCallback(
+    (result, overlaySettings) => {
+      clearStrategyLines();
+
+      if (!overlaySettings.showSlTp) {
+        return;
+      }
+
+      (result?.trades ?? [])
+        .filter((trade) => Number.isFinite(Number(trade.stopLoss)) || Number.isFinite(Number(trade.takeProfit)))
+        .slice(-MAX_STRATEGY_LINE_EVENTS)
+        .forEach((trade) => {
+          const startTime = trade.entryTime;
+          const endTime = trade.exitTime ?? trade.entryTime;
+
+          if (Number.isFinite(Number(trade.stopLoss))) {
+            addStrategySegment({
+              color: "rgba(120, 24, 24, 0.72)",
+              endTime,
+              lineStyle: 2,
+              lineWidth: 1,
+              showLabel: true,
+              startTime,
+              value: Number(trade.stopLoss),
+            });
+          }
+
+          if (Number.isFinite(Number(trade.takeProfit))) {
+            addStrategySegment({
+              color: "rgba(245, 245, 245, 0.78)",
+              endTime,
+              lineStyle: 2,
+              lineWidth: 1,
+              showLabel: true,
+              startTime,
+              value: Number(trade.takeProfit),
+            });
+          }
+        });
+    },
+    [addStrategySegment, clearStrategyLines],
+  );
+
   const renderMarket = useCallback(
-    (candles, shouldFitContent = false) => {
+    (candles, shouldFitContent = false, mode = {}) => {
       if (!candleSeriesRef.current || !realPriceSeriesRef.current) {
         return;
       }
 
+      const renderSettings = mode.settings ?? settings;
       const heikenAshiCandles = toHeikenAshi(candles);
       const indicatorCandles =
-        settings.strategySource === "raw-exchange" ? candles : heikenAshiCandles;
+        renderSettings.strategySource === "raw-exchange" ? candles : heikenAshiCandles;
       const envelope = calculateNadarayaEnvelope(indicatorCandles, {
-        bandwidth: settings.bandwidth,
-        multiplier: settings.envelopeMultiplier,
+        bandwidth: renderSettings.bandwidth,
+        multiplier: renderSettings.envelopeMultiplier,
       });
-      const closedCandles = candles.filter((candle) => candle.isClosed !== false);
-      const closedHeikenAshiCandles = toHeikenAshi(closedCandles);
-      const strategyCandles =
-        settings.strategySource === "raw-exchange" ? closedCandles : closedHeikenAshiCandles;
-      const closedEnvelope = calculateNadarayaEnvelope(strategyCandles, {
-        bandwidth: settings.bandwidth,
-        multiplier: settings.envelopeMultiplier,
-      });
-      const lastClosedCandle = closedCandles[closedCandles.length - 1];
-      const strategyKey = [
-        closedCandles.length,
-        lastClosedCandle?.time ?? 0,
-        settings.bandwidth,
-        settings.envelopeMultiplier,
-        settings.atrLength,
-        settings.atrMultiplier,
-        settings.maxSameSideFailures,
-        settings.strategySource,
-      ].join(":");
       const realPriceLine = candles.map((candle) => ({
         time: candle.time,
         value: candle.close,
       }));
-      let strategyEvents = strategyCacheRef.current.events;
-
-      if (strategyCacheRef.current.key !== strategyKey) {
-        const strategyResult = evaluateChoromanskiStrategy({
-          sourceCandles: strategyCandles,
-          envelope: closedEnvelope,
-          inputs: {
-            atrLength: settings.atrLength,
-            atrMultiplier: settings.atrMultiplier,
-            maxSameSideFailures: settings.maxSameSideFailures,
-          },
-        });
-        strategyCacheRef.current = {
-          key: strategyKey,
-          events: strategyResult.events,
-        };
-        strategyEvents = strategyResult.events;
-        globalThis.__CHOROMANSKI_DEBUG_EXPORT__ = strategyResult.debugRows;
-        globalThis.__CHOROMANSKI_SETUP_AUDIT__ = strategyResult.setupAudits;
-        console.debug("Choromanski debug export available at window.__CHOROMANSKI_DEBUG_EXPORT__");
-        console.debug("Choromanski setup audit available at window.__CHOROMANSKI_SETUP_AUDIT__");
-      }
-
-      const markerEvents = filterStrategyEvents(strategyEvents, settings);
 
       heikenAshiCacheRef.current = heikenAshiCandles;
       candleSeriesRef.current.setData(heikenAshiCandles);
-      upperSeriesRef.current?.setData(settings.showBands ? toLineData(envelope, "upper") : []);
-      lowerSeriesRef.current?.setData(settings.showBands ? toLineData(envelope, "lower") : []);
+      upperSeriesRef.current?.setData(renderSettings.showBands ? toLineData(envelope, "upper") : []);
+      lowerSeriesRef.current?.setData(renderSettings.showBands ? toLineData(envelope, "lower") : []);
       realPriceSeriesRef.current.setData(realPriceLine);
-      strategyMarkersRef.current?.setMarkers([
-        ...toStrategyMarkers(markerEvents),
-        ...backtestMarkers,
-      ]);
-      renderStrategyLines(strategyEvents, closedCandles);
+
+      if (mode.analysisResult) {
+        strategyMarkersRef.current?.setMarkers(toBacktestAnalysisMarkers(mode.analysisResult, mode.overlaySettings, candles));
+        renderBacktestLines(mode.analysisResult, mode.overlaySettings);
+      } else {
+        const closedCandles = candles.filter((candle) => candle.isClosed !== false);
+        const closedHeikenAshiCandles = toHeikenAshi(closedCandles);
+        const strategyCandles =
+          renderSettings.strategySource === "raw-exchange" ? closedCandles : closedHeikenAshiCandles;
+        const closedEnvelope = calculateNadarayaEnvelope(strategyCandles, {
+          bandwidth: renderSettings.bandwidth,
+          multiplier: renderSettings.envelopeMultiplier,
+        });
+        const lastClosedCandle = closedCandles[closedCandles.length - 1];
+        const strategyKey = [
+          closedCandles.length,
+          lastClosedCandle?.time ?? 0,
+          renderSettings.bandwidth,
+          renderSettings.envelopeMultiplier,
+          renderSettings.atrLength,
+          renderSettings.atrMultiplier,
+          renderSettings.maxSameSideFailures,
+          renderSettings.strategySource,
+        ].join(":");
+        let strategyEvents = strategyCacheRef.current.events;
+
+        if (strategyCacheRef.current.key !== strategyKey) {
+          const strategyResult = evaluateChoromanskiStrategy({
+            sourceCandles: strategyCandles,
+            envelope: closedEnvelope,
+            inputs: {
+              atrLength: renderSettings.atrLength,
+              atrMultiplier: renderSettings.atrMultiplier,
+              maxSameSideFailures: renderSettings.maxSameSideFailures,
+            },
+          });
+          strategyCacheRef.current = {
+            key: strategyKey,
+            events: strategyResult.events,
+          };
+          strategyEvents = strategyResult.events;
+          globalThis.__CHOROMANSKI_DEBUG_EXPORT__ = strategyResult.debugRows;
+          globalThis.__CHOROMANSKI_SETUP_AUDIT__ = strategyResult.setupAudits;
+          console.debug("Choromanski debug export available at window.__CHOROMANSKI_DEBUG_EXPORT__");
+          console.debug("Choromanski setup audit available at window.__CHOROMANSKI_SETUP_AUDIT__");
+        }
+
+        const markerEvents = filterStrategyEvents(strategyEvents, renderSettings);
+
+        strategyMarkersRef.current?.setMarkers(toStrategyMarkers(markerEvents));
+        renderStrategyLines(strategyEvents, closedCandles);
+      }
 
       if (shouldFitContent) {
         chartRef.current?.timeScale().fitContent();
       }
     },
-    [backtestMarkers, renderStrategyLines, settings],
+    [renderBacktestLines, renderStrategyLines, settings],
   );
 
   const scheduleLiveCandleUpdate = useCallback((candles) => {
+    if (analysisModeRef.current) {
+      return;
+    }
+
     pendingLiveCandlesRef.current = candles;
 
     if (liveRenderFrameRef.current) {
@@ -832,11 +1065,27 @@ export default function TradingViewChart() {
   }, [historyLimit, scheduleLiveCandleUpdate, selectedInterval]);
 
   useEffect(() => {
+    if (activeAnalysisSession) {
+      const analysisCandles = activeAnalysisSession.candles?.length
+        ? activeAnalysisSession.candles
+        : filterCandlesByRange(rawCandles, activeAnalysisSession.range);
+
+      if (analysisCandles.length > 0) {
+        renderMarket(analysisCandles, fitAfterRenderRef.current, {
+          analysisResult: activeAnalysisSession.result,
+          overlaySettings: backtestOverlaySettings,
+          settings: activeAnalysisSession.settings,
+        });
+        fitAfterRenderRef.current = false;
+      }
+      return;
+    }
+
     if (rawCandles.length > 0) {
       renderMarket(rawCandles, fitAfterRenderRef.current);
       fitAfterRenderRef.current = false;
     }
-  }, [rawCandles, renderMarket]);
+  }, [activeAnalysisSession, backtestOverlaySettings, rawCandles, renderMarket]);
 
   return (
     <main className="hubert-dashboard">
@@ -898,9 +1147,14 @@ export default function TradingViewChart() {
       {settingsPanel && (
         <ControlCenter
           activePanel={settingsPanel}
+          activeBacktestSession={activeBacktestSession}
+          backtestAnalysisActive={backtestAnalysisActive}
           onApplyChart={applyStrategyConfigToChart}
+          onAnalyzeBacktest={analyzeBacktestOnChart}
           onBacktestResult={handleBacktestResult}
+          onClearBacktest={exitBacktestAnalysis}
           onClose={() => setSettingsPanel(null)}
+          onExitBacktestAnalysis={exitBacktestAnalysis}
           rawCandles={rawCandles}
           selectedInterval={selectedInterval}
           setActivePanel={setSettingsPanel}
@@ -914,6 +1168,21 @@ export default function TradingViewChart() {
         <h1>Choromański</h1>
         <p>TRADING PLATFORM</p>
       </section>
+
+      {activeAnalysisSession && (
+        <BacktestAnalysisBanner
+          overlaySettings={backtestOverlaySettings}
+          session={activeAnalysisSession}
+          onAnalyze={analyzeBacktestOnChart}
+          onExit={exitBacktestAnalysis}
+          onToggle={(key, value) =>
+            setBacktestOverlaySettings((current) => ({
+              ...current,
+              [key]: value,
+            }))
+          }
+        />
+      )}
 
       <div className="hubert-chart" onClick={handleChartClick} ref={chartContainerRef} />
 
@@ -947,6 +1216,66 @@ export default function TradingViewChart() {
         </div>
       )}
     </main>
+  );
+}
+
+function BacktestAnalysisBanner({ overlaySettings, session, onAnalyze, onExit, onToggle }) {
+  const range = session.range ?? rangeFromCandles(session.candles);
+  const tradeCount = session.result?.trades?.length ?? 0;
+  const renderedCount = renderedTradeCount(session.result, session.candles, overlaySettings);
+  const hasMismatch = overlaySettings.showTrades && renderedCount !== tradeCount;
+
+  return (
+    <aside className="hubert-backtest-banner" aria-label="Backtest Analysis Mode">
+      <div className="hubert-backtest-banner__head">
+        <div>
+          <strong>Backtest Analysis Mode</strong>
+          <span>
+            {session.strategyDeckName} · {session.mmDeckName} · {session.timeframe} · {tradeCount} trades
+          </span>
+          <span>{formatChartTime(range.from)} → {formatChartTime(range.to)}</span>
+          <span className={hasMismatch ? "hubert-backtest-banner__warning" : ""}>
+            Trades in table: {tradeCount} · rendered on chart: {renderedCount}
+          </span>
+        </div>
+        <div className="hubert-backtest-banner__actions">
+          <button type="button" onClick={onAnalyze}>Analyze on Chart</button>
+          <button type="button" onClick={onExit}>Exit Backtest Analysis</button>
+        </div>
+      </div>
+      <div className="hubert-backtest-banner__toggles">
+        {[
+          ["showTrades", "Show trades"],
+          ["showSlTp", "Show SL/TP"],
+          ["showExits", "Show exits"],
+          ["showDebug", "Show skipped setups/debug"],
+          ["showPnlLabels", "Show PnL labels"],
+        ].map(([key, label]) => (
+          <label key={key}>
+            <input
+              checked={Boolean(overlaySettings[key])}
+              type="checkbox"
+              onChange={(event) => onToggle(key, event.target.checked)}
+            />
+            <span>{label}</span>
+          </label>
+        ))}
+      </div>
+      {hasMismatch && (
+        <div className="hubert-backtest-banner__warning">
+          Chart markers are capped to keep zoom and pan responsive. The table remains the full record.
+        </div>
+      )}
+      {overlaySettings.showDebug && (
+        <div className="hubert-backtest-legend">
+          <span><b />HA missing = Heikin Ashi confirmation missing</span>
+          <span><b />Candidate = setup candidate checked</span>
+          <span><b />In position = already in a trade/setup</span>
+          <span><b />SL limiter = blocked by same-side SL limit</span>
+          <span><b />MM invalid = sizing/money management invalid</span>
+        </div>
+      )}
+    </aside>
   );
 }
 
