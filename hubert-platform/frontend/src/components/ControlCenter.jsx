@@ -1761,17 +1761,21 @@ export default function ControlCenter({
         />
       )}
 
-      {panel === "AI" && (
-        <AiPanel
-          aiStatus={aiStatus}
-          aiContext={aiContext}
-          messages={aiMessages}
-          question={aiQuestion}
-          setAiContext={setAiContext}
-          setMessages={setAiMessages}
-          setQuestion={setAiQuestion}
-          onAsk={() =>
-            runAction("ask-ai", "Ask AI", async () => {
+	      {panel === "AI" && (
+	        <AiPanel
+	          apiRequest={apiFetch}
+	          aiStatus={aiStatus}
+	          aiContext={aiContext}
+	          mmDecks={mmDecks}
+	          messages={aiMessages}
+	          question={aiQuestion}
+	          runAction={runAction}
+	          setAiContext={setAiContext}
+	          setMessages={setAiMessages}
+	          setQuestion={setAiQuestion}
+	          strategyDecks={strategyDecks}
+	          onAsk={() =>
+	            runAction("ask-ai", "Ask AI", async () => {
               if (!aiQuestion.trim()) throw new Error("Ask a question first.");
               const userMessage = { role: "user", text: aiQuestion.trim(), time: new Date().toISOString() };
               setAiMessages((current) => [...current, userMessage]);
@@ -2983,7 +2987,20 @@ function CommunicationPanel({ communication, onSave, onTest, setCommunication })
   );
 }
 
-function AiPanel({ aiContext, aiStatus, messages, onAsk, question, setAiContext, setMessages, setQuestion }) {
+function AiPanel({
+  aiContext,
+  aiStatus,
+  apiRequest,
+  messages,
+  mmDecks,
+  onAsk,
+  question,
+  runAction,
+  setAiContext,
+  setMessages,
+  setQuestion,
+  strategyDecks,
+}) {
   const examples = [
     "Explain why Backtest 1 made more than Backtest 2.",
     "Is this drawdown dangerous?",
@@ -2991,12 +3008,101 @@ function AiPanel({ aiContext, aiStatus, messages, onAsk, question, setAiContext,
     "Which deck is currently strongest?",
     "Explain this platform error like I am a beginner.",
   ];
+  const [builder, setBuilder] = useState({
+    format: "json",
+    from: "",
+    maxCombinations: 50,
+    objective: "drawdown-adjusted return",
+    provider: "binance-futures",
+    sizingMode: "position-percent",
+    symbol: "SOLUSDT",
+    timeframe: "15m",
+    timeframes: "10m,15m,20m,30m,1h,4h",
+    to: "",
+  });
+  const [toolResult, setToolResult] = useState(null);
+  const [reports, setReports] = useState([]);
+  const [alertDrafts, setAlertDrafts] = useState([]);
+  const [alertForm, setAlertForm] = useState({
+    condition: "live data stale over 60 seconds",
+    name: "Data freshness watch",
+    source: "live data",
+    symbol: "SOLUSDT",
+    timeframe: "15m",
+  });
+  const [codeMap, setCodeMap] = useState(null);
+  const [snippetRequest, setSnippetRequest] = useState({
+    filePath: "hubert-platform/frontend/src/components/ControlCenter.jsx",
+    line: 1,
+  });
+  const [codeSnippet, setCodeSnippet] = useState(null);
+  const strategyOptions = [["", "Current/default"], ...(strategyDecks ?? []).map((deck) => [deck.id, deck.name])];
+  const mmOptions = [["", "Current/default"], ...(mmDecks ?? []).map((deck) => [deck.id, deck.name])];
+  const commonInput = {
+    ...builder,
+    strategyDeckId: builder.strategyDeckId || undefined,
+    mmDeckId: builder.mmDeckId || undefined,
+    timeframes: String(builder.timeframes ?? "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean),
+  };
+
+  async function callTool(toolName, input = {}, label = toolName) {
+    return runAction(`ai-tool-${toolName}`, label, async () => {
+      const payload = await apiRequest("/ai/tool", {
+        body: { input, toolName },
+        method: "POST",
+      });
+      setToolResult(payload);
+      if (toolName === "exportReport") {
+        setReports(await apiRequest("/ai/reports"));
+      }
+      if (toolName === "createAlertDraft") {
+        setAlertDrafts(await apiRequest("/ai/alerts"));
+      }
+      return payload;
+    });
+  }
+
+  async function loadReports() {
+    return runAction("ai-load-reports", "Load AI reports", async () => {
+      setReports(await apiRequest("/ai/reports"));
+    });
+  }
+
+  async function exportReport(report, format) {
+    return runAction(`ai-export-${report.id}-${format}`, `Export ${format.toUpperCase()}`, async () => {
+      const payload = await apiRequest("/ai/reports/export", {
+        body: { format, reportId: report.id },
+        method: "POST",
+      });
+      downloadText(payload.fileName, payload.content, payload.mime);
+    });
+  }
+
+  async function loadCodeMap() {
+    return runAction("ai-code-map", "Load code map", async () => {
+      setCodeMap(await apiRequest("/ai/code-map"));
+    });
+  }
+
+  async function inspectSnippet() {
+    return runAction("ai-code-snippet", "Inspect file", async () => {
+      setCodeSnippet(await apiRequest("/ai/code-snippet", {
+        body: snippetRequest,
+        method: "POST",
+      }));
+    });
+  }
 
   return (
     <section className="hubert-lab__section">
+      <div className="hubert-lab__subhead"><strong>AI Analyst Workbench</strong><span>analysis only</span></div>
       <MiniStatus tone={aiStatus?.configured ? "good" : "neutral"}>
-        {aiStatus?.message ?? "AI runs through the backend. If no key is configured, this panel will tell you cleanly."}
+        {aiStatus?.message ?? "AI Workbench runs through the backend in mock mode."}
       </MiniStatus>
+      <MiniStatus>AI can analyze data and prepare reports, but it cannot place orders or change live execution.</MiniStatus>
       <ToggleGrid
         values={aiContext}
         onChange={(key, value) => setAiContext({ ...aiContext, [key]: value })}
@@ -3007,8 +3113,11 @@ function AiPanel({ aiContext, aiStatus, messages, onAsk, question, setAiContext,
           ["includeAnalytics", "Analytics"],
           ["includeSystemStatus", "System status"],
           ["includeErrors", "Recent errors"],
+          ["includeCodeMap", "Code map"],
         ]}
       />
+
+      <div className="hubert-lab__subhead"><strong>Ask AI</strong><span>mock provider</span></div>
       <div className="hubert-ai-examples">
         {examples.map((example) => (
           <button key={example} type="button" onClick={() => setQuestion(example)}>{example}</button>
@@ -3020,8 +3129,121 @@ function AiPanel({ aiContext, aiStatus, messages, onAsk, question, setAiContext,
       </label>
       <div className="hubert-lab__actions">
         <button type="button" onClick={onAsk}>Send</button>
-        <button type="button" onClick={() => setMessages([])}>Clear</button>
+        <button type="button" onClick={() => setMessages([])}>Clear screen</button>
+        <button type="button" onClick={() => runAction("ai-clear-memory", "Clear AI memory", async () => {
+          await apiRequest("/ai/sessions", { method: "DELETE" });
+          setMessages([]);
+        })}>Clear saved memory</button>
       </div>
+
+      <div className="hubert-lab__subhead"><strong>Quick Actions</strong><span>backend tools</span></div>
+      <div className="hubert-ai-actions">
+        <button type="button" onClick={() => callTool("explainCurrentSetup", {}, "Explain current setup")}>Explain current setup</button>
+        <button type="button" onClick={() => callTool("summarizeBacktest", {}, "Analyze latest backtest")}>Analyze latest backtest</button>
+        <button type="button" onClick={() => callTool("compareBacktests", {}, "Compare backtests")}>Compare selected backtests</button>
+        <button type="button" onClick={() => callTool("analyzeTimeframes", commonInput, "Find best timeframe")}>Find best timeframe</button>
+        <button type="button" onClick={() => callTool("optimizeSettings", commonInput, "Optimize settings")}>Optimize settings</button>
+        <button type="button" onClick={() => callTool("diagnoseIssue", { question }, "Diagnose data issue")}>Diagnose data issue</button>
+        <button type="button" onClick={() => callTool("runSweepAnalysis", { ...commonInput, maxCombinations: Math.min(Number(builder.maxCombinations) || 50, 100) }, "Summarize sweep")}>Summarize sweep</button>
+        <button type="button" onClick={() => callTool("exportReport", { format: builder.format, type: "backtest" }, "Build report")}>Build report</button>
+        <button type="button" onClick={() => callTool("createAlertDraft", alertForm, "Create alert draft")}>Create alert draft</button>
+      </div>
+
+      <details className="hubert-advanced">
+        <summary>Analysis Builder</summary>
+        <div className="hubert-lab__grid">
+          <TextField label="Symbol" value={builder.symbol} onChange={(value) => setBuilder({ ...builder, symbol: value })} />
+          <TextField label="Timeframe(s)" value={builder.timeframes} onChange={(value) => setBuilder({ ...builder, timeframes: value })} />
+          <TextField label="From" value={builder.from} onChange={(value) => setBuilder({ ...builder, from: value })} />
+          <TextField label="To" value={builder.to} onChange={(value) => setBuilder({ ...builder, to: value })} />
+          <SelectField label="Provider" value={builder.provider} onChange={(value) => setBuilder({ ...builder, provider: value })} options={[["binance-futures", "Binance Futures"], ["binance-spot", "Binance Spot"]]} />
+          <SelectField label="Strategy Deck" value={builder.strategyDeckId ?? ""} onChange={(value) => setBuilder({ ...builder, strategyDeckId: value })} options={strategyOptions} />
+          <SelectField label="MM Deck" value={builder.mmDeckId ?? ""} onChange={(value) => setBuilder({ ...builder, mmDeckId: value })} options={mmOptions} />
+          <SelectField label="Sizing mode" value={builder.sizingMode} onChange={(value) => setBuilder({ ...builder, sizingMode: value })} options={[["position-percent", "Position Percent"], ["fixed-risk", "Fixed Risk Per Trade"]]} />
+          <SelectField label="Objective" value={builder.objective} onChange={(value) => setBuilder({ ...builder, objective: value })} options={[["net profit", "Net profit"], ["win rate", "Win rate"], ["profit factor", "Profit factor"], ["drawdown-adjusted return", "Drawdown-adjusted return"], ["robustness", "Robustness"]]} />
+          <NumberField label="Max combinations" max="500" min="1" value={builder.maxCombinations} onChange={(value) => setBuilder({ ...builder, maxCombinations: value })} />
+          <SelectField label="Output format" value={builder.format} onChange={(value) => setBuilder({ ...builder, format: value })} options={[["json", "JSON"], ["csv", "CSV"]]} />
+        </div>
+        <div className="hubert-lab__actions">
+          <button type="button" onClick={() => callTool("runHistoricalBacktest", commonInput, "Run AI backtest tool")}>Run Historical Backtest Tool</button>
+          <button type="button" onClick={() => callTool("runSweepAnalysis", commonInput, "Run AI sweep tool")}>Run Sweep Tool</button>
+          <button type="button" onClick={() => callTool("analyzePeriods", commonInput, "Analyze periods")}>Analyze Periods</button>
+        </div>
+      </details>
+
+      {toolResult && (
+        <details className="hubert-advanced" open>
+          <summary>Latest Tool Output</summary>
+          <pre className="hubert-ai-json">{JSON.stringify(toolResult, null, 2).slice(0, 12000)}</pre>
+        </details>
+      )}
+
+      <div className="hubert-lab__subhead"><strong>Reports</strong><span>{reports.length}</span></div>
+      <div className="hubert-lab__actions">
+        <button type="button" onClick={loadReports}>Load reports</button>
+      </div>
+      {reports.length === 0 ? (
+        <MiniStatus>No generated AI reports yet.</MiniStatus>
+      ) : (
+        <div className="hubert-list-compact">
+          {reports.slice(0, 8).map((report) => (
+            <article key={report.id}>
+              <strong>{report.name ?? report.title}</strong>
+              <span>{report.source ?? "report"} · {dateText(report.createdAt)}</span>
+              <div className="hubert-lab__actions">
+                <button type="button" onClick={() => exportReport(report, "json")}>Export JSON</button>
+                <button type="button" onClick={() => exportReport(report, "csv")}>Export CSV</button>
+                <button type="button" onClick={() => navigator.clipboard?.writeText(JSON.stringify(report, null, 2))}>Copy summary</button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+
+      <div className="hubert-lab__subhead"><strong>Alerts / Watch Drafts</strong><span>draft only</span></div>
+      <div className="hubert-lab__grid">
+        <TextField label="Alert name" value={alertForm.name} onChange={(value) => setAlertForm({ ...alertForm, name: value })} />
+        <TextField label="Condition" value={alertForm.condition} onChange={(value) => setAlertForm({ ...alertForm, condition: value })} />
+        <TextField label="Source" value={alertForm.source} onChange={(value) => setAlertForm({ ...alertForm, source: value })} />
+        <TextField label="Symbol" value={alertForm.symbol} onChange={(value) => setAlertForm({ ...alertForm, symbol: value })} />
+        <TextField label="Timeframe" value={alertForm.timeframe} onChange={(value) => setAlertForm({ ...alertForm, timeframe: value })} />
+      </div>
+      <div className="hubert-lab__actions">
+        <button type="button" onClick={() => callTool("createAlertDraft", alertForm, "Create alert draft")}>Save draft</button>
+        <button type="button" onClick={() => runAction("ai-load-alerts", "Load alert drafts", async () => setAlertDrafts(await apiRequest("/ai/alerts")))}>Load drafts</button>
+      </div>
+      {alertDrafts.length > 0 && (
+        <div className="hubert-list-compact">
+          {alertDrafts.slice(0, 8).map((draft) => (
+            <article key={draft.id}>
+              <strong>{draft.name}</strong>
+              <span>{draft.condition} · {draft.status}</span>
+            </article>
+          ))}
+        </div>
+      )}
+
+      <div className="hubert-lab__subhead"><strong>Code Assistant</strong><span>safe files only</span></div>
+      <div className="hubert-lab__actions">
+        <button type="button" onClick={loadCodeMap}>Load code map</button>
+      </div>
+      {codeMap && (
+        <details className="hubert-advanced">
+          <summary>Code map: {codeMap.scannedFiles} files</summary>
+          <pre className="hubert-ai-json">{JSON.stringify(codeMap.sections, null, 2).slice(0, 12000)}</pre>
+        </details>
+      )}
+      <div className="hubert-lab__grid">
+        <TextField label="Safe relative file path" value={snippetRequest.filePath} onChange={(value) => setSnippetRequest({ ...snippetRequest, filePath: value })} />
+        <NumberField label="Line" min="1" value={snippetRequest.line} onChange={(value) => setSnippetRequest({ ...snippetRequest, line: value })} />
+      </div>
+      <div className="hubert-lab__actions">
+        <button type="button" onClick={inspectSnippet}>Inspect file</button>
+      </div>
+      {codeSnippet && (
+        <pre className="hubert-ai-json">{codeSnippet.snippet}</pre>
+      )}
+
       <div className="hubert-chat-log">
         {messages.length === 0 ? (
           <MiniStatus>No AI messages yet.</MiniStatus>

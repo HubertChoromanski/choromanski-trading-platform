@@ -1,7 +1,7 @@
-import { STRATEGY_EVENT_TYPES, SETUP_STATUSES, evaluateChoromanskiStrategy } from "../engine/strategyEngine";
-import { toHeikenAshi } from "../indicators/heikenAshi";
-import { calculateNadarayaEnvelope } from "../indicators/nadaraya";
-import { calculateBacktestMetrics } from "./metrics";
+import { STRATEGY_EVENT_TYPES, SETUP_STATUSES, evaluateChoromanskiStrategy } from "../engine/strategyEngine.js";
+import { toHeikenAshi } from "../indicators/heikenAshi.js";
+import { calculateNadarayaEnvelope } from "../indicators/nadaraya.js";
+import { calculateBacktestMetrics } from "./metrics.js";
 
 export const defaultBacktestConfig = {
   commissionPercent: 0.04,

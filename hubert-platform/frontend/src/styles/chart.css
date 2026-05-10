@@ -717,11 +717,13 @@ button {
 .hubert-confirm-strip,
 .hubert-live-stack,
 .hubert-chart-box,
-.hubert-chat-log,
-.hubert-ai-examples {
-  display: grid;
-  gap: 8px;
-}
+	.hubert-chat-log,
+	.hubert-ai-examples,
+	.hubert-ai-actions,
+	.hubert-list-compact {
+	  display: grid;
+	  gap: 8px;
+	}
 
 .hubert-deck-card {
   display: grid;
@@ -819,12 +821,47 @@ button {
   line-height: 1.35;
 }
 
-.hubert-chart-legend,
-.hubert-ai-examples {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
+	.hubert-chart-legend,
+	.hubert-ai-examples,
+	.hubert-ai-actions {
+	  display: flex;
+	  flex-wrap: wrap;
+	  gap: 6px;
+	}
+
+	.hubert-ai-json {
+	  max-height: 260px;
+	  overflow: auto;
+	  padding: 9px;
+	  border: 1px solid rgba(0, 0, 0, 0.16);
+	  border-radius: 5px;
+	  background: rgba(190, 190, 190, 0.42);
+	  color: #090909;
+	  font-size: 10px;
+	  line-height: 1.35;
+	  white-space: pre-wrap;
+	}
+
+	.hubert-list-compact article {
+	  display: grid;
+	  gap: 5px;
+	  padding: 8px;
+	  border: 1px solid rgba(0, 0, 0, 0.14);
+	  border-radius: 5px;
+	  background: rgba(210, 210, 210, 0.5);
+	}
+
+	.hubert-list-compact strong {
+	  color: #070707;
+	  font-size: 12px;
+	  font-weight: 850;
+	}
+
+	.hubert-list-compact span {
+	  color: rgba(0, 0, 0, 0.62);
+	  font-size: 11px;
+	  font-weight: 720;
+	}
 
 .hubert-chart-legend span {
   display: inline-flex;

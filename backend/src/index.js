@@ -1,5 +1,11 @@
 import http from "node:http";
 import "dotenv/config";
+import { buildCodeMap, readSafeCodeSnippet } from "./ai/aiCodeMap.js";
+import { createAiContextBuilder } from "./ai/aiContextBuilder.js";
+import { createAiMemoryStore } from "./ai/aiMemoryStore.js";
+import { createAiService } from "./ai/aiService.js";
+import { createAiTools } from "./ai/aiTools.js";
+import { reportToCsv } from "./ai/aiReportBuilder.js";
 import { createBotRunner } from "./botRunner.js";
 import { createBingxClient } from "./exchanges/bingxClient.js";
 import { reconcileBingxState } from "./execution/reconciliation.js";
@@ -1072,162 +1078,31 @@ async function sendTelegramTest(settings) {
   };
 }
 
-function buildAiContext(flags = {}) {
-  const include = {
-    analytics: flags.includeAnalytics !== false,
-    backtests: flags.includeBacktests !== false,
-    decks: flags.includeDecks !== false,
-    errors: flags.includeErrors !== false,
-    livePositions: flags.includeLivePositions !== false,
-    systemStatus: flags.includeSystemStatus !== false,
-  };
-
-  return sanitizeForAi({
-    analytics: include.analytics ? calculateAnalytics(store.getTrades()) : undefined,
-    backtests: include.backtests ? store.getCollection("backtests").slice(-20) : undefined,
-    decks: include.decks
-      ? {
-          battleDecks: store.getCollection("battleDecks"),
-          mmDecks: store.getCollection("mmDecks"),
-          strategyDecks: store.getCollection("strategyDecks"),
-        }
-      : undefined,
-    recentErrors: include.errors
-      ? store.getLogs()
-          .filter((log) => {
-            const text = `${log.message ?? ""} ${JSON.stringify(log.context ?? {})}`.toLowerCase();
-            return text.includes("error") || text.includes("failed") || text.includes("reject") || text.includes("warning");
-          })
-          .slice(-30)
-      : undefined,
-    live: include.livePositions ? buildLivestreamPayload() : undefined,
-    system: include.systemStatus ? publicStatusPayload() : undefined,
-  });
-}
-
-function aiStatusPayload() {
-  const provider = process.env.AI_PROVIDER ?? "openai";
-  const model = process.env.AI_MODEL ?? "gpt-4.1-mini";
-  const configured = provider === "openai" && Boolean(process.env.OPENAI_API_KEY);
-
-  return {
-    configured,
-    message: configured
-      ? "AI is connected through the backend."
-      : "AI is not connected yet. Add OPENAI_API_KEY on backend to enable this panel.",
-    model,
-    ok: configured,
-    provider,
-  };
-}
-
-function sanitizeForAi(value, depth = 0) {
-  if (depth > 8) return "[trimmed]";
-  if (Array.isArray(value)) {
-    return value.slice(0, 80).map((item) => sanitizeForAi(item, depth + 1));
-  }
-
-  if (!value || typeof value !== "object") {
-    if (typeof value === "string" && /(?:sk-[a-z0-9_-]+|api[_-]?secret|api[_-]?key|secret=|token=)/iu.test(value)) {
-      return "[redacted]";
-    }
-
-    return value;
-  }
-
-  return Object.fromEntries(
-    Object.entries(value).map(([key, entry]) => {
-      if (/(secret|token|password|authorization|api[-_]?key|private|env)/iu.test(key)) {
-        return [key, "[redacted]"];
-      }
-
-      return [key, sanitizeForAi(entry, depth + 1)];
-    }),
-  );
-}
-
-async function runAiChat(body) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  const provider = process.env.AI_PROVIDER ?? "openai";
-  const model = process.env.AI_MODEL ?? "gpt-4.1-mini";
-  const message = String(body.message ?? "").trim();
-
-  if (provider !== "openai") {
-    return {
-      ok: false,
-      message: "AI provider is not supported yet. Set AI_PROVIDER=openai.",
-    };
-  }
-
-  if (!apiKey) {
-    return {
-      configured: false,
-      ok: false,
-      message: "AI is not connected yet. Add OPENAI_API_KEY on backend to enable this panel.",
-    };
-  }
-
-  if (!message) {
-    return {
-      configured: true,
-      ok: false,
-      message: "Ask a question first.",
-    };
-  }
-
-  const context = buildAiContext(body.context ?? {});
-  let response;
-
-  try {
-    response = await fetch("https://api.openai.com/v1/responses", {
-      body: JSON.stringify({
-        input: [
-          {
-            content:
-              "You are the Choromański Trading Platform analyst. Explain things simply, use the provided platform data only, and never tell the user to place a trade.",
-            role: "system",
-          },
-          {
-            content: `Platform data:\n${JSON.stringify(context).slice(0, 120000)}\n\nUser question:\n${message}`,
-            role: "user",
-          },
-        ],
-        max_output_tokens: 900,
-        model,
-      }),
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      method: "POST",
-    });
-  } catch (error) {
-    return {
-      configured: true,
-      ok: false,
-      message: error instanceof Error ? error.message : "AI request failed.",
-    };
-  }
-
-  const payload = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    return {
-      ok: false,
-      message: payload.error?.message || "AI request failed.",
-    };
-  }
-
-  return {
-    configured: true,
-    message:
-      payload.output_text ??
-      payload.output?.flatMap((item) => item.content ?? []).map((part) => part.text).filter(Boolean).join("\n") ??
-      "AI returned an empty answer.",
-    model,
-    ok: true,
-  };
-}
+const aiMemory = createAiMemoryStore({ store });
+const aiBuildContext = createAiContextBuilder({
+  buildLivestreamPayload,
+  calculateAnalytics,
+  dataAvailability,
+  publicApiProfiles,
+  publicStatusPayload,
+  store,
+});
+const aiTools = createAiTools({
+  buildAiContext: aiBuildContext,
+  buildLivestreamPayload,
+  calculateAnalytics,
+  dataAvailability,
+  memory: aiMemory,
+  publicApiProfiles,
+  publicStatusPayload,
+  store,
+});
+const aiService = createAiService({
+  buildAiContext: aiBuildContext,
+  memory: aiMemory,
+  provider: process.env.AI_PROVIDER ?? "mock",
+  tools: aiTools,
+});
 
 async function readBody(request) {
   const chunks = [];
@@ -1481,16 +1356,98 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && pathname === "/ai/status") {
-      sendJson(response, 200, aiStatusPayload());
-      return;
-    }
+	    if (request.method === "GET" && pathname === "/ai/status") {
+	      sendJson(response, 200, aiService.status());
+	      return;
+	    }
 
-    if (request.method === "POST" && pathname === "/ai/chat") {
-      const body = await readBody(request);
-      sendJson(response, 200, await runAiChat(body));
-      return;
-    }
+	    if (request.method === "GET" && pathname === "/ai/context") {
+	      sendJson(response, 200, await aiBuildContext(Object.fromEntries(url.searchParams.entries())));
+	      return;
+	    }
+
+	    if (request.method === "GET" && pathname === "/ai/code-map") {
+	      sendJson(response, 200, await buildCodeMap());
+	      return;
+	    }
+
+	    if (request.method === "POST" && pathname === "/ai/code-snippet") {
+	      const body = await readBody(request);
+	      sendJson(response, 200, await readSafeCodeSnippet(body));
+	      return;
+	    }
+
+	    if (request.method === "POST" && pathname === "/ai/chat") {
+	      const body = await readBody(request);
+	      sendJson(response, 200, await aiService.chat(body));
+	      return;
+	    }
+
+	    if (request.method === "POST" && pathname === "/ai/tool") {
+	      const body = await readBody(request);
+	      const toolName = String(body.toolName ?? "");
+	      const tool = aiTools[toolName];
+
+	      if (typeof tool !== "function") {
+	        sendJson(response, 400, {
+	          ok: false,
+	          message: "That AI tool is not available.",
+	        });
+	        return;
+	      }
+
+	      sendJson(response, 200, {
+	        ok: true,
+	        result: await tool(body.input ?? {}),
+	        toolName,
+	      });
+	      return;
+	    }
+
+	    if (request.method === "GET" && pathname === "/ai/reports") {
+	      sendJson(response, 200, aiMemory.getReports());
+	      return;
+	    }
+
+	    if (request.method === "GET" && pathname === "/ai/sessions") {
+	      sendJson(response, 200, aiMemory.getSessions());
+	      return;
+	    }
+
+	    if (request.method === "DELETE" && pathname === "/ai/sessions") {
+	      sendJson(response, 200, await aiMemory.clearSessions());
+	      return;
+	    }
+
+	    if (request.method === "POST" && pathname === "/ai/reports/export") {
+	      const body = await readBody(request);
+	      const report = body.report ?? aiMemory.getReports().find((item) => item.id === body.reportId);
+
+	      if (!report) {
+	        sendJson(response, 400, { message: "Choose a report first." });
+	        return;
+	      }
+
+	      const format = body.format === "csv" ? "csv" : "json";
+	      sendJson(response, 200, {
+	        content: format === "csv" ? reportToCsv(report) : JSON.stringify(report, null, 2),
+	        fileName: `${String(report.name ?? report.title ?? "ai-report").replace(/[^\w.-]+/g, "-")}.${format}`,
+	        format,
+	        mime: format === "csv" ? "text/csv" : "application/json",
+	      });
+	      return;
+	    }
+
+	    if (request.method === "GET" && pathname === "/ai/alerts") {
+	      sendJson(response, 200, aiMemory.getAlertDrafts());
+	      return;
+	    }
+
+	    if (request.method === "POST" && pathname === "/ai/alerts") {
+	      const body = await readBody(request);
+	      sendJson(response, 200, await aiTools.createAlertDraft(body));
+	      return;
+	    }
 
     if (request.method === "GET" && pathname === "/analytics") {
       sendJson(response, 200, {
