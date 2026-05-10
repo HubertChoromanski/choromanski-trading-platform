@@ -1,6 +1,7 @@
 import { createAgentArtifact } from "./agentArtifacts.js";
 import { mergeProgress } from "./agentProgress.js";
 import { composeAgentMarkdown, composeEmailDraft, composeTelegramDraft, rowsToCsv } from "./agentReportComposer.js";
+import { runResearchWorkflow } from "../research/researchEngine.js";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -213,6 +214,15 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
     };
   }
 
+  async function executeResearch(run) {
+    return runResearchWorkflow({
+      isCancelled: () => isCancelled(run.id),
+      onProgress: (progress, step) => updateProgress(run.id, progress, step),
+      plan: run.plan,
+      toolRegistry,
+    });
+  }
+
   async function execute(runId) {
     const initialRun = runStore.get(runId);
     if (!initialRun) return null;
@@ -227,7 +237,9 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
       const run = runStore.get(runId);
       let output;
 
-      if (run.plan.kind === "sweep" || run.plan.kind === "report") {
+      if (run.plan.kind === "research") {
+        output = await executeResearch(run);
+      } else if (run.plan.kind === "sweep" || run.plan.kind === "report") {
         output = await executeSweep(run);
       } else if (run.plan.kind === "compare_fill_modes") {
         output = await executeCompareFillModes(run);

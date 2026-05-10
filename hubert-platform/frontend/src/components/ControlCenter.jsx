@@ -3009,6 +3009,7 @@ function AiAgentPanel({ aiStatus, apiRequest, runAction }) {
   const activeRun = runs.find((run) => run.id === activeRunId) ?? runs[0] ?? null;
   const running = ["queued", "running"].includes(activeRun?.status);
   const examples = [
+    "Find robust SOLUSDT 15m settings for the last 2 years and reject overfit configs.",
     "Run 1000 sweep combinations for SOLUSDT 15m over the last 2 years and give me the 5 best robust settings.",
     "Compare Legacy vs Conservative fill mode across 15m, 30m and 1H.",
     "Find the best MM sizing settings for Q1 2025 only.",
@@ -3162,7 +3163,7 @@ function AiAgentPanel({ aiStatus, apiRequest, runAction }) {
               {activeRun.resultSummary.topRows?.length > 0 && (
                 <div className="hubert-table-wrap">
                   <table className="hubert-table">
-                    <thead><tr><th>Rank</th><th>Score</th><th>Net</th><th>PF</th><th>Win</th><th>Trades</th><th>Context</th></tr></thead>
+                    <thead><tr><th>Rank</th><th>Score</th><th>Net</th><th>PF</th><th>Win</th><th>Trades</th><th>Research</th></tr></thead>
                     <tbody>
                       {activeRun.resultSummary.topRows.slice(0, 6).map((row, index) => (
                         <tr key={`${row.id ?? row.timeframe ?? index}`}>
@@ -3172,7 +3173,7 @@ function AiAgentPanel({ aiStatus, apiRequest, runAction }) {
                           <td>{fmt(row.metrics?.profitFactor ?? row.profitFactor)}</td>
                           <td>{fmt(row.metrics?.winRate ?? row.winRate)}%</td>
                           <td>{row.metrics?.totalTrades ?? row.totalTrades ?? 0}</td>
-                          <td>{row.timeframe ?? row.params?.sizingMode ?? "result"}</td>
+                          <td>{row.research?.label ?? row.timeframe ?? row.params?.sizingMode ?? "result"}</td>
                         </tr>
                       ))}
                     </tbody>

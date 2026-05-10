@@ -21,8 +21,12 @@ export function rowsToCsv(rows = []) {
     maxDrawdown: metricValue(row, "maxDrawdown"),
     maxSameSideFailures: row.params?.maxSameSideFailures,
     netProfit: metricValue(row, "netProfit"),
+    overfitRisk: row.research?.overfit?.label,
+    overfitRiskScore: row.research?.overfitRiskScore,
     profitFactor: metricValue(row, "profitFactor"),
     rank: row.rank,
+    researchLabel: row.research?.label,
+    robustnessScore: row.research?.robustnessScore,
     score: row.score,
     sizingMode: row.params?.sizingMode,
     symbol: row.symbol,
@@ -42,11 +46,12 @@ export function rowsToCsv(rows = []) {
 export function composeAgentMarkdown({ output = {}, plan = {}, run = {} }) {
   const topRows = output.rankedResults ?? output.rows ?? [];
   const best = topRows[0] ?? output.best ?? null;
+  const narrative = output.narrative;
   const lines = [
     `# AI Agent Report`,
     "",
     "## Executive Summary",
-    output.summary ?? (best
+    narrative?.executiveSummary ?? output.summary ?? (best
       ? `Best visible result is rank ${best.rank ?? 1} with score ${number(best.score)}.`
       : "The agent completed the requested analysis."),
     "",
@@ -82,8 +87,22 @@ export function composeAgentMarkdown({ output = {}, plan = {}, run = {} }) {
 
   lines.push(
     "",
+    "## Methodology",
+    ...(narrative?.methodology?.length ? narrative.methodology.map((item) => `- ${item}`) : ["- Used existing platform tools without changing strategy or backtest math."]),
+    "",
     "## Robustness",
-    output.robustnessNotes ?? "Treat the ranking as a research result. Re-test nearby settings across neighboring periods before deployment.",
+    output.robustnessNotes ?? narrative?.productionViability ?? "Treat the ranking as a research result. Re-test nearby settings across neighboring periods before deployment.",
+    "",
+    "## Overfit Risk",
+    ...(topRows.slice(0, 5).map((row) => `- Rank ${row.rank ?? "?"}: ${row.research?.overfit?.label ?? "not evaluated"} risk. ${(row.research?.overfit?.explanation ?? []).join(" ")}`)),
+    "",
+    "## Period / Regime Notes",
+    ...(output.regime?.notes?.map((note) => `- ${note}`) ?? ["- Period validation was not available for this run."]),
+    "",
+    "## Recommendations",
+    `- Production: ${narrative?.recommendedConfigurations?.production ?? "No production candidate"}`,
+    `- Stable: ${narrative?.recommendedConfigurations?.stable ?? "No stable candidate"}`,
+    `- Aggressive: ${narrative?.recommendedConfigurations?.aggressive ?? "No aggressive candidate"}`,
     "",
     "## Risks",
     ...(output.warnings?.length ? output.warnings.map((warning) => `- ${warning}`) : ["- Sample size and data freshness can change conclusions.", "- AI analysis cannot place trades and does not modify live execution."]),

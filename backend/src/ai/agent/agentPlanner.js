@@ -76,9 +76,18 @@ function inferObjective(text, options = {}) {
 
 function inferKind(text) {
   const lower = String(text).toLowerCase();
+  if (
+    lower.includes("robust") ||
+    lower.includes("overfit") ||
+    lower.includes("production candidate") ||
+    lower.includes("stable settings") ||
+    lower.includes("quant") ||
+    lower.includes("research")
+  ) return "research";
   if (lower.includes("legacy") && lower.includes("conservative")) return "compare_fill_modes";
   if (lower.includes("timeframe") || /\b(10m|15m|20m|30m|1h|4h)\b.*\b(10m|15m|20m|30m|1h|4h)\b/i.test(text)) return "compare_timeframes";
-  if (lower.includes("sweep") || lower.includes("optimize") || lower.includes("best setting") || lower.includes("best config")) return "sweep";
+  if (lower.includes("find the best") || lower.includes("best settings") || lower.includes("best config")) return "research";
+  if (lower.includes("sweep") || lower.includes("optimize")) return "sweep";
   if (lower.includes("backtest") || lower.includes("q1")) return "backtest";
   if (lower.includes("diagnose") || lower.includes("why") || lower.includes("issue") || lower.includes("worse")) return "diagnose";
   if (lower.includes("report") || lower.includes("presentation") || lower.includes("email") || lower.includes("telegram")) return "report";
