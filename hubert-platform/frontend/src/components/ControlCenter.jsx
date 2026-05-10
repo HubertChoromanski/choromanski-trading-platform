@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { runBacktest } from "../backtest/backtestEngine";
 
 const PANEL_TABS = [
@@ -35,7 +35,7 @@ const PREVIEW_CURVE_POINTS = 420;
 const BACKTEST_CHART_TRADE_LIMIT = 500;
 const TRADE_TABLE_PAGE_SIZE = 50;
 const STORED_BACKTEST_EVENT_LIMIT = 1000;
-// TODO: Sweep Backtesting should return as a fast comparison mode: run many parameter combinations without rendering charts and output a compact ranked table only.
+const SWEEP_MAX_COMBINATIONS = 100;
 
 const defaultStrategyDeck = {
   allowLong: true,
@@ -76,6 +76,36 @@ const defaultBacktestForm = {
   slippagePercent: 0,
   startingBalance: 10000,
   strategyDeckId: "",
+  manualTo: "",
+};
+
+const defaultSweepForm = {
+  atrLengths: "",
+  atrMultipliers: "",
+  atrPositionSizing: "current",
+  bandwidths: "",
+  envelopeMultipliers: "",
+  fixedNotionalValues: "",
+  manualAtrLengths: "14",
+  manualAtrMultipliers: "1.2",
+  manualBandwidths: "8",
+  manualEnvelopeMultipliers: "3",
+  manualFixedNotionalValues: "100",
+  manualFrom: "",
+  manualLastDays: 31,
+  manualMaxSameSideFailures: "2",
+  manualPositionValues: "10",
+  manualRiskValues: "1",
+  manualSizingMode: "run-risk",
+  manualStartingBalance: 10000,
+  manualStrategySource: "pine-ha",
+  manualSymbol: "SOLUSDT",
+  manualTimeframe: "15m",
+  maxCombinations: SWEEP_MAX_COMBINATIONS,
+  maxSameSideFailures: "",
+  mode: "manual",
+  positionValues: "",
+  riskValues: "",
   to: "",
 };
 
@@ -348,6 +378,190 @@ function sideBreakdown(trades = []) {
   });
 }
 
+function sidePnl(trades = [], side) {
+  return trades
+    .filter((trade) => trade.direction === side)
+    .reduce((sum, trade) => sum + Number(trade.netPnl ?? trade.pnl ?? 0), 0);
+}
+
+function safeProfitFactor(value) {
+  if (!Number.isFinite(value)) return value === Infinity ? 99 : 0;
+  return value;
+}
+
+function sweepScore(metrics, startingBalance) {
+  const netProfitPercent = startingBalance > 0 ? (metrics.netProfit / startingBalance) * 100 : 0;
+  const drawdownPenalty = Number(metrics.maxDrawdown ?? 0);
+  const tradeBonus = Math.min(Number(metrics.totalTrades ?? 0), 30) * 0.2;
+  const factorBonus = Math.min(safeProfitFactor(metrics.profitFactor), 5) * 2;
+  return netProfitPercent - drawdownPenalty + tradeBonus + factorBonus;
+}
+
+function parseSweepNumberList(value, label, { integer = false, min = -Infinity, positive = false } = {}) {
+  const source = String(value ?? "").trim();
+  if (!source) throw new Error(`${label} needs at least one value.`);
+  const values = source
+    .split(/[,\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => Number(item));
+
+  if (values.some((number) => !Number.isFinite(number) || number < min || (positive && number <= 0))) {
+    throw new Error(`${label} contains an invalid value.`);
+  }
+
+  if (integer && values.some((number) => !Number.isInteger(number))) {
+    throw new Error(`${label} accepts whole numbers only.`);
+  }
+
+  return [...new Set(values)];
+}
+
+function parseOptionalSweepNumberList(value, fallbackValues, label, options) {
+  return String(value ?? "").trim()
+    ? parseSweepNumberList(value, label, options)
+    : fallbackValues;
+}
+
+function sweepAtrSizingValues(mode, current) {
+  if (mode === "both") return [true, false];
+  if (mode === "on") return [true];
+  if (mode === "off") return [false];
+  return [Boolean(current)];
+}
+
+function sweepSizeKey(mmDeck, atrPositionSizing) {
+  if (!mmDeck) return "";
+  if (mmDeck.mode === "constant") return "fixedNotional";
+  return atrPositionSizing ? "oneSlPercent" : "positionPercent";
+}
+
+function sweepSizeLabel(key) {
+  if (key === "fixedNotional") return "CONSTANT fixed USDT";
+  if (key === "oneSlPercent") return "RUN risk per SL";
+  if (key === "positionPercent") return "RUN position %";
+  return "Default size";
+}
+
+function hasExplicitSweepAtrMode(mode) {
+  return mode === "on" || mode === "off" || mode === "both";
+}
+
+function sweepSizingSummary(mmDeck, strategyDeck, atrMode) {
+  if (mmDeck?.mode === "constant") {
+    return `Sweep sizing source: CONSTANT MM Deck. Every trade uses fixed USDT notional. ATR sizing ${hasExplicitSweepAtrMode(atrMode) ? "selection" : "state"} does not change position size.`;
+  }
+
+  if (mmDeck?.mode === "run") {
+    const values = sweepAtrSizingValues(atrMode, strategyDeck?.atrPositionSizing);
+    const modeText =
+      values.length > 1
+        ? "testing ATR ON and OFF"
+        : values[0]
+          ? "ATR ON"
+          : "ATR OFF";
+
+    return `Sweep sizing source: RUN MM Deck, ${modeText}.`;
+  }
+
+  return "Sweep sizing source: fallback. Without a RUN MM Deck, ATR ON/OFF may produce identical sizing.";
+}
+
+function sweepSizeValuesForKey(form, mmDeck, key) {
+  if (!key) return [null];
+
+  if (key === "fixedNotional") {
+    return parseOptionalSweepNumberList(
+      form.fixedNotionalValues,
+      [Number(mmDeck?.fixedNotional ?? 0)],
+      "Fixed notional values",
+      { positive: true },
+    );
+  }
+
+  if (key === "oneSlPercent") {
+    return parseOptionalSweepNumberList(
+      form.riskValues,
+      [Number(mmDeck?.oneSlPercent ?? mmDeck?.riskPerSlPercent ?? 1)],
+      "Risk per SL hit values",
+      { positive: true },
+    );
+  }
+
+  if (key === "positionPercent") {
+    return parseOptionalSweepNumberList(
+      form.positionValues,
+      [Number(mmDeck?.positionPercent ?? mmDeck?.onePercentMovePercent ?? 10)],
+      "Position size values",
+      { positive: true },
+    );
+  }
+
+  return [null];
+}
+
+function manualSweepSizeValues(form) {
+  if (form.manualSizingMode === "constant") {
+    return {
+      atrPositionSizing: false,
+      key: "fixedNotional",
+      values: parseSweepNumberList(form.manualFixedNotionalValues, "Fixed notional values", { positive: true }),
+    };
+  }
+
+  if (form.manualSizingMode === "run-position") {
+    return {
+      atrPositionSizing: false,
+      key: "positionPercent",
+      values: parseSweepNumberList(form.manualPositionValues, "Position size values", { positive: true }),
+    };
+  }
+
+  return {
+    atrPositionSizing: true,
+    key: "oneSlPercent",
+    values: parseSweepNumberList(form.manualRiskValues, "Risk per SL hit values", { positive: true }),
+  };
+}
+
+function makeManualMmDeck(key, value) {
+  if (key === "fixedNotional") {
+    return {
+      fixedNotional: value,
+      id: "manual-sweep-mm",
+      mode: "constant",
+      name: "Manual Sweep MM",
+    };
+  }
+
+  return {
+    id: "manual-sweep-mm",
+    mode: "run",
+    name: "Manual Sweep MM",
+    oneSlPercent: key === "oneSlPercent" ? value : 1,
+    positionPercent: key === "positionPercent" ? value : 10,
+  };
+}
+
+function sweepRangeForm(backtestForm, form) {
+  if (form.mode !== "manual") return backtestForm;
+
+  return {
+    ...backtestForm,
+    from: form.manualFrom,
+    lastDays: form.manualLastDays,
+    startingBalance: form.manualStartingBalance,
+    to: form.manualTo,
+  };
+}
+
+function rankSweepRows(rows) {
+  return rows
+    .slice()
+    .sort((left, right) => right.score - left.score)
+    .map((row, index) => ({ ...row, rank: index + 1 }));
+}
+
 function sizingAudit(trades = []) {
   const sizes = trades.map((trade) => Number(trade.size ?? 0)).filter((value) => value > 0);
   const leverages = trades.map((trade) => Number(trade.assumedLeverage ?? 0)).filter((value) => value > 0);
@@ -486,6 +700,15 @@ export default function ControlCenter({
   const [mmForm, setMmForm] = useState(defaultMmDeck);
   const [backtestForm, setBacktestForm] = useState(defaultBacktestForm);
   const [backtestResult, setBacktestResult] = useState(activeBacktestSession?.result ?? null);
+  const [sweepForm, setSweepForm] = useState(defaultSweepForm);
+  const [sweepProgress, setSweepProgress] = useState({
+    completed: 0,
+    message: "",
+    running: false,
+    total: 0,
+  });
+  const [sweepResults, setSweepResults] = useState([]);
+  const sweepCancelRef = useRef(false);
   const [decision, setDecision] = useState({
     apiProfile: "main",
     battleName: "",
@@ -518,6 +741,30 @@ export default function ControlCenter({
     () => estimateDecision({ balance: futuresBalance, mmDeck: selectedMm, strategyDeck: selectedStrategy }),
     [futuresBalance, selectedMm, selectedStrategy],
   );
+  const sweepPreview = useMemo(() => {
+    const cap = Math.min(
+      SWEEP_MAX_COMBINATIONS,
+      Math.max(1, Number(sweepForm.maxCombinations) || SWEEP_MAX_COMBINATIONS),
+    );
+
+    try {
+      const manualSweepForm = { ...sweepForm, mode: "manual" };
+      const combinations = buildSweepCombinations({ baseDeck: null, baseMmDeck: null, form: manualSweepForm });
+      return {
+        cap,
+        count: combinations.length,
+        error: "",
+        tooMany: combinations.length > cap,
+      };
+    } catch (error) {
+      return {
+        cap,
+        count: 0,
+        error: humanError(error),
+        tooMany: false,
+      };
+    }
+  }, [selectedInterval, sweepForm]);
 
   async function runAction(key, label, fn) {
     setAction({ key, message: `${label}...`, state: "loading" });
@@ -687,24 +934,29 @@ export default function ControlCenter({
     onApplyChart(next);
   }
 
-  function runBrowserBacktest() {
-    const form = normalizeBacktestForm(backtestForm);
-    const rawDeck = strategyDecks.find((item) => item.id === form.strategyDeckId) ?? strategyDecks[0];
+  function runBrowserBacktest(overrides = {}) {
+    const form = normalizeBacktestForm({ ...backtestForm, ...(overrides.form ?? {}) });
+    const rawDeck = overrides.strategyDeck ?? strategyDecks.find((item) => item.id === form.strategyDeckId) ?? strategyDecks[0];
     if (!rawDeck) throw new Error("Create or choose a Strategy Deck first.");
     const deck = normalizeStrategyDeck(rawDeck);
-    const rawMmDeck = form.mmDeckId ? mmDecks.find((item) => item.id === form.mmDeckId) : null;
+    const rawMmDeck =
+      Object.hasOwn(overrides, "mmDeck")
+        ? overrides.mmDeck
+        : form.mmDeckId
+          ? mmDecks.find((item) => item.id === form.mmDeckId)
+          : null;
     const mmDeck = rawMmDeck ? normalizeMmDeck(rawMmDeck) : null;
-    const candles = filterCandlesByBacktestForm(rawCandles, form);
+    const candles = overrides.candles ?? filterCandlesByBacktestForm(rawCandles, form);
     if (candles.length < 550) {
       throw new Error("Not enough candles are loaded for this backtest. Request more history days or use a larger timeframe.");
     }
     const result = runBacktest({
       backtestConfig: {
-        commissionPercent: Number(backtestForm.commissionPercent),
+        commissionPercent: Number(form.commissionPercent),
         atrPositionSizing: deck.atrPositionSizing,
         mmDeck,
-        slippagePercent: Number(backtestForm.slippagePercent),
-        startingBalance: Number(backtestForm.startingBalance),
+        slippagePercent: Number(form.slippagePercent),
+        startingBalance: Number(form.startingBalance),
       },
       rawCandles: candles,
       settings: strategyToSettings(deck, settings),
@@ -719,10 +971,11 @@ export default function ControlCenter({
       id: `backtest-${Date.now()}`,
       mmDeckId: mmDeck?.id ?? "",
       mmDeckName: mmDeck?.name ?? "No MM deck",
-      name: form.name || `${deck.name} ${new Date().toLocaleDateString()}`,
+      name: overrides.name ?? (form.name || `${deck.name} ${new Date().toLocaleDateString()}`),
+      sweepParams: overrides.sweepParams ?? null,
       strategyDeckId: deck.id,
       strategyDeckName: deck.name,
-      timeframe: selectedInterval,
+      timeframe: overrides.timeframe ?? selectedInterval,
     });
     setBacktestResult(named);
     onBacktestResult(named, {
@@ -731,9 +984,288 @@ export default function ControlCenter({
       range: analysisRange,
       settings: analysisSettings,
       strategyDeckName: deck.name,
-      timeframe: selectedInterval,
+      timeframe: overrides.timeframe ?? selectedInterval,
     });
     return named;
+  }
+
+  function buildSweepCombinations({ baseDeck, baseMmDeck, form }) {
+    const combinations = [];
+    const manualMode = true;
+
+    if (manualMode) {
+      if (form.manualSymbol.trim().toUpperCase() !== "SOLUSDT") {
+        throw new Error("Manual Sweep currently uses loaded SOLUSDT candles. Use SOLUSDT or load another symbol first.");
+      }
+
+      if (form.manualTimeframe !== selectedInterval) {
+        throw new Error(`Manual Sweep uses currently loaded ${selectedInterval} candles. Change the chart timeframe to ${form.manualTimeframe} first, or choose ${selectedInterval}.`);
+      }
+
+      const failures = parseSweepNumberList(form.manualMaxSameSideFailures, "Max same-side failures", { integer: true, min: 0 });
+      const atrLengths = parseSweepNumberList(form.manualAtrLengths, "ATR length values", { integer: true, positive: true });
+      const atrMultipliers = parseSweepNumberList(form.manualAtrMultipliers, "ATR multiplier values", { positive: true });
+      const envelopeMultipliers = parseSweepNumberList(form.manualEnvelopeMultipliers, "NWE multiplier values", { positive: true });
+      const bandwidths = parseSweepNumberList(form.manualBandwidths, "Bandwidth values", { positive: true });
+      const sizing = manualSweepSizeValues(form);
+
+      failures.forEach((maxSameSideFailures) => {
+        atrLengths.forEach((atrLength) => {
+          atrMultipliers.forEach((atrMultiplier) => {
+            envelopeMultipliers.forEach((envelopeMultiplier) => {
+              bandwidths.forEach((bandwidth) => {
+                sizing.values.forEach((sizeValue) => {
+                  const strategyDeck = {
+                    ...defaultStrategyDeck,
+                    atrLength,
+                    atrMultiplier,
+                    atrPositionSizing: sizing.atrPositionSizing,
+                    bandwidth,
+                    envelopeMultiplier,
+                    id: "manual-sweep-strategy",
+                    maxSameSideFailures,
+                    name: "Manual Sweep Strategy",
+                    strategySource: form.manualStrategySource,
+                    symbol: form.manualSymbol.trim().toUpperCase(),
+                    timeframe: form.manualTimeframe,
+                  };
+                  const mmDeck = makeManualMmDeck(sizing.key, sizeValue);
+
+                  combinations.push({
+                    mmDeck,
+                    params: {
+                      atrLength,
+                      atrMultiplier,
+                      atrPositionSizing: sizing.atrPositionSizing,
+                      bandwidth,
+                      envelopeMultiplier,
+                      maxSameSideFailures,
+                      mode: "manual",
+                      sizeKey: sizing.key,
+                      sizeLabel: sweepSizeLabel(sizing.key),
+                      sizeValue,
+                      source: form.manualStrategySource,
+                      symbol: form.manualSymbol.trim().toUpperCase(),
+                      timeframe: form.manualTimeframe,
+                    },
+                    strategyDeck,
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+
+      return combinations;
+    }
+
+    const failures = parseOptionalSweepNumberList(
+      form.maxSameSideFailures,
+      [Number(baseDeck.maxSameSideFailures ?? defaultStrategyDeck.maxSameSideFailures)],
+      "Max same-side failures",
+      { integer: true, min: 0 },
+    );
+    const atrLengths = parseOptionalSweepNumberList(
+      form.atrLengths,
+      [Number(baseDeck.atrLength ?? defaultStrategyDeck.atrLength)],
+      "ATR length values",
+      { integer: true, positive: true },
+    );
+    const atrMultipliers = parseOptionalSweepNumberList(
+      form.atrMultipliers,
+      [Number(baseDeck.atrMultiplier ?? defaultStrategyDeck.atrMultiplier)],
+      "ATR multiplier values",
+      { positive: true },
+    );
+    const envelopeMultipliers = parseOptionalSweepNumberList(
+      form.envelopeMultipliers,
+      [Number(baseDeck.envelopeMultiplier ?? defaultStrategyDeck.envelopeMultiplier)],
+      "NWE multiplier values",
+      { positive: true },
+    );
+    const bandwidths = parseOptionalSweepNumberList(
+      form.bandwidths,
+      [Number(baseDeck.bandwidth ?? defaultStrategyDeck.bandwidth)],
+      "Bandwidth values",
+      { positive: true },
+    );
+    const atrSizingValues = sweepAtrSizingValues(form.atrPositionSizing, baseDeck.atrPositionSizing);
+
+    failures.forEach((maxSameSideFailures) => {
+      atrLengths.forEach((atrLength) => {
+        atrMultipliers.forEach((atrMultiplier) => {
+          envelopeMultipliers.forEach((envelopeMultiplier) => {
+            bandwidths.forEach((bandwidth) => {
+              atrSizingValues.forEach((atrPositionSizing) => {
+                const sizeKey = sweepSizeKey(baseMmDeck, atrPositionSizing);
+                const sizeValues = sweepSizeValuesForKey(form, baseMmDeck, sizeKey);
+
+                sizeValues.forEach((sizeValue) => {
+                  const strategyDeck = {
+                    ...baseDeck,
+                    atrLength,
+                    atrMultiplier,
+                    atrPositionSizing,
+                    bandwidth,
+                    envelopeMultiplier,
+                    maxSameSideFailures,
+                  };
+                  const mmDeck = baseMmDeck
+                    ? {
+                        ...baseMmDeck,
+                        ...(sizeKey ? { [sizeKey]: sizeValue } : {}),
+                      }
+                    : null;
+
+                  combinations.push({
+                    mmDeck,
+                    params: {
+                      atrLength,
+                      atrMultiplier,
+                      atrPositionSizing,
+                      bandwidth,
+                      envelopeMultiplier,
+                      maxSameSideFailures,
+                      mode: "base",
+                      sizeKey,
+                      sizeLabel: sweepSizeLabel(sizeKey),
+                      sizeValue,
+                      source: baseDeck.strategySource,
+                      symbol: baseDeck.symbol ?? "SOLUSDT",
+                      timeframe: selectedInterval,
+                    },
+                    strategyDeck,
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    });
+
+    return combinations;
+  }
+
+  async function runSweepBacktest() {
+    const manualSweepForm = { ...sweepForm, mode: "manual" };
+    const form = normalizeBacktestForm(sweepRangeForm(backtestForm, manualSweepForm));
+    const candles = filterCandlesByBacktestForm(rawCandles, form);
+    if (candles.length < 550) {
+      throw new Error("Not enough candles are loaded for this sweep. Request more history days or use a larger timeframe.");
+    }
+
+    const combinations = buildSweepCombinations({ baseDeck: null, baseMmDeck: null, form: manualSweepForm });
+    const cap = Math.min(
+      SWEEP_MAX_COMBINATIONS,
+      Math.max(1, Number(sweepForm.maxCombinations) || SWEEP_MAX_COMBINATIONS),
+    );
+
+    if (combinations.length > cap) {
+      throw new Error(`${combinations.length} combinations requested. Narrow the ranges or keep the sweep at ${cap} combinations or fewer.`);
+    }
+
+    sweepCancelRef.current = false;
+    setSweepResults([]);
+    setSweepProgress({
+      completed: 0,
+      message: `Running 0 / ${combinations.length}`,
+      running: true,
+      total: combinations.length,
+    });
+
+    const rows = [];
+    const analysisRange = rangeFromBacktestCandles(candles);
+
+    for (let index = 0; index < combinations.length; index += 1) {
+      if (sweepCancelRef.current) {
+        break;
+      }
+
+      const combination = combinations[index];
+      const result = runBacktest({
+        backtestConfig: {
+          commissionPercent: Number(form.commissionPercent),
+          atrPositionSizing: combination.strategyDeck.atrPositionSizing,
+          mmDeck: combination.mmDeck,
+          slippagePercent: Number(form.slippagePercent),
+          startingBalance: Number(form.startingBalance),
+        },
+        rawCandles: candles,
+        settings: strategyToSettings(combination.strategyDeck, settings),
+      });
+      const metrics = result.metrics;
+      const row = {
+        ...combination,
+        analysisRange,
+        averageTrade: metrics.averageTrade,
+        bestTrade: metrics.largestWin,
+        id: `sweep-${Date.now()}-${index}`,
+        longResult: sidePnl(result.trades, "LONG"),
+        maxDrawdown: metrics.maxDrawdown,
+        netProfit: metrics.netProfit,
+        netProfitPercent: Number(form.startingBalance) > 0
+          ? (metrics.netProfit / Number(form.startingBalance)) * 100
+          : 0,
+        profitFactor: metrics.profitFactor,
+        rangeForm: form,
+        score: sweepScore(metrics, Number(form.startingBalance)),
+        shortResult: sidePnl(result.trades, "SHORT"),
+        totalTrades: metrics.totalTrades,
+        winRate: metrics.winRate,
+        worstTrade: metrics.largestLoss,
+        expectancy: metrics.expectancy,
+      };
+      rows.push(row);
+
+      if ((index + 1) % 4 === 0 || index === combinations.length - 1) {
+        setSweepResults(rankSweepRows(rows));
+        setSweepProgress({
+          completed: index + 1,
+          message: `Running ${index + 1} / ${combinations.length}`,
+          running: true,
+          total: combinations.length,
+        });
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      }
+    }
+
+    const ranked = rankSweepRows(rows);
+    setSweepResults(ranked);
+    setSweepProgress({
+      completed: rows.length,
+      message: sweepCancelRef.current ? `Cancelled at ${rows.length} / ${combinations.length}` : `Completed ${rows.length} combinations`,
+      running: false,
+      total: combinations.length,
+    });
+    return ranked;
+  }
+
+  function cancelSweepBacktest() {
+    sweepCancelRef.current = true;
+    setSweepProgress((current) => ({
+      ...current,
+      message: "Cancelling sweep...",
+    }));
+  }
+
+  function openSweepResult(row) {
+    if (!row) throw new Error("Choose a sweep result first.");
+    setBacktestForm((current) => ({
+      ...current,
+      mmDeckId: row.mmDeck?.id ?? "",
+      name: `Sweep #${row.rank} ${row.strategyDeck.name}`,
+      strategyDeckId: row.strategyDeck.id,
+    }));
+    return runBrowserBacktest({
+      form: row.rangeForm,
+      mmDeck: row.mmDeck,
+      name: `Sweep #${row.rank} ${row.strategyDeck.name}`,
+      strategyDeck: row.strategyDeck,
+      sweepParams: row.params,
+      timeframe: row.params?.timeframe,
+    });
   }
 
   async function saveBacktest(result = backtestResult) {
@@ -857,6 +1389,12 @@ export default function ControlCenter({
           savedBacktests={savedBacktests}
           setForm={setBacktestForm}
           strategyDecks={strategyDecks}
+          sweepForm={sweepForm}
+          sweepPreview={sweepPreview}
+          sweepProgress={sweepProgress}
+          sweepResults={sweepResults}
+          setSweepForm={setSweepForm}
+          onCancelSweep={() => runAction("cancel-sweep", "Cancel sweep", async () => cancelSweepBacktest())}
           onDelete={(item) => runAction(`delete-backtest-${item.id}`, "Delete backtest", () => deleteCollectionItem("backtests", item))}
           onFavorite={(item) => runAction(`fav-backtest-${item.id}`, "Add favorite", () => addFavorite("Backtests", item))}
           onHide={(item) => runAction(`hide-backtest-${item.id}`, "Hide backtest", () => saveCollectionItem("backtests", { ...item, hidden: true }))}
@@ -869,7 +1407,9 @@ export default function ControlCenter({
             setBacktestResult(null);
             onExitBacktestAnalysis();
           })}
+          onOpenSweepResult={(row) => runAction(`open-sweep-${row.id}`, "Open sweep result", async () => openSweepResult(row))}
           onRun={() => runAction("run-backtest", "Run backtest", async () => runBrowserBacktest())}
+          onRunSweep={() => runAction("run-sweep", "Run sweep", async () => runSweepBacktest())}
           onSave={() => runAction("save-backtest", "Save backtest", () => saveBacktest())}
         />
       )}
@@ -1364,18 +1904,27 @@ function BacktestsPanel({
   form,
   mmDecks,
   onAnalyze,
+  onCancelSweep,
   onClear,
   onDelete,
   onExitAnalysis,
   onFavorite,
   onHide,
+  onOpenSweepResult,
   onRun,
+  onRunSweep,
   onSave,
   result,
   savedBacktests,
   setForm,
+  setSweepForm,
   strategyDecks,
+  sweepForm,
+  sweepPreview,
+  sweepProgress,
+  sweepResults,
 }) {
+  const [mode, setMode] = useState("single");
   const favoriteBacktests = favorites
     .filter((favorite) => favorite.category === "Backtests")
     .map((favorite) => savedBacktests.find((item) => item.id === favorite.itemId))
@@ -1387,43 +1936,66 @@ function BacktestsPanel({
   return (
     <section className="hubert-lab__section">
       <MiniStatus>Saved backtests automatically go to Favorites. Use this panel for the current run.</MiniStatus>
-      <div className="hubert-lab__grid">
-        <TextField label="Backtest name" value={form.name} onChange={(value) => setForm({ ...form, name: value })} />
-        <SelectField label="Strategy Deck" value={form.strategyDeckId || strategyDecks[0]?.id || ""} onChange={(value) => setForm({ ...form, strategyDeckId: value })} options={strategyDecks.map((deck) => [deck.id, deck.name])} />
-        <SelectField label="MM Deck" value={form.mmDeckId} onChange={(value) => setForm({ ...form, mmDeckId: value })} options={mmDecks.map((deck) => [deck.id, deck.name])} />
-        <NumberField label="Last X days" value={form.lastDays} min="1" onChange={(value) => setForm({ ...form, lastDays: value })} />
-        <NumberField label="Starting balance" value={form.startingBalance} onChange={(value) => setForm({ ...form, startingBalance: value })} />
-        <NumberField label="Commission %" value={form.commissionPercent} step="0.01" onChange={(value) => setForm({ ...form, commissionPercent: value })} />
-        <NumberField label="Slippage %" value={form.slippagePercent} step="0.01" onChange={(value) => setForm({ ...form, slippagePercent: value })} />
-      </div>
       <div className="hubert-lab__actions">
-        <button type="button" onClick={onRun}>Run Backtest</button>
-        <button type="button" onClick={onSave}>Name & Save</button>
+        <button type="button" data-active={mode === "single"} onClick={() => setMode("single")}>Single Backtest</button>
+        <button type="button" data-active={mode === "sweep"} onClick={() => setMode("sweep")}>Sweep</button>
       </div>
-      {result && (
-        <div className="hubert-analysis-card">
-          <div>
-            <strong>{analysisActive ? "Backtest Analysis Mode is active" : "Backtest result is ready"}</strong>
-            <span>
-              {analysisSession?.strategyDeckName ?? result.strategyDeckName ?? "Strategy Deck"} · {analysisSession?.timeframe ?? result.timeframe ?? "--"} · {dateText((analysisSession?.range ?? result.analysisRange)?.from)} → {dateText((analysisSession?.range ?? result.analysisRange)?.to)}
-            </span>
-            <span>
-              Trades in table: {tableTradeCount} · rendered on chart: {renderedTrades}
-            </span>
-            {hasTradeRenderMismatch && (
-              <span className="hubert-analysis-card__warning">
-                Chart markers are capped for speed; use the table for the full record.
-              </span>
-            )}
+      {mode === "single" ? (
+        <>
+          <div className="hubert-lab__grid">
+            <TextField label="Backtest name" value={form.name} onChange={(value) => setForm({ ...form, name: value })} />
+            <SelectField label="Strategy Deck" value={form.strategyDeckId || strategyDecks[0]?.id || ""} onChange={(value) => setForm({ ...form, strategyDeckId: value })} options={strategyDecks.map((deck) => [deck.id, deck.name])} />
+            <SelectField label="MM Deck" value={form.mmDeckId} onChange={(value) => setForm({ ...form, mmDeckId: value })} options={mmDecks.map((deck) => [deck.id, deck.name])} />
+            <NumberField label="Last X days" value={form.lastDays} min="1" onChange={(value) => setForm({ ...form, lastDays: value })} />
+            <NumberField label="Starting balance" value={form.startingBalance} onChange={(value) => setForm({ ...form, startingBalance: value })} />
+            <NumberField label="Commission %" value={form.commissionPercent} step="0.01" onChange={(value) => setForm({ ...form, commissionPercent: value })} />
+            <NumberField label="Slippage %" value={form.slippagePercent} step="0.01" onChange={(value) => setForm({ ...form, slippagePercent: value })} />
           </div>
           <div className="hubert-lab__actions">
-            <button type="button" onClick={onAnalyze}>Analyze on Chart</button>
-            <button type="button" onClick={onExitAnalysis}>Exit Analysis</button>
-            <button type="button" onClick={onClear}>Clear Result</button>
+            <button type="button" onClick={onRun}>Run Backtest</button>
+            <button type="button" onClick={onSave}>Name & Save</button>
           </div>
-        </div>
+          {result && (
+            <div className="hubert-analysis-card">
+              <div>
+                <strong>{analysisActive ? "Backtest Analysis Mode is active" : "Backtest result is ready"}</strong>
+                <span>
+                  {analysisSession?.strategyDeckName ?? result.strategyDeckName ?? "Strategy Deck"} · {analysisSession?.timeframe ?? result.timeframe ?? "--"} · {dateText((analysisSession?.range ?? result.analysisRange)?.from)} → {dateText((analysisSession?.range ?? result.analysisRange)?.to)}
+                </span>
+                <span>
+                  Trades in table: {tableTradeCount} · rendered on chart: {renderedTrades}
+                </span>
+                {hasTradeRenderMismatch && (
+                  <span className="hubert-analysis-card__warning">
+                    Chart markers are capped for speed; use the table for the full record.
+                  </span>
+                )}
+              </div>
+              <div className="hubert-lab__actions">
+                <button type="button" onClick={onAnalyze}>Analyze on Chart</button>
+                <button type="button" onClick={onExitAnalysis}>Exit Analysis</button>
+                <button type="button" onClick={onClear}>Clear Result</button>
+              </div>
+            </div>
+          )}
+          <BacktestResult result={result} />
+        </>
+      ) : (
+        <BacktestSweepPanel
+          progress={sweepProgress}
+          preview={sweepPreview}
+          results={sweepResults}
+          form={sweepForm}
+          setForm={setSweepForm}
+          onCancel={onCancelSweep}
+          onOpenResult={(row) => {
+            const result = onOpenSweepResult(row);
+            setMode("single");
+            return result;
+          }}
+          onRun={onRunSweep}
+        />
       )}
-      <BacktestResult result={result} />
       {favoriteBacktests.length > 0 && (
         <>
           <div className="hubert-lab__subhead"><strong>Favorite Backtests</strong><span>{favoriteBacktests.length}</span></div>
@@ -1436,6 +2008,174 @@ function BacktestsPanel({
         </>
       )}
     </section>
+  );
+}
+
+function BacktestSweepPanel({
+  form,
+  onCancel,
+  onOpenResult,
+  onRun,
+  preview,
+  progress,
+  results,
+  setForm,
+}) {
+  const previewTone = preview?.error || preview?.tooMany ? "bad" : "neutral";
+
+  return (
+    <section className="hubert-lab__section">
+      <MiniStatus>
+        Manual Sweep runs many explicit parameter sets without drawing chart overlays. Score = net profit % - max drawdown + trade-count bonus + profit-factor bonus.
+      </MiniStatus>
+      <MiniStatus>Manual Sweep ignores saved Strategy/MM Deck values. It uses the currently loaded chart candles and the explicit fields below.</MiniStatus>
+      <div className="hubert-lab__subhead"><strong>Market</strong><span>loaded data</span></div>
+      <div className="hubert-lab__grid">
+        <TextField label="Symbol" value={form.manualSymbol} onChange={(value) => setForm({ ...form, manualSymbol: value })} />
+        <SelectField label="Timeframe" value={form.manualTimeframe} onChange={(value) => setForm({ ...form, manualTimeframe: value })} options={TIMEFRAMES.map((item) => [item.interval, item.label])} />
+        <NumberField label="Last X days" min="1" value={form.manualLastDays} onChange={(value) => setForm({ ...form, manualLastDays: value })} />
+        <NumberField label="Starting balance" min="1" value={form.manualStartingBalance} onChange={(value) => setForm({ ...form, manualStartingBalance: value })} />
+        <TextField label="From date/time" value={form.manualFrom} onChange={(value) => setForm({ ...form, manualFrom: value })} />
+        <TextField label="To date/time" value={form.manualTo} onChange={(value) => setForm({ ...form, manualTo: value })} />
+      </div>
+      <div className="hubert-lab__subhead"><strong>Strategy Parameters</strong><span>all explicit</span></div>
+      <div className="hubert-lab__grid">
+        <TextField label="Bandwidth values" value={form.manualBandwidths} onChange={(value) => setForm({ ...form, manualBandwidths: value })} />
+        <TextField label="NWE multiplier values" value={form.manualEnvelopeMultipliers} onChange={(value) => setForm({ ...form, manualEnvelopeMultipliers: value })} />
+        <TextField label="ATR length values" value={form.manualAtrLengths} onChange={(value) => setForm({ ...form, manualAtrLengths: value })} />
+        <TextField label="ATR multiplier values" value={form.manualAtrMultipliers} onChange={(value) => setForm({ ...form, manualAtrMultipliers: value })} />
+        <TextField label="Max failures values" value={form.manualMaxSameSideFailures} onChange={(value) => setForm({ ...form, manualMaxSameSideFailures: value })} />
+        <SelectField
+          label="Strategy source"
+          value={form.manualStrategySource}
+          onChange={(value) => setForm({ ...form, manualStrategySource: value })}
+          options={[
+            ["pine-ha", "Pine HA parity"],
+            ["raw-exchange", "Raw exchange"],
+          ]}
+        />
+      </div>
+      <MiniStatus>Confirmed entries is visual only, so it is not part of sweep math.</MiniStatus>
+      <div className="hubert-lab__subhead"><strong>Money Management</strong><span>one sizing mode</span></div>
+      <div className="hubert-lab__grid">
+        <SelectField
+          label="Sizing mode"
+          value={form.manualSizingMode}
+          onChange={(value) => setForm({ ...form, manualSizingMode: value })}
+          options={[
+            ["run-risk", "RUN risk per SL"],
+            ["run-position", "RUN position % equity"],
+            ["constant", "CONSTANT fixed USDT"],
+          ]}
+        />
+        {form.manualSizingMode === "run-risk" && (
+          <TextField label="Risk per SL hit values (%)" value={form.manualRiskValues} onChange={(value) => setForm({ ...form, manualRiskValues: value })} />
+        )}
+        {form.manualSizingMode === "run-position" && (
+          <TextField label="Position size values (% equity)" value={form.manualPositionValues} onChange={(value) => setForm({ ...form, manualPositionValues: value })} />
+        )}
+        {form.manualSizingMode === "constant" && (
+          <TextField label="Fixed notional values (USDT)" value={form.manualFixedNotionalValues} onChange={(value) => setForm({ ...form, manualFixedNotionalValues: value })} />
+        )}
+      </div>
+      <MiniStatus>{manualSweepSizingText(form.manualSizingMode)}</MiniStatus>
+      <div className="hubert-lab__grid">
+        <NumberField label="Max combinations" max={String(SWEEP_MAX_COMBINATIONS)} min="1" value={form.maxCombinations} onChange={(value) => setForm({ ...form, maxCombinations: value })} />
+      </div>
+      <MiniStatus tone={previewTone}>
+        {preview?.error
+          ? preview.error
+          : `Combinations ready: ${preview?.count ?? 0} / ${preview?.cap ?? SWEEP_MAX_COMBINATIONS}${preview?.tooMany ? ". Narrow ranges before running." : "."}`}
+      </MiniStatus>
+      <div className="hubert-lab__actions">
+        <button disabled={progress.running || preview?.tooMany || Boolean(preview?.error)} type="button" onClick={onRun}>Run Sweep</button>
+        <button disabled={!progress.running} type="button" onClick={onCancel}>Cancel</button>
+        <span>{progress.message || "Ready"} {progress.total ? `· ${progress.completed}/${progress.total}` : ""}</span>
+      </div>
+      <SweepResultTable onOpenResult={onOpenResult} results={results} />
+    </section>
+  );
+}
+
+function manualSweepSizingText(mode) {
+  if (mode === "run-risk") {
+    return "RUN risk per SL sizes each position so an SL hit targets the selected % of current equity.";
+  }
+
+  if (mode === "run-position") {
+    return "RUN position % equity uses the selected % of current equity as position notional.";
+  }
+
+  return "CONSTANT fixed USDT uses the same notional size for every trade.";
+}
+
+function sweepSizingShortText(row) {
+  const params = row.params ?? {};
+  const value = params.sizeValue === null || params.sizeValue === undefined
+    ? ""
+    : ` ${fmt(params.sizeValue, 2)}`;
+
+  if (params.sizeKey === "oneSlPercent") return `Risk${value}%`;
+  if (params.sizeKey === "positionPercent") return `Pos${value}%`;
+  if (params.sizeKey === "fixedNotional") return `Fixed${value}`;
+  return "Default";
+}
+
+function sweepParamDetails(row) {
+  const params = row.params ?? {};
+  const symbol = `${params.symbol ?? "SOLUSDT"} ${params.timeframe ?? ""}`.trim();
+  return `${symbol} · source ${params.source ?? "default"} · ATR length ${params.atrLength ?? "--"} · ${params.sizeLabel ?? "Sizing"} ${params.sizeValue ?? "--"}`;
+}
+
+function SweepResultTable({ onOpenResult, results }) {
+  if (!results?.length) {
+    return <MiniStatus>No sweep results yet. Run a sweep to rank parameter sets.</MiniStatus>;
+  }
+
+  return (
+    <div className="hubert-lab__table hubert-lab__table--sweep">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th>
+            <th>Score</th>
+            <th>Net profit</th>
+            <th>Max DD</th>
+            <th>PF</th>
+            <th>Win rate</th>
+            <th>Trades</th>
+            <th>Max failures</th>
+            <th>ATR mult</th>
+            <th>NWE</th>
+            <th>BW</th>
+            <th>Sizing</th>
+            <th>Open</th>
+          </tr>
+        </thead>
+        <tbody>
+          {results.slice(0, 30).map((row) => (
+            <tr key={row.id}>
+              <td>{row.rank}</td>
+              <td>{fmt(row.score)}</td>
+              <td>{fmt(row.netProfit)}</td>
+              <td>{fmt(row.maxDrawdown)}%</td>
+              <td>{fmt(row.profitFactor)}</td>
+              <td>{fmt(row.winRate)}%</td>
+              <td>{row.totalTrades}</td>
+              <td>{row.params?.maxSameSideFailures ?? "--"}</td>
+              <td>{fmt(row.params?.atrMultiplier, 2)}</td>
+              <td>{fmt(row.params?.envelopeMultiplier, 2)}</td>
+              <td>{fmt(row.params?.bandwidth, 2)}</td>
+              <td className="hubert-sweep-params" title={sweepParamDetails(row)}>{sweepSizingShortText(row)}</td>
+              <td><button className="hubert-sweep-open" type="button" onClick={() => onOpenResult(row)}>Open</button></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {results.length > 30 && (
+        <MiniStatus>Showing top 30 of {results.length} combinations. Narrow the range if you want a smaller comparison.</MiniStatus>
+      )}
+    </div>
   );
 }
 

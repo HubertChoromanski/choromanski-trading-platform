@@ -885,6 +885,89 @@ button {
   max-height: 210px;
 }
 
+.hubert-lab__table--sweep {
+  overflow-x: hidden;
+}
+
+.hubert-lab__table--sweep table {
+  table-layout: fixed;
+}
+
+.hubert-lab__table--sweep th,
+.hubert-lab__table--sweep td {
+  overflow: hidden;
+  padding: 6px 4px;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+
+.hubert-lab__table--sweep th {
+  line-height: 1.1;
+  white-space: normal;
+}
+
+.hubert-lab__table--sweep td {
+  white-space: nowrap;
+}
+
+.hubert-lab__table--sweep th:nth-child(1),
+.hubert-lab__table--sweep td:nth-child(1) {
+  width: 30px;
+}
+
+.hubert-lab__table--sweep th:nth-child(2),
+.hubert-lab__table--sweep td:nth-child(2) {
+  width: 46px;
+}
+
+.hubert-lab__table--sweep th:nth-child(3),
+.hubert-lab__table--sweep td:nth-child(3) {
+  width: 60px;
+}
+
+.hubert-lab__table--sweep th:nth-child(4),
+.hubert-lab__table--sweep td:nth-child(4),
+.hubert-lab__table--sweep th:nth-child(6),
+.hubert-lab__table--sweep td:nth-child(6) {
+  width: 48px;
+}
+
+.hubert-lab__table--sweep th:nth-child(5),
+.hubert-lab__table--sweep td:nth-child(5),
+.hubert-lab__table--sweep th:nth-child(7),
+.hubert-lab__table--sweep td:nth-child(7),
+.hubert-lab__table--sweep th:nth-child(8),
+.hubert-lab__table--sweep td:nth-child(8),
+.hubert-lab__table--sweep th:nth-child(9),
+.hubert-lab__table--sweep td:nth-child(9),
+.hubert-lab__table--sweep th:nth-child(10),
+.hubert-lab__table--sweep td:nth-child(10),
+.hubert-lab__table--sweep th:nth-child(11),
+.hubert-lab__table--sweep td:nth-child(11) {
+  width: 40px;
+}
+
+.hubert-lab__table--sweep th:nth-child(12),
+.hubert-lab__table--sweep td:nth-child(12) {
+  width: 66px;
+}
+
+.hubert-lab__table--sweep th:nth-child(13),
+.hubert-lab__table--sweep td:nth-child(13) {
+  width: 42px;
+}
+
+.hubert-sweep-params {
+  font-size: 10px;
+}
+
+.hubert-sweep-open {
+  min-height: 24px;
+  padding: 4px 6px;
+  font-size: 10px;
+  line-height: 1;
+}
+
 .hubert-lab table {
   width: 100%;
   border-collapse: collapse;
