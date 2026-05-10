@@ -66,6 +66,18 @@ export function createBingxClient({
       return client.getSwapUsdtBalance();
     },
 
+    async getLastPrice(symbol) {
+      return request("GET", "/openApi/swap/v2/quote/price", {
+        symbol: symbol ? normalizeSymbol(symbol) : undefined,
+      }, { signed: false });
+    },
+
+    async getMarkPrice(symbol) {
+      return request("GET", "/openApi/swap/v2/quote/premiumIndex", {
+        symbol: symbol ? normalizeSymbol(symbol) : undefined,
+      }, { signed: false });
+    },
+
     async getOpenPositions(symbol) {
       return request("GET", "/openApi/swap/v2/user/positions", {
         symbol: symbol ? normalizeSymbol(symbol) : undefined,

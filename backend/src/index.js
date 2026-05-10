@@ -56,11 +56,123 @@ let availabilityCache = {
   expiresAt: 0,
   rows: [],
 };
+let historicalCandleCache = new Map();
 let apiProfilesCache = {
   expiresAt: 0,
   rows: [],
 };
 let apiProfilesPromise = null;
+
+function intervalMinutesValue(interval) {
+  return TIMEFRAMES.find((item) => item.interval === interval)?.minutes ?? 15;
+}
+
+function candleLimitForRange({ from, maxCandles, timeframe, to }) {
+  const minutes = intervalMinutesValue(timeframe);
+  if (!from || !to) return maxCandles;
+  const spanSeconds = Math.max(0, Number(to) - Number(from));
+  return Math.min(maxCandles, Math.ceil(spanSeconds / (minutes * 60)) + 8);
+}
+
+function candleGapSummary(candles = [], timeframe = "15m") {
+  if (candles.length < 2) {
+    return {
+      count: 0,
+      largestGapSeconds: 0,
+    };
+  }
+
+  const expectedSeconds = intervalMinutesValue(timeframe) * 60;
+  let count = 0;
+  let largestGapSeconds = 0;
+
+  for (let index = 1; index < candles.length; index += 1) {
+    const gap = candles[index].time - candles[index - 1].time;
+    if (gap > expectedSeconds * 1.5) {
+      count += 1;
+      largestGapSeconds = Math.max(largestGapSeconds, gap);
+    }
+  }
+
+  return {
+    count,
+    largestGapSeconds,
+  };
+}
+
+async function historicalCandlesPayload(query) {
+  const startedAt = Date.now();
+  const symbol = (query.get("symbol") || "SOLUSDT").trim().toUpperCase();
+  const timeframe = query.get("timeframe") || query.get("interval") || "15m";
+  const provider = query.get("provider") || "binance-futures";
+  const maxCandles = Math.max(100, Math.min(Number(query.get("maxCandles") || 90000), 90000));
+  const from = query.get("from") ? Math.floor(new Date(query.get("from")).getTime() / 1000) : null;
+  const to = query.get("to") ? Math.floor(new Date(query.get("to")).getTime() / 1000) : null;
+  const limit = candleLimitForRange({ from, maxCandles, timeframe, to });
+  const cacheKey = JSON.stringify({ from, limit, provider, symbol, timeframe, to });
+  const cached = historicalCandleCache.get(cacheKey);
+
+  if (cached && cached.expiresAt > Date.now()) {
+    return {
+      ...cached.payload,
+      diagnostics: {
+        ...cached.payload.diagnostics,
+        cache: "hit",
+        fetchDurationMs: Date.now() - startedAt,
+      },
+    };
+  }
+
+  const candles = await fetchCandles({
+    from,
+    limit,
+    provider,
+    symbol,
+    timeframe,
+    to,
+  });
+  const first = candles[0];
+  const last = candles.at(-1);
+  const availableDays = candles.length * intervalMinutesValue(timeframe) / 1440;
+  const gaps = candleGapSummary(candles, timeframe);
+  const coveredRequestedStart = !from || (first?.time ?? Infinity) <= from + intervalMinutesValue(timeframe) * 60;
+  const coveredRequestedEnd = !to || (last?.time ?? 0) >= to - intervalMinutesValue(timeframe) * 60;
+  const providerLimitMessage = coveredRequestedStart && coveredRequestedEnd
+    ? `Provider returned the requested range: about ${Math.floor(availableDays)} days.`
+    : candles.length < limit
+    ? `Provider currently returned ${Math.floor(availableDays)} days. More history requires cached or external historical data.`
+    : `Provider returned at least ${Math.floor(availableDays)} days for this request.`;
+  const payload = {
+    candles,
+    diagnostics: {
+      availableDays,
+      cache: "miss",
+      candlesReturned: candles.length,
+      fetchDurationMs: Date.now() - startedAt,
+      firstCandleTime: first?.time ?? null,
+      gaps,
+      lastCandleTime: last?.time ?? null,
+      limitRequested: limit,
+      maxCandles,
+      provider,
+      providerLimitMessage,
+      source: provider,
+      symbol,
+      timeframe,
+    },
+  };
+
+  historicalCandleCache.set(cacheKey, {
+    expiresAt: Date.now() + 10 * 60_000,
+    payload,
+  });
+
+  if (historicalCandleCache.size > 12) {
+    historicalCandleCache = new Map([...historicalCandleCache.entries()].slice(-8));
+  }
+
+  return payload;
+}
 
 if (bingxClient.auth.configured) {
   try {
@@ -275,8 +387,8 @@ function getApiProfileClient(profileId = "main") {
   return apiProfiles.get(String(profileId || "main").toLowerCase())?.client ?? bingxClient;
 }
 
-async function publicApiProfiles() {
-  if (apiProfilesCache.expiresAt > Date.now() && apiProfilesCache.rows.length > 0) {
+async function publicApiProfiles({ fresh = false } = {}) {
+  if (!fresh && apiProfilesCache.expiresAt > Date.now() && apiProfilesCache.rows.length > 0) {
     return apiProfilesCache.rows;
   }
 
@@ -319,11 +431,25 @@ async function loadPublicApiProfiles() {
         status = "connected";
       } catch (error) {
         futuresBalance = cached?.futuresBalance ?? null;
-        openPositions = Array.from({ length: Number(cached?.openPositions ?? 0) });
-        openOrders = Array.from({ length: Number(cached?.openOrders ?? 0) });
+        openPositions = cached?.openPositionItems ?? Array.from({ length: Number(cached?.openPositions ?? 0) });
+        openOrders = cached?.openOrderItems ?? Array.from({ length: Number(cached?.openOrders ?? 0) });
         lastSyncAt = cached?.lastSyncAt ?? null;
         status = `sync delayed: ${humanBackendError(error)}`;
       }
+    }
+
+    const markPrices = {};
+    if (configured && openPositions.length > 0) {
+      await Promise.all(
+        [...new Set(openPositions.map((position) => compactSymbol(position.symbol)).filter(Boolean))]
+          .map(async (symbol) => {
+            try {
+              markPrices[symbol] = extractMarkPrice(await profile.client.getMarkPrice(symbol));
+            } catch {
+              markPrices[symbol] = null;
+            }
+          }),
+      );
     }
 
     rows.push({
@@ -332,7 +458,10 @@ async function loadPublicApiProfiles() {
       id: profile.id,
       label: profile.label,
       lastSyncAt,
+      markPrices,
+      openOrderItems: openOrders,
       openOrders: openOrders.length,
+      openPositionItems: openPositions,
       openPositions: openPositions.length,
       status,
       type: profile.type,
@@ -355,6 +484,18 @@ function humanBackendError(error) {
     return "BingX is cooling down this endpoint. Wait a moment and refresh.";
   }
   return message;
+}
+
+function extractMarkPrice(value) {
+  const payload = Array.isArray(value) ? value[0] : value;
+  const price = Number(
+    payload?.markPrice ??
+    payload?.lastMarkPrice ??
+    payload?.price ??
+    payload?.lastPrice ??
+    payload?.indexPrice,
+  );
+  return Number.isFinite(price) && price > 0 ? price : null;
 }
 
 function publicStatusPayload() {
@@ -416,7 +557,7 @@ function positionEntryPrice(position) {
 }
 
 function positionMarkPrice(position) {
-  return Number(position.markPrice ?? position.currentPrice ?? position.lastPrice ?? positionEntryPrice(position));
+  return Number(position.__markPrice ?? position.markPrice ?? position.currentPrice ?? position.lastPrice ?? positionEntryPrice(position));
 }
 
 function positionLeverage(position) {
@@ -437,8 +578,27 @@ function buildLivestreamPayload(apiProfileRows = []) {
   const strategyDecks = store.getCollection("strategyDecks");
   const mmDecks = store.getCollection("mmDecks");
   const profiles = store.getProfiles().filter(isLiveExecutionProfile);
-  const openOrders = normalizeExchangeList(state.bingx?.openOrders);
-  const exchangePositions = normalizeExchangeList(state.bingx?.openPositions).filter(
+  const liveProfileOrders = apiProfileRows.flatMap((profile) =>
+    normalizeExchangeList(profile.openOrderItems).map((order) => ({
+      ...order,
+      __apiProfileId: profile.id,
+      __apiProfileLabel: profile.label,
+    })),
+  );
+  const liveProfilePositions = apiProfileRows.flatMap((profile) =>
+    normalizeExchangeList(profile.openPositionItems).map((position) => ({
+      ...position,
+      __apiProfileId: profile.id,
+      __apiProfileLabel: profile.label,
+      __markPrice: profile.markPrices?.[compactSymbol(position.symbol)] ?? null,
+    })),
+  );
+  const openOrders = liveProfileOrders.length
+    ? liveProfileOrders
+    : normalizeExchangeList(state.bingx?.openOrders);
+  const exchangePositions = (liveProfilePositions.length
+    ? liveProfilePositions
+    : normalizeExchangeList(state.bingx?.openPositions)).filter(
     (position) => positionAmount(position) > 0,
   );
   const localPositions = profiles
@@ -449,6 +609,7 @@ function buildLivestreamPayload(apiProfileRows = []) {
     }));
   const positions = exchangePositions.map((exchangePosition) => {
     const matchingProfile =
+      profiles.find((profile) => profileApiId(profile) === exchangePosition.__apiProfileId) ??
       profiles.find((profile) => compactSymbol(profile.symbol) === compactSymbol(exchangePosition.symbol)) ??
       localPositions.find((item) => compactSymbol(item.profile.symbol) === compactSymbol(exchangePosition.symbol))?.profile;
     const battleDeck = battleDecks.find((deck) => `battle-${deck.id}` === matchingProfile?.id);
@@ -471,6 +632,7 @@ function buildLivestreamPayload(apiProfileRows = []) {
 
     return {
       apiProfile: profileApiId(matchingProfile),
+      apiProfileLabel: exchangePosition.__apiProfileLabel ?? matchingProfile?.account?.label ?? matchingProfile?.account?.apiProfile ?? profileApiId(matchingProfile),
       attachedOrders: orders,
       battleDeckId: battleDeck?.id ?? null,
       battleDeckName: battleDeck?.name ?? "Exchange position",
@@ -508,11 +670,23 @@ function buildLivestreamPayload(apiProfileRows = []) {
   const totalUnrealizedPnl = positions.reduce((sum, position) => sum + Number(position.unrealizedPnl ?? 0), 0);
   const totalOpenNotional = positions.reduce((sum, position) => sum + Number(position.notionalSize ?? 0), 0);
   const totalMarginUsed = positions.reduce((sum, position) => sum + Number(position.marginUsed ?? 0), 0);
+  const lastBingxSyncAt =
+    apiProfileRows
+      .map((profile) => profile.lastSyncAt)
+      .filter(Boolean)
+      .sort()
+      .at(-1) ?? state.bingx?.lastSyncAt ?? null;
+  const syncAgeSeconds = lastBingxSyncAt
+    ? Math.max(0, Math.floor((Date.now() - new Date(lastBingxSyncAt).getTime()) / 1000))
+    : null;
 
   return {
     accountSummary: {
       apiProfiles: apiProfileRows,
+      dataAgeSeconds: syncAgeSeconds,
+      lastBingxSyncAt,
       lastRefreshAt: new Date().toISOString(),
+      source: syncAgeSeconds !== null && syncAgeSeconds <= 20 ? "fresh BingX sync" : apiProfileRows.length ? "backend cache" : "fallback",
       totalCombinedFuturesBalance: totalFuturesBalance,
       totalMarginUsed,
       totalOpenNotional,
@@ -1105,18 +1279,23 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "GET" && (pathname === "/historical/candles" || pathname === "/data/candles")) {
+      sendJson(response, 200, await historicalCandlesPayload(url.searchParams));
+      return;
+    }
+
     if (request.method === "GET" && pathname === "/execution/status") {
       sendJson(response, 200, publicStatusPayload());
       return;
     }
 
     if (request.method === "GET" && pathname === "/accounts/profiles") {
-      sendJson(response, 200, await publicApiProfiles());
+      sendJson(response, 200, await publicApiProfiles({ fresh: url.searchParams.get("fresh") === "1" }));
       return;
     }
 
     if (request.method === "GET" && pathname === "/livestream") {
-      const apiProfileRows = await publicApiProfiles();
+      const apiProfileRows = await publicApiProfiles({ fresh: url.searchParams.get("fresh") === "1" });
       const payload = buildLivestreamPayload(apiProfileRows);
       sendJson(response, 200, payload);
       return;

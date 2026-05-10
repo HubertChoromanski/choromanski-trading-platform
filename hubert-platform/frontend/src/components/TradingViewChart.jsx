@@ -6,7 +6,7 @@ import {
   createChart,
   createSeriesMarkers,
 } from "lightweight-charts";
-import { createSolKlineSocket, fetchSolKlines } from "../api/binance";
+import { createSolKlineSocket, fetchHistoricalCandles } from "../api/binance";
 import {
   STRATEGY_EVENT_TYPES,
   evaluateChoromanskiStrategy,
@@ -32,21 +32,21 @@ const timeframes = [
   { label: "4H", interval: "4h" },
 ];
 const toolButtons = [
-  "System",
   "Livestream",
+  "Execution",
+  "Crisis",
   "Indicator",
   "Strategy Decks",
-  "Backtests",
-  "Compare",
   "MM Decks",
   "Decision",
   "Battle Decks",
-  "Execution",
-  "Crisis",
+  "Backtests",
+  "Compare",
+  "Favorites",
+  "System",
   "Analytics",
   "Communication",
   "AI",
-  "Favorites",
 ];
 const defaultSettings = {
   strategySource: "pine-ha",
@@ -55,8 +55,8 @@ const defaultSettings = {
   atrLength: 14,
   atrMultiplier: 1.2,
   maxSameSideFailures: 2,
-  historyDays: 31,
-  historyLimit: 3000,
+  historyDays: 1000,
+  historyLimit: 10000,
   showBands: true,
   showEntries: true,
   showBenchmarks: false,
@@ -67,6 +67,16 @@ const defaultSettings = {
 const MAX_BACKTEST_CHART_MARKERS = 500;
 const MAX_BACKTEST_DEBUG_MARKERS = 80;
 const MAX_STRATEGY_LINE_EVENTS = 220;
+const CHART_RENDER_CAP = 3000;
+const DEFAULT_CHART_WINDOW_DAYS = 50;
+const MAX_CANDLES_BY_INTERVAL = {
+  "10m": 10000,
+  "15m": 10000,
+  "20m": 10000,
+  "30m": 10000,
+  "1h": 10000,
+  "4h": 5000,
+};
 const defaultBacktestOverlaySettings = {
   showDebug: false,
   showExits: true,
@@ -100,6 +110,11 @@ function formatChartPnl(value) {
   return `${prefix}${Number(value).toFixed(2)}`;
 }
 
+function formatExitReason(reason) {
+  if (reason === "END") return "END / open until test end";
+  return reason ?? "EXIT";
+}
+
 function formatChartTime(value) {
   if (!value) return "--";
 
@@ -124,6 +139,44 @@ function rangeFromCandles(candles = []) {
     from: candles[0]?.time ?? null,
     to: candles.at(-1)?.time ?? null,
   };
+}
+
+function intervalMinutes(interval) {
+  const minutesByInterval = {
+    "10m": 10,
+    "15m": 15,
+    "20m": 20,
+    "30m": 30,
+    "1h": 60,
+    "4h": 240,
+  };
+
+  return minutesByInterval[interval] ?? 15;
+}
+
+function chartWindowLimit(interval, days = DEFAULT_CHART_WINDOW_DAYS) {
+  return Math.max(100, Math.min(CHART_RENDER_CAP, Math.ceil(days * 1440 / intervalMinutes(interval))));
+}
+
+function chartWindowAround(candles = [], interval = "15m", centerTime = null, days = DEFAULT_CHART_WINDOW_DAYS) {
+  if (!candles.length) return [];
+  const limit = chartWindowLimit(interval, days);
+
+  if (!centerTime) {
+    return candles.slice(-limit);
+  }
+
+  const target = Number(centerTime);
+  let centerIndex = candles.findIndex((candle) => candle.time >= target);
+
+  if (centerIndex < 0) {
+    centerIndex = candles.length - 1;
+  }
+
+  const half = Math.floor(limit / 2);
+  const start = Math.max(0, Math.min(centerIndex - half, candles.length - limit));
+
+  return candles.slice(start, start + limit);
 }
 
 function filterCandlesByRange(candles = [], range = {}) {
@@ -168,7 +221,10 @@ function toBacktestAnalysisMarkers(result, overlaySettings = defaultBacktestOver
         const entryText = overlaySettings.showPnlLabels
           ? `${side} ${formatChartPrice(trade.entryPrice)}`
           : side;
-        const exitReason = trade.exitReason ?? "EXIT";
+        const exitReason = formatExitReason(trade.exitReason);
+        const exitTime = trade.exitReason === "END"
+          ? result.analysisRange?.to ?? trade.exitTime
+          : trade.exitTime;
         const exitText = overlaySettings.showPnlLabels
           ? `${exitReason} ${formatChartPnl(trade.netPnl)}`
           : exitReason;
@@ -192,7 +248,7 @@ function toBacktestAnalysisMarkers(result, overlaySettings = defaultBacktestOver
             shape: "square",
             size: 0.72,
             text: exitText,
-            time: trade.exitTime,
+            time: exitTime,
           });
         }
 
@@ -221,19 +277,11 @@ function toBacktestAnalysisMarkers(result, overlaySettings = defaultBacktestOver
 }
 
 function historyDaysToLimit(interval, days) {
-  const minutesByInterval = {
-    "10m": 10,
-    "15m": 15,
-    "20m": 20,
-    "30m": 30,
-    "1h": 60,
-    "4h": 240,
-  };
-  const minutes = minutesByInterval[interval] ?? 15;
-  const requested = Math.ceil(Number(days || 31) * 1440 / minutes);
-  const maxLimit = interval === "4h" ? 5000 : 10000;
+  const requested = Math.ceil(Number(days || 31) * 1440 / intervalMinutes(interval));
+  const maxLimit = MAX_CANDLES_BY_INTERVAL[interval] ?? 10000;
+  const minimumReliableHistory = maxLimit;
 
-  return Math.max(100, Math.min(maxLimit, requested));
+  return Math.max(100, Math.min(maxLimit, Math.max(requested, minimumReliableHistory)));
 }
 
 function toIncrementalHeikenAshi(rawCandle, previousHa) {
@@ -267,13 +315,30 @@ export default function TradingViewChart() {
   const pendingLiveCandlesRef = useRef(null);
   const liveRenderFrameRef = useRef(0);
   const analysisModeRef = useRef(false);
+  const fullHistoryDatasetRef = useRef([]);
+  const dataDiagnosticsRef = useRef({});
   const rawCandlesRef = useRef([]);
+  const selectedHistoricalWindowRef = useRef({ mode: "latest" });
   const fitAfterRenderRef = useRef(false);
   const requestIdRef = useRef(0);
   const [selectedInterval, setSelectedInterval] = useState(
     persistedState.chartTimeframe ?? "15m",
   );
+  const [fullHistoryDataset, setFullHistoryDataset] = useState([]);
   const [rawCandles, setRawCandlesState] = useState([]);
+  const [selectedHistoricalWindow, setSelectedHistoricalWindow] = useState({
+    centerTime: null,
+    from: null,
+    mode: "latest",
+    to: null,
+  });
+  const [dataDiagnostics, setDataDiagnostics] = useState({
+    fullCandles: 0,
+    provider: "binance-futures",
+    renderedCandles: 0,
+    source: "binance-futures",
+  });
+  const [jumpDate, setJumpDate] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
   const [settings, setSettings] = useState({
@@ -303,6 +368,14 @@ export default function TradingViewChart() {
   useEffect(() => {
     analysisModeRef.current = Boolean(activeAnalysisSession);
   }, [activeAnalysisSession]);
+
+  useEffect(() => {
+    selectedHistoricalWindowRef.current = selectedHistoricalWindow;
+  }, [selectedHistoricalWindow]);
+
+  useEffect(() => {
+    dataDiagnosticsRef.current = dataDiagnostics;
+  }, [dataDiagnostics]);
 
   const projectMeasurementPoint = useCallback((point) => {
     if (!point || !chartRef.current || !realPriceSeriesRef.current) {
@@ -415,7 +488,46 @@ export default function TradingViewChart() {
       ...currentStatus,
       state: "Unsaved changes",
     }));
+    setSelectedHistoricalWindow({
+      centerTime: null,
+      from: null,
+      mode: "latest",
+      to: null,
+    });
     setSelectedInterval(interval);
+  }
+
+  function setChartVisibleDataset(candles, shouldFitContent = false, windowMode = {}) {
+    rawCandlesRef.current = candles;
+    fitAfterRenderRef.current = shouldFitContent;
+    setRawCandlesState(candles);
+    setSelectedHistoricalWindow({
+      centerTime: windowMode.centerTime ?? null,
+      from: candles[0]?.time ?? null,
+      mode: windowMode.mode ?? "latest",
+      to: candles.at(-1)?.time ?? null,
+    });
+    setDataDiagnostics((current) => ({
+      ...current,
+      renderedCandles: candles.length,
+      selectedHistoricalWindow: {
+        from: candles[0]?.time ?? null,
+        mode: windowMode.mode ?? "latest",
+        to: candles.at(-1)?.time ?? null,
+      },
+    }));
+  }
+
+  function setFullHistoryDatasetState(candles, diagnostics = {}) {
+    fullHistoryDatasetRef.current = candles;
+    setFullHistoryDataset(candles);
+    setDataDiagnostics((current) => ({
+      ...current,
+      ...diagnostics,
+      fullCandles: candles.length,
+      provider: diagnostics.provider ?? diagnostics.source ?? current.provider ?? "binance-futures",
+      source: diagnostics.source ?? diagnostics.provider ?? current.source ?? "binance-futures",
+    }));
   }
 
   function handleBacktestResult(result, context = {}) {
@@ -426,15 +538,29 @@ export default function TradingViewChart() {
       return;
     }
 
-    const analysisCandles = context.candles?.length
+    const backtestCandles = context.candles?.length
       ? context.candles
       : filterCandlesByRange(rawCandlesRef.current, result.analysisRange);
+    const fullRange = context.range ?? result.analysisRange ?? rangeFromCandles(backtestCandles);
+    const focusTime =
+      context.focusTime ??
+      result.trades?.at(-1)?.entryTime ??
+      fullRange.to ??
+      backtestCandles.at(-1)?.time;
+    const analysisCandles = chartWindowAround(
+      backtestCandles,
+      context.timeframe ?? result.timeframe ?? selectedInterval,
+      focusTime,
+    );
     const session = {
       candles: analysisCandles,
+      backtestCandles,
       createdAt: new Date().toISOString(),
+      diagnostics: context.diagnostics ?? result.dataDiagnostics ?? null,
       id: result.id ?? `analysis-${Date.now()}`,
       mmDeckName: context.mmDeckName ?? result.mmDeckName ?? "No MM deck",
-      range: context.range ?? result.analysisRange ?? rangeFromCandles(analysisCandles),
+      range: rangeFromCandles(analysisCandles),
+      fullRange,
       result,
       settings: context.settings ?? result.analysisSettings ?? settings,
       strategyDeckName: context.strategyDeckName ?? result.strategyDeckName ?? "Strategy Deck",
@@ -448,6 +574,26 @@ export default function TradingViewChart() {
 
   function analyzeBacktestOnChart() {
     if (!activeBacktestSession) return;
+    setBacktestAnalysisActive(true);
+    fitAfterRenderRef.current = true;
+  }
+
+  function viewBacktestTradeOnChart(trade) {
+    if (!activeBacktestSession) return;
+    const focusTime = trade?.entryTime ?? trade?.exitTime ?? activeBacktestSession.fullRange?.to;
+    const sourceCandles = activeBacktestSession.backtestCandles?.length
+      ? activeBacktestSession.backtestCandles
+      : activeBacktestSession.candles;
+    const nextCandles = chartWindowAround(sourceCandles, activeBacktestSession.timeframe, focusTime);
+
+    setActiveBacktestSession((currentSession) => currentSession
+      ? {
+          ...currentSession,
+          candles: nextCandles,
+          range: rangeFromCandles(nextCandles),
+          viewedTradeId: trade?.id ?? trade?.setupId ?? null,
+        }
+      : currentSession);
     setBacktestAnalysisActive(true);
     fitAfterRenderRef.current = true;
   }
@@ -520,6 +666,48 @@ export default function TradingViewChart() {
     chartRef.current?.timeScale().scrollToRealTime();
     chartRef.current?.timeScale().fitContent();
     resetMeasurement();
+  }
+
+  async function jumpToHistoricalDate() {
+    const targetMs = new Date(jumpDate).getTime();
+
+    if (!Number.isFinite(targetMs)) {
+      setError("Choose a valid jump date.");
+      return;
+    }
+
+    const targetSeconds = Math.floor(targetMs / 1000);
+
+    if (activeBacktestSession?.backtestCandles?.length) {
+      viewBacktestTradeOnChart({ entryTime: targetSeconds, id: `jump-${targetSeconds}` });
+      return;
+    }
+
+    const halfWindowSeconds = Math.floor(DEFAULT_CHART_WINDOW_DAYS * 86400 / 2);
+    setIsLoading(true);
+    setError("");
+
+    try {
+      const payload = await fetchHistoricalCandles({
+        from: new Date((targetSeconds - halfWindowSeconds) * 1000).toISOString(),
+        maxCandles: CHART_RENDER_CAP + 50,
+        provider: "binance-futures",
+        symbol: "SOLUSDT",
+        timeframe: selectedInterval,
+        to: new Date((targetSeconds + halfWindowSeconds) * 1000).toISOString(),
+      });
+      const visibleCandles = chartWindowAround(payload.candles, selectedInterval, targetSeconds);
+
+      setFullHistoryDatasetState(payload.candles, payload.diagnostics);
+      setChartVisibleDataset(visibleCandles, true, {
+        centerTime: targetSeconds,
+        mode: "historical",
+      });
+    } catch (jumpError) {
+      setError(jumpError instanceof Error ? jumpError.message : "Unable to load that historical chart window.");
+    } finally {
+      setIsLoading(false);
+    }
   }
 
   useEffect(() => {
@@ -639,19 +827,23 @@ export default function TradingViewChart() {
   );
 
   const renderBacktestLines = useCallback(
-    (result, overlaySettings) => {
+    (result, overlaySettings, candles = []) => {
       clearStrategyLines();
 
       if (!overlaySettings.showSlTp) {
         return;
       }
 
+      const times = candles.length ? candleTimeSet(candles) : null;
       (result?.trades ?? [])
+        .filter((trade) => !times || times.has(trade.entryTime) || times.has(trade.exitTime))
         .filter((trade) => Number.isFinite(Number(trade.stopLoss)) || Number.isFinite(Number(trade.takeProfit)))
         .slice(-MAX_STRATEGY_LINE_EVENTS)
         .forEach((trade) => {
           const startTime = trade.entryTime;
-          const endTime = trade.exitTime ?? trade.entryTime;
+          const endTime = trade.exitReason === "END"
+            ? result.analysisRange?.to ?? trade.exitTime ?? trade.entryTime
+            : trade.exitTime ?? trade.entryTime;
 
           if (Number.isFinite(Number(trade.stopLoss))) {
             addStrategySegment({
@@ -708,7 +900,7 @@ export default function TradingViewChart() {
 
       if (mode.analysisResult) {
         strategyMarkersRef.current?.setMarkers(toBacktestAnalysisMarkers(mode.analysisResult, mode.overlaySettings, candles));
-        renderBacktestLines(mode.analysisResult, mode.overlaySettings);
+        renderBacktestLines(mode.analysisResult, mode.overlaySettings, candles);
       } else {
         const closedCandles = candles.filter((candle) => candle.isClosed !== false);
         const closedHeikenAshiCandles = toHeikenAshi(closedCandles);
@@ -984,35 +1176,50 @@ export default function TradingViewChart() {
     const requestId = requestIdRef.current + 1;
     requestIdRef.current = requestId;
 
-    function setRawCandles(candles, shouldFitContent = false) {
-      rawCandlesRef.current = candles;
-      fitAfterRenderRef.current = shouldFitContent;
-      setRawCandlesState(candles);
-    }
-
     function updateRawCandle(nextCandle) {
-      const currentCandles = rawCandlesRef.current;
-      const lastCandle = currentCandles[currentCandles.length - 1];
-      let updatedCandles = currentCandles;
+      const currentFullCandles = fullHistoryDatasetRef.current;
+      const lastCandle = currentFullCandles[currentFullCandles.length - 1];
+      let updatedFullCandles = currentFullCandles;
 
       if (!lastCandle || nextCandle.time > lastCandle.time) {
-        updatedCandles = [...currentCandles, nextCandle].slice(-historyLimit);
+        updatedFullCandles = [...currentFullCandles, nextCandle].slice(-historyLimit);
       } else if (nextCandle.time === lastCandle.time) {
-        updatedCandles = [...currentCandles.slice(0, -1), nextCandle];
+        updatedFullCandles = [...currentFullCandles.slice(0, -1), nextCandle];
       }
 
-      if (updatedCandles === currentCandles) {
+      if (updatedFullCandles === currentFullCandles) {
         return;
       }
 
-      rawCandlesRef.current = updatedCandles;
+      fullHistoryDatasetRef.current = updatedFullCandles;
+
+      if (selectedHistoricalWindowRef.current.mode !== "latest") {
+        setFullHistoryDatasetState(updatedFullCandles, {
+          fullCandles: updatedFullCandles.length,
+          provider: dataDiagnosticsRef.current.provider,
+          source: dataDiagnosticsRef.current.source,
+        });
+        return;
+      }
+
+      const visibleCandles = chartWindowAround(updatedFullCandles, selectedInterval);
 
       if (nextCandle.isClosed || nextCandle.time > lastCandle?.time) {
-        setRawCandles(updatedCandles);
+        setFullHistoryDatasetState(updatedFullCandles, {
+          fullCandles: updatedFullCandles.length,
+          provider: dataDiagnosticsRef.current.provider,
+          source: dataDiagnosticsRef.current.source,
+        });
+        setChartVisibleDataset(visibleCandles, false, { mode: "latest" });
         return;
       }
 
-      scheduleLiveCandleUpdate(updatedCandles);
+      rawCandlesRef.current = visibleCandles;
+      setDataDiagnostics((current) => ({
+        ...current,
+        renderedCandles: visibleCandles.length,
+      }));
+      scheduleLiveCandleUpdate(visibleCandles);
     }
 
     async function loadMarketData() {
@@ -1020,13 +1227,20 @@ export default function TradingViewChart() {
       setError("");
 
       try {
-        const candles = await fetchSolKlines(selectedInterval, historyLimit);
+        const payload = await fetchHistoricalCandles({
+          maxCandles: historyLimit,
+          provider: "binance-futures",
+          symbol: "SOLUSDT",
+          timeframe: selectedInterval,
+        });
+        const candles = payload.candles;
 
         if (ignore || requestIdRef.current !== requestId) {
           return;
         }
 
-        setRawCandles(candles, true);
+        setFullHistoryDatasetState(candles, payload.diagnostics);
+        setChartVisibleDataset(chartWindowAround(candles, selectedInterval), true, { mode: "latest" });
         closeSocket = createSolKlineSocket(selectedInterval, {
           onCandle: (candle) => {
             if (ignore || requestIdRef.current !== requestId) {
@@ -1155,7 +1369,11 @@ export default function TradingViewChart() {
           onClearBacktest={exitBacktestAnalysis}
           onClose={() => setSettingsPanel(null)}
           onExitBacktestAnalysis={exitBacktestAnalysis}
+          onViewBacktestTrade={viewBacktestTradeOnChart}
+          chartDiagnostics={dataDiagnostics}
+          fullHistoryDataset={fullHistoryDataset}
           rawCandles={rawCandles}
+          selectedHistoricalWindow={selectedHistoricalWindow}
           selectedInterval={selectedInterval}
           setActivePanel={setSettingsPanel}
           setSelectedInterval={updateSelectedInterval}
@@ -1185,6 +1403,21 @@ export default function TradingViewChart() {
       )}
 
       <div className="hubert-chart" onClick={handleChartClick} ref={chartContainerRef} />
+
+      <div className="hubert-window-panel" aria-label="Chart window controls">
+        <strong>{dataDiagnostics.provider ?? "binance-futures"}</strong>
+        <span>{rawCandles.length} rendered / {fullHistoryDataset.length || dataDiagnostics.fullCandles || 0} loaded</span>
+        <span>{selectedHistoricalWindow.mode === "historical" ? "Viewing historical window" : "Live/latest window"}</span>
+        <div>
+          <input
+            aria-label="Jump to date"
+            type="date"
+            value={jumpDate}
+            onChange={(event) => setJumpDate(event.target.value)}
+          />
+          <button type="button" onClick={jumpToHistoricalDate}>Jump</button>
+        </div>
+      </div>
 
       {measurementView?.start && (
         <MeasurementOverlay measurementView={measurementView} />
@@ -1221,9 +1454,11 @@ export default function TradingViewChart() {
 
 function BacktestAnalysisBanner({ overlaySettings, session, onAnalyze, onExit, onToggle }) {
   const range = session.range ?? rangeFromCandles(session.candles);
+  const fullRange = session.fullRange ?? range;
   const tradeCount = session.result?.trades?.length ?? 0;
   const renderedCount = renderedTradeCount(session.result, session.candles, overlaySettings);
   const hasMismatch = overlaySettings.showTrades && renderedCount !== tradeCount;
+  const hasEndTrade = Boolean(session.result?.trades?.some((trade) => trade.exitReason === "END"));
 
   return (
     <aside className="hubert-backtest-banner" aria-label="Backtest Analysis Mode">
@@ -1233,7 +1468,9 @@ function BacktestAnalysisBanner({ overlaySettings, session, onAnalyze, onExit, o
           <span>
             {session.strategyDeckName} · {session.mmDeckName} · {session.timeframe} · {tradeCount} trades
           </span>
-          <span>{formatChartTime(range.from)} → {formatChartTime(range.to)}</span>
+          <span>Viewing historical window from backtest: {formatChartTime(range.from)} → {formatChartTime(range.to)}</span>
+          <span>Full test range: {formatChartTime(fullRange.from)} → {formatChartTime(fullRange.to)}</span>
+          <span>{session.candles?.length ?? 0} chart candles · {session.backtestCandles?.length ?? session.result?.candlesUsed ?? "--"} backtest candles</span>
           <span className={hasMismatch ? "hubert-backtest-banner__warning" : ""}>
             Trades in table: {tradeCount} · rendered on chart: {renderedCount}
           </span>
@@ -1264,6 +1501,11 @@ function BacktestAnalysisBanner({ overlaySettings, session, onAnalyze, onExit, o
       {hasMismatch && (
         <div className="hubert-backtest-banner__warning">
           Chart markers are capped to keep zoom and pan responsive. The table remains the full record.
+        </div>
+      )}
+      {hasEndTrade && (
+        <div className="hubert-backtest-banner__warning">
+          END means a trade was still open when the test range ended. It is not a live open position.
         </div>
       )}
       {overlaySettings.showDebug && (

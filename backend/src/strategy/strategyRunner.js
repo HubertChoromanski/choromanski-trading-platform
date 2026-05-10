@@ -2,7 +2,10 @@ import { evaluateChoromanskiStrategy, STRATEGY_EVENT_TYPES } from "../../../hube
 import { toHeikenAshi } from "../../../hubert-platform/frontend/src/indicators/heikenAshi.js";
 import { calculateNadarayaEnvelope } from "../../../hubert-platform/frontend/src/indicators/nadaraya.js";
 
-const BINANCE_BASE_URL = "https://api.binance.com/api/v3";
+const BINANCE_SPOT_BASE_URL = "https://api.binance.com/api/v3";
+const BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com/fapi/v1";
+const MAX_BINANCE_LIMIT = 1500;
+const MAX_HISTORICAL_CANDLES = Number(process.env.MAX_HISTORICAL_CANDLES || 90000);
 
 const CUSTOM_INTERVALS = {
   "10m": { base: "5m", minutes: 10 },
@@ -60,7 +63,11 @@ function intervalMinutes(interval) {
   return 1;
 }
 
-async function requestKlines({ endTime, interval, limit, symbol }) {
+function providerBaseUrl(provider = "binance-futures") {
+  return provider === "binance-spot" ? BINANCE_SPOT_BASE_URL : BINANCE_FUTURES_BASE_URL;
+}
+
+async function requestKlines({ endTime, interval, limit, provider = "binance-futures", symbol }) {
   const params = new URLSearchParams({
     symbol,
     interval,
@@ -71,10 +78,10 @@ async function requestKlines({ endTime, interval, limit, symbol }) {
     params.set("endTime", String(endTime));
   }
 
-  const response = await fetch(`${BINANCE_BASE_URL}/klines?${params.toString()}`);
+  const response = await fetch(`${providerBaseUrl(provider)}/klines?${params.toString()}`);
 
   if (!response.ok) {
-    throw new Error(`Binance request failed: ${response.status}`);
+    throw new Error(`Binance ${provider} request failed: ${response.status}`);
   }
 
   const payload = await response.json();
@@ -86,20 +93,42 @@ async function requestKlines({ endTime, interval, limit, symbol }) {
   return payload.map(normalizeKline);
 }
 
-export async function fetchCandles({ limit = 1000, symbol, timeframe }) {
+export async function fetchCandles({
+  endTime,
+  from,
+  limit = 1000,
+  provider = "binance-futures",
+  symbol,
+  timeframe,
+  to,
+} = {}) {
   const custom = CUSTOM_INTERVALS[timeframe];
   const interval = custom?.base ?? timeframe;
-  const requestedLimit = Math.max(1, Math.min(Number(limit) || 1000, 10000));
+  const startMs = from ? Number(from) * 1000 : undefined;
+  const endMs = to ? Number(to) * 1000 : endTime;
+  const rangeLimit = startMs && endMs
+    ? Math.ceil((endMs - startMs) / (intervalMinutes(timeframe) * 60 * 1000)) + 4
+    : 0;
+  const requestedLimit = Math.max(
+    1,
+    Math.min(Number(limit) || rangeLimit || 1000, MAX_HISTORICAL_CANDLES),
+  );
   const requestLimit = custom
-    ? Math.min(50000, requestedLimit * (custom.minutes / intervalMinutes(interval)) + 8)
+    ? Math.min(MAX_HISTORICAL_CANDLES * 5, requestedLimit * (custom.minutes / intervalMinutes(interval)) + 8)
     : requestedLimit;
   const chunks = [];
-  let endTime = undefined;
+  let nextEndTime = endMs;
   let remaining = requestLimit;
 
   while (remaining > 0) {
-    const batchLimit = Math.min(1000, remaining);
-    const candles = await requestKlines({ endTime, interval, limit: batchLimit, symbol });
+    const batchLimit = Math.min(MAX_BINANCE_LIMIT, remaining);
+    const candles = await requestKlines({
+      endTime: nextEndTime,
+      interval,
+      limit: batchLimit,
+      provider,
+      symbol,
+    });
 
     if (candles.length === 0) {
       break;
@@ -107,9 +136,13 @@ export async function fetchCandles({ limit = 1000, symbol, timeframe }) {
 
     chunks.unshift(candles);
     remaining -= candles.length;
-    endTime = candles[0].openTime - 1;
+    nextEndTime = candles[0].openTime - 1;
 
     if (candles.length < batchLimit) {
+      break;
+    }
+
+    if (startMs && nextEndTime < startMs) {
       break;
     }
   }
@@ -118,12 +151,12 @@ export async function fetchCandles({ limit = 1000, symbol, timeframe }) {
   chunks.flat().forEach((candle) => {
     deduped.set(candle.time, candle);
   });
-  const candles = [...deduped.values()]
+  let candles = [...deduped.values()]
     .sort((left, right) => left.time - right.time)
-    .slice(-requestLimit);
+    .filter((candle) => (!startMs || candle.openTime >= startMs) && (!endMs || candle.openTime <= endMs));
 
   if (custom) {
-    return aggregateCandles(candles, custom.minutes).slice(-requestedLimit);
+    candles = aggregateCandles(candles, custom.minutes);
   }
 
   return candles.slice(-requestedLimit);

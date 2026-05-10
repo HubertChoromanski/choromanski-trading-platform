@@ -1,22 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { runBacktest } from "../backtest/backtestEngine";
+import { fetchHistoricalCandles } from "../api/binance";
 
 const PANEL_TABS = [
-  "System",
   "Livestream",
+  "Execution",
+  "Crisis",
   "Indicator",
   "Strategy Decks",
-  "Backtests",
-  "Compare",
   "MM Decks",
   "Decision",
   "Battle Decks",
-  "Execution",
-  "Crisis",
+  "Backtests",
+  "Compare",
+  "Favorites",
+  "System",
   "Analytics",
   "Communication",
   "AI",
-  "Favorites",
 ];
 
 const BACKEND_URL = normalizeBackendUrl(
@@ -73,10 +74,12 @@ const defaultBacktestForm = {
   lastDays: 31,
   mmDeckId: "",
   name: "",
+  provider: "binance-futures",
   slippagePercent: 0,
   startingBalance: 10000,
   strategyDeckId: "",
-  manualTo: "",
+  timeframe: "15m",
+  to: "",
 };
 
 const defaultSweepForm = {
@@ -101,6 +104,7 @@ const defaultSweepForm = {
   manualStrategySource: "pine-ha",
   manualSymbol: "SOLUSDT",
   manualTimeframe: "15m",
+  manualTo: "",
   maxCombinations: SWEEP_MAX_COMBINATIONS,
   maxSameSideFailures: "",
   mode: "manual",
@@ -245,6 +249,34 @@ function dateText(time) {
   return new Date(value).toLocaleString();
 }
 
+function compactDateText(time) {
+  if (!time) return "Unavailable";
+  return dateText(time);
+}
+
+function secondsSince(time) {
+  if (!time) return null;
+  const value = typeof time === "number" ? time * 1000 : new Date(time).getTime();
+  if (!Number.isFinite(value)) return null;
+  return Math.max(0, Math.floor((Date.now() - value) / 1000));
+}
+
+function ageText(time) {
+  const seconds = secondsSince(time);
+  if (seconds === null) return "Unavailable";
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  return `${Math.floor(seconds / 3600)}h ago`;
+}
+
+function dataFreshnessTone(time) {
+  const seconds = secondsSince(time);
+  if (seconds === null) return "bad";
+  if (seconds > 120) return "bad";
+  if (seconds > 45) return "neutral";
+  return "good";
+}
+
 function displayBotStatus(status) {
   if (!status || status === "STOPPED" || status === "PAPER" || status === "PAPER_RUNNING") return "OFF";
   if (status === "LIVE_RUNNING") return "ON";
@@ -256,6 +288,28 @@ function displayBotStatus(status) {
 
 function compact(value) {
   return String(value ?? "").replace("-", "").toUpperCase();
+}
+
+function humanProfileStatus(profile = {}) {
+  const status = String(profile.status ?? "").toLowerCase();
+  if (profile.configured === false || status.includes("missing")) return "Missing";
+  if (status.includes("connected")) return "Connected";
+  if (status.includes("sync")) return "Stale";
+  if (profile.configured) return "Configured";
+  return "Unavailable";
+}
+
+function profileStatusTitle(profile = {}) {
+  if (humanProfileStatus(profile) === "Stale") {
+    return "Backend could not refresh this profile recently. Try Refresh Status.";
+  }
+
+  return humanProfileStatus(profile);
+}
+
+function displayExitReason(reason) {
+  if (reason === "END") return "END / open until test end";
+  return reason ?? "--";
 }
 
 function daysFromCandles(candles, interval) {
@@ -288,6 +342,31 @@ function filterCandlesByBacktestForm(rawCandles, form) {
 
   if (!Number.isFinite(from)) from = lastTime - 31 * 86400;
   return rawCandles.filter((candle) => candle.time >= from && candle.time <= to);
+}
+
+async function loadHistoricalBacktestDataset(form, fallbackCandles = []) {
+  const timeframe = form.timeframe ?? form.manualTimeframe ?? "15m";
+  const provider = form.provider ?? "binance-futures";
+  const symbol = (form.symbol ?? form.manualSymbol ?? "SOLUSDT").trim().toUpperCase();
+  const fallbackLast = fallbackCandles.at(-1)?.time;
+  const to = form.to
+    ? new Date(form.to).toISOString()
+    : fallbackLast
+      ? new Date(fallbackLast * 1000).toISOString()
+      : new Date().toISOString();
+  const toSeconds = Math.floor(new Date(to).getTime() / 1000);
+  const from = form.from
+    ? new Date(form.from).toISOString()
+    : new Date((toSeconds - Number(form.lastDays || 31) * 86400) * 1000).toISOString();
+
+  return fetchHistoricalCandles({
+    from,
+    maxCandles: 90000,
+    provider,
+    symbol,
+    timeframe,
+    to,
+  });
 }
 
 function rangeFromBacktestCandles(candles = []) {
@@ -656,13 +735,17 @@ export default function ControlCenter({
   activePanel,
   activeBacktestSession,
   backtestAnalysisActive,
+  chartDiagnostics,
+  fullHistoryDataset,
   onApplyChart,
   onAnalyzeBacktest,
   onBacktestResult,
   onClearBacktest,
   onClose,
   onExitBacktestAnalysis,
+  onViewBacktestTrade,
   rawCandles,
+  selectedHistoricalWindow,
   selectedInterval,
   setActivePanel,
   setSelectedInterval,
@@ -730,6 +813,10 @@ export default function ControlCenter({
   const loadedDays = useMemo(
     () => daysFromCandles(rawCandles, selectedInterval),
     [rawCandles, selectedInterval],
+  );
+  const fullLoadedDays = useMemo(
+    () => daysFromCandles(fullHistoryDataset ?? [], selectedInterval),
+    [fullHistoryDataset, selectedInterval],
   );
   const selectedStrategy = strategyDecks.find((deck) => deck.id === decision.strategyDeckId);
   const selectedMm = mmDecks.find((deck) => deck.id === decision.mmDeckId);
@@ -821,14 +908,55 @@ export default function ControlCenter({
     if (!executionDeckId && nextBattle[0]) setExecutionDeckId(nextBattle[0].id);
   }
 
+  async function refreshLiveStatus({ fresh = false } = {}) {
+    const suffix = fresh ? "?fresh=1" : "";
+    const [nextLivestream, nextAccounts, nextSystem] = await Promise.all([
+      apiFetch(`/livestream${suffix}`),
+      apiFetch(`/accounts/profiles${suffix}`),
+      apiFetch("/system/status"),
+    ]);
+    setLivestream(nextLivestream);
+    setAccountProfiles(nextAccounts);
+    setSystem(nextSystem);
+  }
+
   useEffect(() => {
     runAction("initial-load", "Sync platform", refreshAll);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    setBacktestResult(activeBacktestSession?.result ?? null);
+    if (activeBacktestSession?.result) {
+      setBacktestResult(activeBacktestSession.result);
+    }
   }, [activeBacktestSession?.id, activeBacktestSession?.result]);
+
+  useEffect(() => {
+    if (activePanel !== "Livestream") return undefined;
+    let ignore = false;
+
+    async function refreshQuietly() {
+      try {
+        const [nextLivestream, nextAccounts] = await Promise.all([
+          apiFetch("/livestream"),
+          apiFetch("/accounts/profiles"),
+        ]);
+        if (!ignore) {
+          setLivestream(nextLivestream);
+          setAccountProfiles(nextAccounts);
+        }
+      } catch {
+        // Keep the last successful live view visible; the panel shows its age.
+      }
+    }
+
+    refreshQuietly();
+    const timer = window.setInterval(refreshQuietly, 15000);
+    return () => {
+      ignore = true;
+      window.clearInterval(timer);
+    };
+  }, [activePanel]);
 
   async function saveCollectionItem(collection, item, shouldRefresh = true) {
     const route = collectionRoutes[collection];
@@ -876,6 +1004,10 @@ export default function ControlCenter({
     return saveCollectionItem("favorites", { ...favorite, name: name.trim() });
   }
 
+  async function hideFavorite(favorite) {
+    return saveCollectionItem("favorites", { ...favorite, hidden: true });
+  }
+
   function prepareCrisisAction(position, action) {
     setManualForm((current) => ({
       ...current,
@@ -921,10 +1053,48 @@ export default function ControlCenter({
       const result = savedBacktests.find((item) => item.id === favorite.itemId);
       if (result) {
         setBacktestResult(result);
-        onBacktestResult(result);
+        onExitBacktestAnalysis();
       }
       setActivePanel("Backtests");
     }
+  }
+
+  async function analyzeCurrentBacktest(focusTrade = null) {
+    if (!backtestResult) {
+      throw new Error("Open or run a backtest first.");
+    }
+
+    const range = backtestResult.analysisRange;
+
+    if (!range) {
+      throw new Error("This saved backtest can be opened as a report, but it does not include enough chart range data. Rerun it to analyze on chart.");
+    }
+
+    const dataset = await loadHistoricalBacktestDataset({
+      from: new Date(range.from * 1000).toISOString(),
+      lastDays: backtestForm.lastDays,
+      provider: backtestResult.provider ?? "binance-futures",
+      symbol: backtestResult.symbol ?? "SOLUSDT",
+      timeframe: backtestResult.timeframe ?? selectedInterval,
+      to: new Date(range.to * 1000).toISOString(),
+    }, rawCandles);
+    const candles = dataset.candles ?? [];
+
+    if (candles.length === 0) {
+      throw new Error("This saved backtest opened as a report, but the provider returned no candles for its old range. Rerun it or choose a newer range.");
+    }
+
+    onBacktestResult(backtestResult, {
+      candles,
+      diagnostics: dataset.diagnostics ?? null,
+      focusTime: focusTrade?.entryTime ?? focusTrade?.exitTime ?? null,
+      mmDeckName: backtestResult.mmDeckName ?? "No MM deck",
+      range,
+      settings: backtestResult.analysisSettings ?? settings,
+      strategyDeckName: backtestResult.strategyDeckName ?? "Strategy Deck",
+      timeframe: backtestResult.timeframe ?? selectedInterval,
+    });
+    return backtestResult;
   }
 
   function applyDeckToChart(deck) {
@@ -934,7 +1104,7 @@ export default function ControlCenter({
     onApplyChart(next);
   }
 
-  function runBrowserBacktest(overrides = {}) {
+  async function runBrowserBacktest(overrides = {}) {
     const form = normalizeBacktestForm({ ...backtestForm, ...(overrides.form ?? {}) });
     const rawDeck = overrides.strategyDeck ?? strategyDecks.find((item) => item.id === form.strategyDeckId) ?? strategyDecks[0];
     if (!rawDeck) throw new Error("Create or choose a Strategy Deck first.");
@@ -946,9 +1116,18 @@ export default function ControlCenter({
           ? mmDecks.find((item) => item.id === form.mmDeckId)
           : null;
     const mmDeck = rawMmDeck ? normalizeMmDeck(rawMmDeck) : null;
-    const candles = overrides.candles ?? filterCandlesByBacktestForm(rawCandles, form);
+    const timeframe = overrides.timeframe ?? form.timeframe ?? deck.timeframe ?? selectedInterval;
+    const dataset = overrides.candles
+      ? { candles: overrides.candles, diagnostics: overrides.diagnostics ?? null }
+      : await loadHistoricalBacktestDataset({
+          ...form,
+          provider: form.provider ?? "binance-futures",
+          symbol: deck.symbol ?? "SOLUSDT",
+          timeframe,
+        }, rawCandles);
+    const candles = dataset.candles ?? [];
     if (candles.length < 550) {
-      throw new Error("Not enough candles are loaded for this backtest. Request more history days or use a larger timeframe.");
+      throw new Error(`Not enough ${timeframe} candles came back for this backtest. Provider returned ${candles.length}; widen the range or use a larger timeframe.`);
     }
     const result = runBacktest({
       backtestConfig: {
@@ -972,19 +1151,24 @@ export default function ControlCenter({
       mmDeckId: mmDeck?.id ?? "",
       mmDeckName: mmDeck?.name ?? "No MM deck",
       name: overrides.name ?? (form.name || `${deck.name} ${new Date().toLocaleDateString()}`),
+      candlesUsed: candles.length,
+      chartCandlesRendered: rawCandles.length,
+      dataDiagnostics: dataset.diagnostics ?? null,
+      provider: dataset.diagnostics?.provider ?? form.provider ?? "binance-futures",
       sweepParams: overrides.sweepParams ?? null,
       strategyDeckId: deck.id,
       strategyDeckName: deck.name,
-      timeframe: overrides.timeframe ?? selectedInterval,
+      timeframe,
     });
     setBacktestResult(named);
     onBacktestResult(named, {
       candles,
+      diagnostics: dataset.diagnostics ?? null,
       mmDeckName: mmDeck?.name ?? "No MM deck",
       range: analysisRange,
       settings: analysisSettings,
       strategyDeckName: deck.name,
-      timeframe: overrides.timeframe ?? selectedInterval,
+      timeframe,
     });
     return named;
   }
@@ -995,11 +1179,7 @@ export default function ControlCenter({
 
     if (manualMode) {
       if (form.manualSymbol.trim().toUpperCase() !== "SOLUSDT") {
-        throw new Error("Manual Sweep currently uses loaded SOLUSDT candles. Use SOLUSDT or load another symbol first.");
-      }
-
-      if (form.manualTimeframe !== selectedInterval) {
-        throw new Error(`Manual Sweep uses currently loaded ${selectedInterval} candles. Change the chart timeframe to ${form.manualTimeframe} first, or choose ${selectedInterval}.`);
+        throw new Error("Manual Sweep currently supports SOLUSDT historical candles.");
       }
 
       const failures = parseSweepNumberList(form.manualMaxSameSideFailures, "Max same-side failures", { integer: true, min: 0 });
@@ -1150,10 +1330,19 @@ export default function ControlCenter({
 
   async function runSweepBacktest() {
     const manualSweepForm = { ...sweepForm, mode: "manual" };
-    const form = normalizeBacktestForm(sweepRangeForm(backtestForm, manualSweepForm));
-    const candles = filterCandlesByBacktestForm(rawCandles, form);
+    const form = normalizeBacktestForm({
+      ...sweepRangeForm(backtestForm, manualSweepForm),
+      provider: "binance-futures",
+      timeframe: manualSweepForm.manualTimeframe,
+    });
+    const dataset = await loadHistoricalBacktestDataset({
+      ...form,
+      symbol: manualSweepForm.manualSymbol,
+      timeframe: manualSweepForm.manualTimeframe,
+    }, rawCandles);
+    const candles = dataset.candles ?? [];
     if (candles.length < 550) {
-      throw new Error("Not enough candles are loaded for this sweep. Request more history days or use a larger timeframe.");
+      throw new Error(`Not enough ${manualSweepForm.manualTimeframe} candles came back for this sweep. Provider returned ${candles.length}; widen the range or use a larger timeframe.`);
     }
 
     const combinations = buildSweepCombinations({ baseDeck: null, baseMmDeck: null, form: manualSweepForm });
@@ -1201,6 +1390,9 @@ export default function ControlCenter({
         analysisRange,
         averageTrade: metrics.averageTrade,
         bestTrade: metrics.largestWin,
+        candlesUsed: candles.length,
+        chartCandlesRendered: rawCandles.length,
+        dataDiagnostics: dataset.diagnostics ?? null,
         id: `sweep-${Date.now()}-${index}`,
         longResult: sidePnl(result.trades, "LONG"),
         maxDrawdown: metrics.maxDrawdown,
@@ -1336,11 +1528,14 @@ export default function ControlCenter({
         <SystemPanel
           accountProfiles={accountProfiles}
           backendUrl={BACKEND_URL}
+          chartDiagnostics={chartDiagnostics}
+          fullHistoryDataset={fullHistoryDataset}
           rawCandles={rawCandles}
           runAction={runAction}
+          selectedHistoricalWindow={selectedHistoricalWindow}
           selectedInterval={selectedInterval}
           system={system}
-          onRefresh={refreshAll}
+          onRefresh={() => refreshAll()}
         />
       )}
 
@@ -1348,15 +1543,19 @@ export default function ControlCenter({
         <LivestreamPanel
           accountProfiles={accountProfiles}
           livestream={livestream}
-          onRefresh={() => runAction("refresh-live", "Refresh live stream", refreshAll)}
+          onRefresh={() => runAction("refresh-live", "Refresh live stream", () => refreshLiveStatus({ fresh: true }))}
           onPositionAction={prepareCrisisAction}
         />
       )}
 
       {panel === "Indicator" && (
         <IndicatorPanel
+          chartDiagnostics={chartDiagnostics}
+          fullHistoryDataset={fullHistoryDataset}
+          fullLoadedDays={fullLoadedDays}
           loadedDays={loadedDays}
           rawCandles={rawCandles}
+          selectedHistoricalWindow={selectedHistoricalWindow}
           selectedInterval={selectedInterval}
           settings={settings}
           updateSetting={updateSetting}
@@ -1382,6 +1581,7 @@ export default function ControlCenter({
         <BacktestsPanel
           analysisActive={backtestAnalysisActive}
           analysisSession={activeBacktestSession}
+          chartDiagnostics={chartDiagnostics}
           favorites={favorites}
           form={backtestForm}
           mmDecks={mmDecks}
@@ -1398,15 +1598,15 @@ export default function ControlCenter({
           onDelete={(item) => runAction(`delete-backtest-${item.id}`, "Delete backtest", () => deleteCollectionItem("backtests", item))}
           onFavorite={(item) => runAction(`fav-backtest-${item.id}`, "Add favorite", () => addFavorite("Backtests", item))}
           onHide={(item) => runAction(`hide-backtest-${item.id}`, "Hide backtest", () => saveCollectionItem("backtests", { ...item, hidden: true }))}
-          onAnalyze={() => runAction("analyze-backtest", "Analyze on Chart", onAnalyzeBacktest)}
+          onAnalyze={() => runAction("analyze-backtest", "Analyze on Chart", () => analyzeCurrentBacktest())}
           onClear={() => runAction("clear-backtest", "Clear result", async () => {
             setBacktestResult(null);
             onClearBacktest();
           })}
           onExitAnalysis={() => runAction("exit-backtest-analysis", "Exit analysis", async () => {
-            setBacktestResult(null);
             onExitBacktestAnalysis();
           })}
+          onViewTrade={(trade) => runAction("view-backtest-trade", "View trade on chart", () => analyzeCurrentBacktest(trade))}
           onOpenSweepResult={(row) => runAction(`open-sweep-${row.id}`, "Open sweep result", async () => openSweepResult(row))}
           onRun={() => runAction("run-backtest", "Run backtest", async () => runBrowserBacktest())}
           onRunSweep={() => runAction("run-sweep", "Run sweep", async () => runSweepBacktest())}
@@ -1555,6 +1755,7 @@ export default function ControlCenter({
         <FavoritesPanel
           favorites={favorites}
           onDelete={(favorite) => runAction(`delete-fav-${favorite.id}`, "Remove favorite", () => deleteCollectionItem("favorites", favorite))}
+          onHide={(favorite) => runAction(`hide-fav-${favorite.id}`, "Hide favorite", () => hideFavorite(favorite))}
           onOpen={openFavorite}
           onRename={(favorite) => runAction(`rename-fav-${favorite.id}`, "Rename favorite", () => renameFavorite(favorite))}
         />
@@ -1602,7 +1803,34 @@ function estimateDecision({ balance, mmDeck, strategyDeck }) {
   };
 }
 
-function SystemPanel({ accountProfiles, backendUrl, rawCandles, runAction, selectedInterval, system, onRefresh }) {
+function executionReadinessIssues({ balance, profile, selectedBattleDeck, status }) {
+  const issues = [];
+  const bingx = status?.state?.bingx ?? {};
+
+  if (!status) issues.push("Backend status is still syncing.");
+  if (!selectedBattleDeck) issues.push("Choose a Battle Deck.");
+  if (!bingx.apiConfigured) issues.push("BingX API keys are missing on the backend.");
+  if (!profile) issues.push("Selected API profile is not reported by the backend.");
+  if (profile && ["Missing", "Stale"].includes(humanProfileStatus(profile))) {
+    issues.push(`API profile is ${humanProfileStatus(profile).toLowerCase()}.`);
+  }
+  if (!Number.isFinite(Number(balance)) || Number(balance) <= 0) issues.push("Futures balance is not available yet.");
+
+  return issues;
+}
+
+function SystemPanel({
+  accountProfiles,
+  backendUrl,
+  chartDiagnostics,
+  fullHistoryDataset,
+  rawCandles,
+  runAction,
+  selectedHistoricalWindow,
+  selectedInterval,
+  system,
+  onRefresh,
+}) {
   const status = system?.state ?? {};
   const bingx = status.bingx ?? {};
   const hasSystemBalance = bingx.activeExecutionBalance !== null &&
@@ -1620,7 +1848,10 @@ function SystemPanel({ accountProfiles, backendUrl, rawCandles, runAction, selec
     `BingX keys: ${bingx.apiConfigured ? "configured" : "not configured"}`,
     `Futures balance: ${fmt(futuresBalance)} USDT`,
     `Chart interval: ${selectedInterval}`,
-    `Loaded candles: ${rawCandles.length}`,
+    `Chart candles rendered: ${rawCandles.length}`,
+    `Full candles loaded: ${fullHistoryDataset?.length ?? chartDiagnostics?.fullCandles ?? 0}`,
+    `Provider: ${chartDiagnostics?.provider ?? "binance-futures"}`,
+    `Chart window: ${selectedHistoricalWindow?.mode ?? "latest"}`,
     `Last candle: ${dateText(rawCandles.at(-1)?.time)}`,
   ].join("\n");
 
@@ -1655,54 +1886,67 @@ function SystemPanel({ accountProfiles, backendUrl, rawCandles, runAction, selec
         <Metric label="Bot" value={displayBotStatus(status.botStatus)} />
         <Metric label="BingX" value={system ? (bingx.apiConfigured ? "Keys ready" : "No keys") : "Checking"} />
         <Metric label="Futures USDT" value={hasKnownProfileBalance(accountProfiles) || hasSystemBalance ? fmt(futuresBalance) : "Syncing"} />
-        <Metric label="BingX sync" value={dateText(bingx.lastSyncAt)} />
-        <Metric label="Backend uptime" value={system?.summary?.uptimeSeconds ? `${Math.floor(system.summary.uptimeSeconds / 60)} min` : "--"} />
+        <Metric label="BingX sync" value={compactDateText(bingx.lastSyncAt)} />
+        <Metric label="Backend uptime" value={system?.summary?.uptimeSeconds ? `${Math.floor(system.summary.uptimeSeconds / 60)} min` : "Unavailable"} />
         <Metric label="Open orders" value={system?.summary?.openOrdersCount ?? 0} />
         <Metric label="Active Battle Deck" value={system?.summary?.activeBattleDeck?.name ?? "None"} />
+        <Metric label="Chart candles" value={`${rawCandles.length} / ${fullHistoryDataset?.length ?? chartDiagnostics?.fullCandles ?? 0}`} />
+        <Metric label="Data provider" value={chartDiagnostics?.provider ?? "Binance Futures"} />
+        <Metric label="Chart window" value={selectedHistoricalWindow?.mode === "historical" ? "Historical" : "Latest"} />
       </div>
 
       <div className="hubert-lab__subhead"><strong>API Profiles</strong><span>{accountProfiles.length}</span></div>
-      <div className="hubert-lab__table">
-        <table>
-          <thead>
-            <tr><th>Profile</th><th>Status</th><th>Futures USDT</th><th>Positions</th><th>Orders</th><th>Last sync</th></tr>
-          </thead>
-          <tbody>
-            {accountProfiles.map((profile) => (
-              <tr key={profile.id}>
-                <td>{profile.label}</td>
-                <td>{profile.status}</td>
-                <td>{profileBalanceText(profile)}</td>
-                <td>{profile.openPositions}</td>
-                <td>{profile.openOrders}</td>
-                <td>{dateText(profile.lastSyncAt)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      {accountProfiles.length === 0 ? (
+        <MiniStatus>No API profiles are reported by the backend yet.</MiniStatus>
+      ) : (
+        <div className="hubert-lab__table">
+          <table>
+            <thead>
+              <tr><th>Profile</th><th>Status</th><th>Futures USDT</th><th>Positions</th><th>Orders</th><th>Last sync</th></tr>
+            </thead>
+            <tbody>
+              {accountProfiles.map((profile) => (
+                <tr key={profile.id}>
+                  <td>{profile.label}</td>
+                  <td title={profileStatusTitle(profile)}>{humanProfileStatus(profile)}</td>
+                  <td>{profileBalanceText(profile)}</td>
+                  <td>{profile.openPositions ?? 0}</td>
+                  <td>{profile.openOrders ?? 0}</td>
+                  <td>{compactDateText(profile.lastSyncAt)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
-      <div className="hubert-lab__table">
-        <table>
-          <thead>
-            <tr><th>Timeframe</th><th>Candles</th><th>Days</th><th>First</th><th>Last</th></tr>
-          </thead>
-          <tbody>
-            {(system?.dataAvailability ?? []).map((row) => (
-              <tr key={row.interval}>
-                <td>{row.label}</td>
-                <td>{row.candles}</td>
-                <td>{fmt(row.availableDays, 0)}</td>
-                <td>{dateText(row.firstCandleTime)}</td>
-                <td>{dateText(row.lastCandleTime)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <MiniStatus>
-        Data availability uses the configured safe candle limits. If a timeframe reaches its limit, more history can be added by raising max candles or connecting an external data source.
-      </MiniStatus>
+      {(system?.dataAvailability ?? []).length > 0 ? (
+        <>
+          <div className="hubert-lab__table">
+            <table>
+              <thead>
+                <tr><th>Timeframe</th><th>Candles</th><th>Days</th><th>First</th><th>Last</th></tr>
+              </thead>
+              <tbody>
+                {(system?.dataAvailability ?? []).map((row) => (
+                  <tr key={row.interval}>
+                    <td>{row.label}</td>
+                    <td>{row.candles}</td>
+                    <td>{fmt(row.availableDays, 0)}</td>
+                    <td>{compactDateText(row.firstCandleTime)}</td>
+                    <td>{compactDateText(row.lastCandleTime)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <MiniStatus>
+            {(system?.dataAvailability ?? []).find((row) => row.note)?.note ?? "Exchange API availability is measured from paginated Binance candle requests."}
+          </MiniStatus>
+        </>
+      ) : (
+        <MiniStatus>Historical availability is syncing.</MiniStatus>
+      )}
     </section>
   );
 }
@@ -1718,6 +1962,9 @@ function LivestreamPanel({ accountProfiles = [], livestream, onPositionAction, o
   const hasSummaryBalance = summary.totalCombinedFuturesBalance !== null &&
     summary.totalCombinedFuturesBalance !== undefined &&
     Number.isFinite(Number(summary.totalCombinedFuturesBalance));
+  const lastSyncAt = summary.lastBingxSyncAt ?? summary.lastRefreshAt;
+  const stale = secondsSince(lastSyncAt) !== null && secondsSince(lastSyncAt) > 120;
+  const source = summary.source ?? (stale ? "backend cache" : "fresh BingX sync");
 
   return (
     <section className="hubert-lab__section">
@@ -1732,7 +1979,14 @@ function LivestreamPanel({ accountProfiles = [], livestream, onPositionAction, o
         <Metric label="Open notional" value={fmt(summary.totalOpenNotional ?? 0)} />
         <Metric label="Open positions" value={summary.totalOpenPositions ?? 0} />
       </div>
-      <MiniStatus>Last refresh: {dateText(summary.lastRefreshAt)}</MiniStatus>
+      <MiniStatus tone={dataFreshnessTone(lastSyncAt)}>
+        Source: {source}. Last successful sync: {ageText(lastSyncAt)}. Last panel refresh: {compactDateText(summary.lastRefreshAt)}.
+      </MiniStatus>
+      {stale && (
+        <MiniStatus tone="bad">
+          Data may be stale. Last successful sync: {ageText(lastSyncAt)}.
+        </MiniStatus>
+      )}
       {profileRows.length > 0 && (
         <div className="hubert-lab__table">
           <table>
@@ -1743,7 +1997,7 @@ function LivestreamPanel({ accountProfiles = [], livestream, onPositionAction, o
               {profileRows.map((profile) => (
                 <tr key={profile.id}>
                   <td>{profile.label}</td>
-                  <td>{profile.status}</td>
+                  <td title={profileStatusTitle(profile)}>{humanProfileStatus(profile)}</td>
                   <td>{profileBalanceText(profile)}</td>
                   <td>{profile.openPositions ?? 0}</td>
                   <td>{profile.openOrders ?? 0}</td>
@@ -1761,7 +2015,7 @@ function LivestreamPanel({ accountProfiles = [], livestream, onPositionAction, o
             <div className="hubert-live-card" key={`${position.symbol}-${position.side}-${position.apiProfile}`}>
               <div className="hubert-live-card__head">
                 <strong>{position.symbol} {position.side}</strong>
-                <span>{position.battleDeckName ?? "Manual"} · {position.timeframe ?? "--"} · {position.apiProfile}</span>
+                <span>{position.battleDeckName ?? "Manual"} · {position.timeframe ?? "--"} · {position.apiProfileLabel ?? position.apiProfile}</span>
               </div>
               <div className="hubert-lab__metrics">
                 <Metric label="Strategy" value={position.strategyDeckName ?? "--"} />
@@ -1797,18 +2051,28 @@ function LivestreamPanel({ accountProfiles = [], livestream, onPositionAction, o
   );
 }
 
-function IndicatorPanel({ loadedDays, rawCandles, selectedInterval, settings, updateSetting }) {
-  const requestedDays = Number(settings.historyDays ?? loadedDays);
-  const usedDays = Math.min(requestedDays, loadedDays);
-
+function IndicatorPanel({
+  chartDiagnostics,
+  fullHistoryDataset,
+  fullLoadedDays,
+  loadedDays,
+  rawCandles,
+  selectedHistoricalWindow,
+  selectedInterval,
+  settings,
+  updateSetting,
+}) {
   return (
     <section className="hubert-lab__section">
       <MiniStatus>
-        Requested {fmt(requestedDays, 0)} days, available about {fmt(loadedDays, 0)} days. Using {fmt(usedDays, 0)} days.
+        Chart is rendering {rawCandles.length} candles, about {fmt(loadedDays, 0)} days. Full loaded context has {fullHistoryDataset?.length ?? 0} candles, about {fmt(fullLoadedDays, 0)} days.
+        Backtests fetch their own historical range from {chartDiagnostics?.provider ?? "binance-futures"}.
       </MiniStatus>
       <div className="hubert-lab__grid">
         <NumberField commitEmpty={false} label="History days" value={settings.historyDays ?? 31} min="1" max="1000" onChange={(value) => updateSetting("historyDays", value)} help="Choose time in days. The platform converts it into candles for this timeframe." />
-        <ReadOnly label="Loaded candles" value={`${rawCandles.length} on ${selectedInterval}`} />
+        <ReadOnly label="Chart window" value={`${selectedHistoricalWindow?.mode === "historical" ? "Historical" : "Latest"} · ${rawCandles.length} on ${selectedInterval}`} />
+        <ReadOnly label="Full loaded candles" value={`${fullHistoryDataset?.length ?? 0} on ${selectedInterval}`} />
+        <ReadOnly label="Provider" value={chartDiagnostics?.provider ?? "Binance Futures"} />
         <NumberField commitEmpty={false} label="Bandwidth" value={settings.bandwidth} step="0.5" onChange={(value) => updateSetting("bandwidth", value)} />
         <NumberField commitEmpty={false} label="NWE multiplier" value={settings.envelopeMultiplier} step="0.1" onChange={(value) => updateSetting("envelopeMultiplier", value)} />
         <NumberField commitEmpty={false} label="ATR length" value={settings.atrLength} step="1" onChange={(value) => updateSetting("atrLength", value)} />
@@ -1914,6 +2178,7 @@ function BacktestsPanel({
   onRun,
   onRunSweep,
   onSave,
+  onViewTrade,
   result,
   savedBacktests,
   setForm,
@@ -1946,11 +2211,21 @@ function BacktestsPanel({
             <TextField label="Backtest name" value={form.name} onChange={(value) => setForm({ ...form, name: value })} />
             <SelectField label="Strategy Deck" value={form.strategyDeckId || strategyDecks[0]?.id || ""} onChange={(value) => setForm({ ...form, strategyDeckId: value })} options={strategyDecks.map((deck) => [deck.id, deck.name])} />
             <SelectField label="MM Deck" value={form.mmDeckId} onChange={(value) => setForm({ ...form, mmDeckId: value })} options={mmDecks.map((deck) => [deck.id, deck.name])} />
+            <SelectField label="Timeframe" value={form.timeframe ?? "15m"} onChange={(value) => setForm({ ...form, timeframe: value })} options={TIMEFRAMES.map((item) => [item.interval, item.label])} />
+            <SelectField label="Provider" value={form.provider ?? "binance-futures"} onChange={(value) => setForm({ ...form, provider: value })} options={[
+              ["binance-futures", "Binance Futures"],
+              ["binance-spot", "Binance Spot"],
+            ]} />
             <NumberField label="Last X days" value={form.lastDays} min="1" onChange={(value) => setForm({ ...form, lastDays: value })} />
+            <TextField label="From date/time" value={form.from} onChange={(value) => setForm({ ...form, from: value })} />
+            <TextField label="To date/time" value={form.to ?? ""} onChange={(value) => setForm({ ...form, to: value })} />
             <NumberField label="Starting balance" value={form.startingBalance} onChange={(value) => setForm({ ...form, startingBalance: value })} />
             <NumberField label="Commission %" value={form.commissionPercent} step="0.01" onChange={(value) => setForm({ ...form, commissionPercent: value })} />
             <NumberField label="Slippage %" value={form.slippagePercent} step="0.01" onChange={(value) => setForm({ ...form, slippagePercent: value })} />
           </div>
+          <MiniStatus>
+            Historical Range Backtest uses {form.provider === "binance-spot" ? "Binance Spot" : "Binance Futures"} public candles for the selected range. It does not depend on the candles currently rendered on the chart.
+          </MiniStatus>
           <div className="hubert-lab__actions">
             <button type="button" onClick={onRun}>Run Backtest</button>
             <button type="button" onClick={onSave}>Name & Save</button>
@@ -1978,7 +2253,7 @@ function BacktestsPanel({
               </div>
             </div>
           )}
-          <BacktestResult result={result} />
+          <BacktestResult result={result} onViewTrade={onViewTrade} />
         </>
       ) : (
         <BacktestSweepPanel
@@ -2028,8 +2303,8 @@ function BacktestSweepPanel({
       <MiniStatus>
         Manual Sweep runs many explicit parameter sets without drawing chart overlays. Score = net profit % - max drawdown + trade-count bonus + profit-factor bonus.
       </MiniStatus>
-      <MiniStatus>Manual Sweep ignores saved Strategy/MM Deck values. It uses the currently loaded chart candles and the explicit fields below.</MiniStatus>
-      <div className="hubert-lab__subhead"><strong>Market</strong><span>loaded data</span></div>
+      <MiniStatus>Manual Sweep ignores saved Strategy/MM Deck values. It fetches its own Binance Futures historical range and never draws chart overlays during the sweep.</MiniStatus>
+      <div className="hubert-lab__subhead"><strong>Historical Range Sweep</strong><span>independent data</span></div>
       <div className="hubert-lab__grid">
         <TextField label="Symbol" value={form.manualSymbol} onChange={(value) => setForm({ ...form, manualSymbol: value })} />
         <SelectField label="Timeframe" value={form.manualTimeframe} onChange={(value) => setForm({ ...form, manualTimeframe: value })} options={TIMEFRAMES.map((item) => [item.interval, item.label])} />
@@ -2131,47 +2406,54 @@ function SweepResultTable({ onOpenResult, results }) {
   if (!results?.length) {
     return <MiniStatus>No sweep results yet. Run a sweep to rank parameter sets.</MiniStatus>;
   }
+  const firstResult = results[0];
 
   return (
-    <div className="hubert-lab__table hubert-lab__table--sweep">
-      <table>
-        <thead>
-          <tr>
-            <th>Rank</th>
-            <th>Score</th>
-            <th>Net profit</th>
-            <th>Max DD</th>
-            <th>PF</th>
-            <th>Win rate</th>
-            <th>Trades</th>
-            <th>Max failures</th>
-            <th>ATR mult</th>
-            <th>NWE</th>
-            <th>BW</th>
-            <th>Sizing</th>
-            <th>Open</th>
-          </tr>
-        </thead>
-        <tbody>
-          {results.slice(0, 30).map((row) => (
-            <tr key={row.id}>
-              <td>{row.rank}</td>
-              <td>{fmt(row.score)}</td>
-              <td>{fmt(row.netProfit)}</td>
-              <td>{fmt(row.maxDrawdown)}%</td>
-              <td>{fmt(row.profitFactor)}</td>
-              <td>{fmt(row.winRate)}%</td>
-              <td>{row.totalTrades}</td>
-              <td>{row.params?.maxSameSideFailures ?? "--"}</td>
-              <td>{fmt(row.params?.atrMultiplier, 2)}</td>
-              <td>{fmt(row.params?.envelopeMultiplier, 2)}</td>
-              <td>{fmt(row.params?.bandwidth, 2)}</td>
-              <td className="hubert-sweep-params" title={sweepParamDetails(row)}>{sweepSizingShortText(row)}</td>
-              <td><button className="hubert-sweep-open" type="button" onClick={() => onOpenResult(row)}>Open</button></td>
+    <div className="hubert-lab__section">
+      <MiniStatus>
+        Sweep used {firstResult.candlesUsed ?? "--"} candles on {firstResult.params?.timeframe ?? "--"} from {firstResult.dataDiagnostics?.provider ?? "binance-futures"}.
+        {firstResult.analysisRange ? ` Range: ${dateText(firstResult.analysisRange.from)} to ${dateText(firstResult.analysisRange.to)}.` : ""}
+      </MiniStatus>
+      <div className="hubert-lab__table hubert-lab__table--sweep">
+        <table>
+          <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Score</th>
+              <th>Net profit</th>
+              <th>Max DD</th>
+              <th>PF</th>
+              <th>Win rate</th>
+              <th>Trades</th>
+              <th>Max failures</th>
+              <th>ATR mult</th>
+              <th>NWE</th>
+              <th>BW</th>
+              <th>Sizing</th>
+              <th>Open</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {results.slice(0, 30).map((row) => (
+              <tr key={row.id}>
+                <td>{row.rank}</td>
+                <td>{fmt(row.score)}</td>
+                <td>{fmt(row.netProfit)}</td>
+                <td>{fmt(row.maxDrawdown)}%</td>
+                <td>{fmt(row.profitFactor)}</td>
+                <td>{fmt(row.winRate)}%</td>
+                <td>{row.totalTrades}</td>
+                <td>{row.params?.maxSameSideFailures ?? "--"}</td>
+                <td>{fmt(row.params?.atrMultiplier, 2)}</td>
+                <td>{fmt(row.params?.envelopeMultiplier, 2)}</td>
+                <td>{fmt(row.params?.bandwidth, 2)}</td>
+                <td className="hubert-sweep-params" title={sweepParamDetails(row)}>{sweepSizingShortText(row)}</td>
+                <td><button className="hubert-sweep-open" type="button" onClick={() => onOpenResult(row)}>Open</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
       {results.length > 30 && (
         <MiniStatus>Showing top 30 of {results.length} combinations. Narrow the range if you want a smaller comparison.</MiniStatus>
       )}
@@ -2388,7 +2670,13 @@ function ExecutionPanel({ accountProfiles, battleDecks, executionDeckId, onActio
     accountProfiles.find((profile) => profile.id === (selectedBattleDeck?.apiProfile ?? "main")) ??
     accountProfiles[0];
   const executionBalance = Number(selectedProfile?.futuresBalance ?? bingx.activeExecutionBalance ?? 0);
-  const ready = Boolean(selectedBattleDeck && bingx.apiConfigured && executionBalance > 0 && status);
+  const readinessIssues = executionReadinessIssues({
+    balance: executionBalance,
+    profile: selectedProfile,
+    selectedBattleDeck,
+    status,
+  });
+  const ready = readinessIssues.length === 0;
   const exchangePosition = status?.summary?.openPosition ?? bingx.openPositions?.[0] ?? null;
   const openOrders = bingx.openOrders ?? [];
   const currentPrice = rawCandles.at(-1)?.close;
@@ -2400,12 +2688,13 @@ function ExecutionPanel({ accountProfiles, battleDecks, executionDeckId, onActio
         <ReadOnly label="Readiness" value={ready ? "Ready" : "Needs attention"} />
       </div>
       <MiniStatus tone={ready ? "good" : "bad"}>
-        {ready ? `Ready to run ${selectedBattleDeck.name} on BingX.` : "Choose a Battle Deck, confirm BingX balance, and keep backend online before starting."}
+        {ready ? `Ready to run ${selectedBattleDeck.name} on ${selectedProfile?.label ?? "selected account"}.` : readinessIssues.join(" ")}
       </MiniStatus>
       <div className="hubert-lab__metrics">
         <Metric label="Bot status" value={displayBotStatus(state.botStatus)} />
         <Metric label="Active deck" value={selectedBattleDeck?.name ?? "--"} />
-        <Metric label="API profile" value={selectedBattleDeck?.apiProfile ?? "--"} />
+        <Metric label="API profile" value={selectedProfile?.label ?? selectedBattleDeck?.apiProfile ?? "--"} />
+        <Metric label="Profile health" value={selectedProfile ? humanProfileStatus(selectedProfile) : "Unavailable"} />
         <Metric label="Current price" value={fmt(currentPrice)} />
         <Metric label="Futures balance" value={fmt(executionBalance)} />
         <Metric label="Position" value={exchangePosition ? `${exchangePosition.symbol ?? selectedBattleDeck?.symbol} ${exchangePosition.positionSide ?? exchangePosition.side ?? ""}` : "None"} />
@@ -2452,6 +2741,7 @@ function CrisisPanel({
     ["CLOSE_PARTIAL", "Close Partial", "Sends a reduce-only market order for the quantity below."],
     ["CANCEL_ALL", "Cancel All Orders", "Cancels open orders for this symbol."],
   ];
+  const positionOnlyActions = new Set(["MOVE_SL", "MOVE_TP", "CLOSE_POSITION", "CLOSE_PARTIAL", "CANCEL_ALL"]);
 
   function chooseAction(action) {
     setMessage("");
@@ -2491,7 +2781,7 @@ function CrisisPanel({
           <OrderTable orders={activePosition.attachedOrders ?? []} />
         </div>
       ) : (
-        <MiniStatus>No live position is currently reported. Manual open actions still require a symbol and quantity.</MiniStatus>
+        <MiniStatus>No live position context is currently reported. Position actions stay disabled until the backend sees an open position. Market open actions still require symbol and quantity.</MiniStatus>
       )}
       <div className="hubert-lab__actions">
         <button type="button" onClick={onCrisisOn}>Crisis Management ON</button>
@@ -2507,6 +2797,7 @@ function CrisisPanel({
         {actions.map(([action, label, help]) => (
           <button
             data-active={pendingAction === action}
+            disabled={!activePosition && positionOnlyActions.has(action)}
             key={action}
             title={help}
             type="button"
@@ -2518,7 +2809,10 @@ function CrisisPanel({
       </div>
       {pendingAction && (
         <div className="hubert-confirm-strip">
-          <span>{actions.find(([action]) => action === pendingAction)?.[2]}</span>
+          <span>
+            {actions.find(([action]) => action === pendingAction)?.[2]}
+            {activePosition ? ` Context: ${activePosition.symbol} ${activePosition.side}, SL ${fmt(activePosition.stopLoss)}, TP ${fmt(activePosition.takeProfit)}.` : " No open position context is attached."}
+          </span>
           <button type="button" onClick={confirmAction}>Confirm Send</button>
           <button type="button" onClick={() => setPendingAction(null)}>Cancel</button>
         </div>
@@ -2549,9 +2843,13 @@ function AnalyticsPanel({ analytics }) {
 
 function CommunicationPanel({ communication, onSave, onTest, setCommunication }) {
   const alertTypes = communication.alertTypes ?? {};
+  const ready = Boolean(communication.telegramBotTokenConfigured && communication.telegramChatId);
 
   return (
     <section className="hubert-lab__section">
+      <MiniStatus tone={ready ? "good" : "neutral"}>
+        {ready ? "Telegram is ready for backend alerts." : "Telegram alerts need a backend token and chat id before phone notifications can be sent."}
+      </MiniStatus>
       <div className="hubert-lab__grid">
         <label>
           <span>Telegram alerts</span>
@@ -2641,20 +2939,23 @@ function AiPanel({ aiContext, aiStatus, messages, onAsk, question, setAiContext,
   );
 }
 
-function FavoritesPanel({ favorites, onDelete, onOpen, onRename }) {
+function FavoritesPanel({ favorites, onDelete, onHide, onOpen, onRename }) {
   const groups = ["Strategy Decks", "MM Decks", "Battle Decks", "Backtests", "Analytics Reports"];
+  const visibleFavorites = favorites.filter((item) => !item.hidden);
 
   return (
     <section className="hubert-lab__section">
       {groups.map((group) => (
         <div className="hubert-lab__section" key={group}>
-          <div className="hubert-lab__subhead"><strong>{group}</strong><span>{favorites.filter((item) => item.category === group).length}</span></div>
+          <div className="hubert-lab__subhead"><strong>{group}</strong><span>{visibleFavorites.filter((item) => item.category === group).length}</span></div>
           <DeckList
-            decks={favorites.filter((item) => item.category === group)}
+            deleteLabel="Remove"
+            decks={visibleFavorites.filter((item) => item.category === group)}
             extra={(favorite) => (
               <>
                 <button type="button" onClick={() => onOpen(favorite)}>Open</button>
                 <button type="button" onClick={() => onRename(favorite)}>Rename</button>
+                <button type="button" onClick={() => onHide(favorite)}>Hide</button>
               </>
             )}
             onDelete={onDelete}
@@ -2700,7 +3001,7 @@ function CompactOpenRow({ items, label, onOpen }) {
   );
 }
 
-function DeckList({ decks, extra, onDelete, onDuplicate, onEdit, onFavorite }) {
+function DeckList({ decks, deleteLabel = "Delete", extra, onDelete, onDuplicate, onEdit, onFavorite }) {
   if (!decks?.length) {
     return <MiniStatus>No saved items here yet.</MiniStatus>;
   }
@@ -2718,7 +3019,7 @@ function DeckList({ decks, extra, onDelete, onDuplicate, onEdit, onFavorite }) {
             {onDuplicate && <button type="button" onClick={() => onDuplicate(deck)}>Duplicate</button>}
             {onFavorite && <button type="button" onClick={() => onFavorite(deck)}>Favorite</button>}
             {extra?.(deck)}
-            {onDelete && <button type="button" onClick={() => onDelete(deck)}>Delete</button>}
+            {onDelete && <button type="button" onClick={() => onDelete(deck)}>{deleteLabel}</button>}
           </div>
         </div>
       ))}
@@ -2726,10 +3027,11 @@ function DeckList({ decks, extra, onDelete, onDuplicate, onEdit, onFavorite }) {
   );
 }
 
-function BacktestResult({ result }) {
+function BacktestResult({ onViewTrade, result }) {
   const audit = useMemo(() => sizingAudit(result?.trades ?? []), [result?.trades]);
   const equityPoints = useMemo(() => equityPolyline(result?.equityCurve), [result?.equityCurve]);
   const drawdownPoints = useMemo(() => drawdownPolyline(result?.equityCurve), [result?.equityCurve]);
+  const hasEndTrade = Boolean(result?.trades?.some((trade) => trade.exitReason === "END" || trade.reason === "END"));
 
   if (!result) return <MiniStatus>Run a backtest to see equity, trades, and analysis.</MiniStatus>;
   const metrics = result.metrics;
@@ -2747,9 +3049,28 @@ function BacktestResult({ result }) {
         <Metric label="Best trade" value={fmt(metrics.largestWin)} />
         <Metric label="Worst trade" value={fmt(metrics.largestLoss)} />
       </div>
+      <MiniStatus>
+        {result.strategyDeckName ?? "Strategy"} · {result.timeframe ?? "selected timeframe"} · provider {result.provider ?? result.dataDiagnostics?.provider ?? "binance-futures"} ·
+        test candles {result.candlesUsed ?? result.sourceCandles?.length ?? "--"} · chart rendered {result.chartCandlesRendered ?? "--"}
+        {result.analysisRange ? ` · ${dateText(result.analysisRange.from)} → ${dateText(result.analysisRange.to)}.` : "."}
+      </MiniStatus>
+      <MiniStatus>
+        Evaluated setups: {result.diagnosticSummary?.totalEvaluatedCandles ?? "--"} candles.
+        {result.dataDiagnostics?.providerLimitMessage ? ` ${result.dataDiagnostics.providerLimitMessage}` : ""}
+      </MiniStatus>
+      {metrics.totalTrades === 0 && (
+        <MiniStatus tone="neutral">
+          No trades opened in this range. Evaluated candles: {result.diagnosticSummary?.totalEvaluatedCandles ?? "unknown"};
+          valid LONG setups: {result.diagnosticSummary?.validLongSetups ?? 0};
+          valid SHORT setups: {result.diagnosticSummary?.validShortSetups ?? 0}.
+        </MiniStatus>
+      )}
       <SingleCurveChart title="Equity Curve" caption="Higher line means higher account equity. Preview capped for speed." points={equityPoints} />
       <SingleCurveChart title="Drawdown Curve" caption="Higher red line means deeper drawdown from the last equity peak. Preview capped for speed." points={drawdownPoints} drawdown />
       <MiniStatus>{analyzeBacktest(result)}</MiniStatus>
+      {hasEndTrade && (
+        <MiniStatus>END means the trade was still open when the selected test range ended. It is not a live open position.</MiniStatus>
+      )}
       <div className="hubert-lab__subhead"><strong>Position Sizing Audit</strong><span>transparent sizing</span></div>
       <div className="hubert-lab__metrics">
         <Metric label="Average size" value={fmt(audit.averageSize)} />
@@ -2765,7 +3086,7 @@ function BacktestResult({ result }) {
         <button type="button" onClick={() => exportCsv(`${result.name ?? "backtest"}-trades.csv`, result.trades)}>Export CSV</button>
       </div>
       <SideBreakdown trades={result.trades} />
-      <TradeTable trades={result.trades} />
+      <TradeTable onViewTrade={onViewTrade} trades={result.trades} />
       <BacktestDebugSection result={result} />
     </>
   );
@@ -2890,7 +3211,7 @@ function SideBreakdown({ trades }) {
   );
 }
 
-function TradeTable({ trades }) {
+function TradeTable({ onViewTrade, trades }) {
   const [page, setPage] = useState(0);
   const orderedTrades = useMemo(() => (trades ?? []).slice().reverse(), [trades]);
   const totalPages = Math.max(1, Math.ceil(orderedTrades.length / TRADE_TABLE_PAGE_SIZE));
@@ -2914,7 +3235,7 @@ function TradeTable({ trades }) {
       <div className="hubert-lab__table">
         <table>
           <thead>
-            <tr><th>Time</th><th>Side</th><th>Size</th><th>Lev</th><th>Margin</th><th>SL dist</th><th>Risk</th><th>PnL</th><th>Reason</th></tr>
+            <tr><th>Time</th><th>Side</th><th>Size</th><th>Lev</th><th>Margin</th><th>SL dist</th><th>Risk</th><th>PnL</th><th>Reason</th><th>Chart</th></tr>
           </thead>
           <tbody>
             {visibleTrades.map((trade, index) => (
@@ -2927,7 +3248,12 @@ function TradeTable({ trades }) {
                 <td>{trade.slDistancePercent ? `${fmt(trade.slDistancePercent * 100)}%` : "--"}</td>
                 <td>{fmt(trade.riskAmount)}</td>
                 <td>{fmt(trade.netPnl ?? trade.pnl)}</td>
-                <td>{trade.exitReason ?? trade.reason ?? "--"}</td>
+                <td>{displayExitReason(trade.exitReason ?? trade.reason)}</td>
+                <td>
+                  <button disabled={!onViewTrade} type="button" onClick={() => onViewTrade?.(trade)}>
+                    View
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>

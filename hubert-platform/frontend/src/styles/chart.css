@@ -1034,6 +1034,62 @@ button {
   background: rgba(215, 215, 215, 0.88);
 }
 
+.hubert-window-panel {
+  position: absolute;
+  right: 14px;
+  bottom: 76px;
+  z-index: 3;
+  display: grid;
+  gap: 4px;
+  width: 210px;
+  padding: 9px;
+  box-sizing: border-box;
+  border: 1px solid rgba(0, 0, 0, 0.22);
+  border-radius: 6px;
+  background: rgba(190, 190, 190, 0.78);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3);
+  pointer-events: auto;
+}
+
+.hubert-window-panel strong {
+  color: #080808;
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.hubert-window-panel span {
+  color: rgba(0, 0, 0, 0.64);
+  font-size: 10px;
+  font-weight: 740;
+  line-height: 1.25;
+}
+
+.hubert-window-panel div {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  padding-top: 3px;
+}
+
+.hubert-window-panel input,
+.hubert-window-panel button {
+  min-width: 0;
+  height: 28px;
+  box-sizing: border-box;
+  border: 1px solid rgba(0, 0, 0, 0.24);
+  border-radius: 5px;
+  background: rgba(216, 216, 216, 0.9);
+  color: #080808;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 760;
+}
+
+.hubert-window-panel button {
+  padding: 0 8px;
+  cursor: pointer;
+}
+
 .hubert-ruler-tool[data-active="true"] {
   background: #090909;
   border-color: #090909;
