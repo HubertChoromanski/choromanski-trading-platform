@@ -124,6 +124,156 @@ function formatChartTime(value) {
   return new Date(Number(value) * 1000).toLocaleString();
 }
 
+function chartTimeValue(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
+function warnSanitizedChartData(label, details) {
+  const totalIssues = Object.values(details).reduce((sum, value) => sum + Number(value || 0), 0);
+
+  if (totalIssues > 0) {
+    console.warn(`Choromanski chart sanitized ${label}`, details);
+  }
+}
+
+function sanitizeChartSeriesData(data = [], label = "series") {
+  const byTime = new Map();
+  let duplicates = 0;
+  let invalid = 0;
+  let nonAscending = 0;
+  let previousTime = -Infinity;
+
+  data.forEach((point) => {
+    const time = chartTimeValue(point?.time);
+
+    if (time === null) {
+      invalid += 1;
+      return;
+    }
+
+    if (time <= previousTime) {
+      nonAscending += 1;
+    }
+
+    previousTime = time;
+
+    if (byTime.has(time)) {
+      duplicates += 1;
+    }
+
+    byTime.set(time, { ...point, time });
+  });
+
+  const sanitized = [...byTime.values()].sort((left, right) => left.time - right.time);
+  warnSanitizedChartData(label, { duplicates, invalid, nonAscending });
+
+  return sanitized;
+}
+
+function markerSortPriority(marker) {
+  const id = String(marker?.id ?? "");
+
+  if (id.includes("debug")) return 0;
+  if (id.includes("benchmark")) return 1;
+  if (id.includes("entry")) return 2;
+  if (id.includes("exit")) return 3;
+
+  return 4;
+}
+
+function sanitizeMarkers(markers = [], label = "markers") {
+  const byId = new Map();
+  const noId = [];
+  let duplicateIds = 0;
+  let invalid = 0;
+  let nonAscending = 0;
+  let previousTime = -Infinity;
+
+  markers.forEach((marker, index) => {
+    const time = chartTimeValue(marker?.time);
+
+    if (time === null) {
+      invalid += 1;
+      return;
+    }
+
+    if (time < previousTime) {
+      nonAscending += 1;
+    }
+
+    previousTime = time;
+
+    const nextMarker = {
+      ...marker,
+      __index: index,
+      time,
+    };
+
+    if (marker.id) {
+      if (byId.has(marker.id)) {
+        duplicateIds += 1;
+      }
+      byId.set(marker.id, nextMarker);
+    } else {
+      noId.push(nextMarker);
+    }
+  });
+
+  const sanitized = [...byId.values(), ...noId]
+    .sort((left, right) => {
+      const timeDiff = left.time - right.time;
+      if (timeDiff !== 0) return timeDiff;
+
+      const priorityDiff = markerSortPriority(left) - markerSortPriority(right);
+      if (priorityDiff !== 0) return priorityDiff;
+
+      return left.__index - right.__index;
+    })
+    .map(({ __index, ...marker }) => marker);
+
+  warnSanitizedChartData(label, { duplicateIds, invalid, nonAscending });
+
+  return sanitized;
+}
+
+function sanitizeOverlayEvents(points = [], label = "overlay") {
+  const valid = points
+    .map((point) => {
+      const time = chartTimeValue(point?.time);
+      const value = Number(point?.value);
+
+      if (time === null || !Number.isFinite(value)) {
+        return null;
+      }
+
+      return { ...point, time, value };
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.time - right.time);
+
+  if (valid.length < 2) {
+    warnSanitizedChartData(label, { invalid: points.length - valid.length, zeroDuration: 0 });
+    return [];
+  }
+
+  const first = valid[0];
+  const last = valid.at(-1);
+
+  if (last.time <= first.time) {
+    warnSanitizedChartData(label, { invalid: points.length - valid.length, zeroDuration: 1 });
+    return [
+      first,
+      {
+        ...last,
+        time: first.time + 1,
+      },
+    ];
+  }
+
+  return sanitizeChartSeriesData([first, last], label);
+}
+
 function compactReason(reason = "") {
   const normalized = String(reason).toLowerCase();
 
@@ -522,33 +672,35 @@ export default function TradingViewChart() {
   }
 
   function setChartVisibleDataset(candles, shouldFitContent = false, windowMode = {}) {
-    rawCandlesRef.current = candles;
+    const safeCandles = sanitizeChartSeriesData(candles, "chart visible dataset");
+    rawCandlesRef.current = safeCandles;
     fitAfterRenderRef.current = shouldFitContent;
-    setRawCandlesState(candles);
+    setRawCandlesState(safeCandles);
     setSelectedHistoricalWindow({
       centerTime: windowMode.centerTime ?? null,
-      from: candles[0]?.time ?? null,
+      from: safeCandles[0]?.time ?? null,
       mode: windowMode.mode ?? "latest",
-      to: candles.at(-1)?.time ?? null,
+      to: safeCandles.at(-1)?.time ?? null,
     });
     setDataDiagnostics((current) => ({
       ...current,
-      renderedCandles: candles.length,
+      renderedCandles: safeCandles.length,
       selectedHistoricalWindow: {
-        from: candles[0]?.time ?? null,
+        from: safeCandles[0]?.time ?? null,
         mode: windowMode.mode ?? "latest",
-        to: candles.at(-1)?.time ?? null,
+        to: safeCandles.at(-1)?.time ?? null,
       },
     }));
   }
 
   function setFullHistoryDatasetState(candles, diagnostics = {}) {
-    fullHistoryDatasetRef.current = candles;
-    setFullHistoryDataset(candles);
+    const safeCandles = sanitizeChartSeriesData(candles, "full history dataset");
+    fullHistoryDatasetRef.current = safeCandles;
+    setFullHistoryDataset(safeCandles);
     setDataDiagnostics((current) => ({
       ...current,
       ...diagnostics,
-      fullCandles: candles.length,
+      fullCandles: safeCandles.length,
       provider: diagnostics.provider ?? diagnostics.source ?? current.provider ?? "binance-futures",
       source: diagnostics.source ?? diagnostics.provider ?? current.source ?? "binance-futures",
     }));
@@ -785,7 +937,16 @@ export default function TradingViewChart() {
 
   const addStrategySegment = useCallback(({ color, lineStyle = 0, lineWidth = 1, value, startTime, endTime, showLabel }) => {
     if (!chartRef.current) {
-      return;
+      return false;
+    }
+
+    const data = sanitizeOverlayEvents([
+      { time: startTime, value },
+      { time: endTime, value },
+    ], "strategy segment");
+
+    if (data.length < 2) {
+      return false;
     }
 
     const lineSeries = chartRef.current.addSeries(LineSeries, {
@@ -802,11 +963,9 @@ export default function TradingViewChart() {
       },
     });
 
-    lineSeries.setData([
-      { time: startTime, value },
-      { time: endTime, value },
-    ]);
+    lineSeries.setData(data);
     strategyLineSeriesRef.current.push(lineSeries);
+    return true;
   }, []);
 
   const renderStrategyLines = useCallback(
@@ -897,31 +1056,31 @@ export default function TradingViewChart() {
             ? result.analysisRange?.to ?? trade.exitTime ?? trade.entryTime
             : trade.exitTime ?? trade.entryTime;
 
-          if (Number.isFinite(Number(trade.stopLoss))) {
-            addStrategySegment({
-              color: "rgba(120, 24, 24, 0.72)",
-              endTime,
+	          if (Number.isFinite(Number(trade.stopLoss))) {
+	            const rendered = addStrategySegment({
+	              color: "rgba(120, 24, 24, 0.72)",
+	              endTime,
               lineStyle: 2,
               lineWidth: 1,
               showLabel: true,
-              startTime,
-              value: Number(trade.stopLoss),
-            });
-            linesRendered += 1;
-          }
-
-          if (Number.isFinite(Number(trade.takeProfit))) {
-            addStrategySegment({
-              color: "rgba(245, 245, 245, 0.78)",
-              endTime,
+	              startTime,
+	              value: Number(trade.stopLoss),
+	            });
+	            if (rendered) linesRendered += 1;
+	          }
+	
+	          if (Number.isFinite(Number(trade.takeProfit))) {
+	            const rendered = addStrategySegment({
+	              color: "rgba(245, 245, 245, 0.78)",
+	              endTime,
               lineStyle: 2,
               lineWidth: 1,
               showLabel: true,
-              startTime,
-              value: Number(trade.takeProfit),
-            });
-            linesRendered += 1;
-          }
+	              startTime,
+	              value: Number(trade.takeProfit),
+	            });
+	            if (rendered) linesRendered += 1;
+	          }
         });
 
       return linesRendered;
@@ -937,47 +1096,57 @@ export default function TradingViewChart() {
 
       const renderStartedAt = performance.now();
       const renderSettings = mode.settings ?? settings;
-      const heikenAshiCandles = toHeikenAshi(candles);
+      const chartCandles = sanitizeChartSeriesData(candles, "raw candles");
+      const heikenAshiCandles = sanitizeChartSeriesData(toHeikenAshi(chartCandles), "heiken ashi candles");
       const indicatorCandles =
-        renderSettings.strategySource === "raw-exchange" ? candles : heikenAshiCandles;
+        renderSettings.strategySource === "raw-exchange" ? chartCandles : heikenAshiCandles;
       const envelope = calculateNadarayaEnvelope(indicatorCandles, {
         bandwidth: renderSettings.bandwidth,
         multiplier: renderSettings.envelopeMultiplier,
       });
-      const realPriceLine = candles.map((candle) => ({
+      const realPriceLine = sanitizeChartSeriesData(chartCandles.map((candle) => ({
         time: candle.time,
         value: candle.close,
-      }));
+      })), "real price line");
+      const upperLine = renderSettings.showBands
+        ? sanitizeChartSeriesData(toLineData(envelope, "upper"), "upper band")
+        : [];
+      const lowerLine = renderSettings.showBands
+        ? sanitizeChartSeriesData(toLineData(envelope, "lower"), "lower band")
+        : [];
 
       heikenAshiCacheRef.current = heikenAshiCandles;
       candleSeriesRef.current.setData(heikenAshiCandles);
-      upperSeriesRef.current?.setData(renderSettings.showBands ? toLineData(envelope, "upper") : []);
-      lowerSeriesRef.current?.setData(renderSettings.showBands ? toLineData(envelope, "lower") : []);
+      upperSeriesRef.current?.setData(upperLine);
+      lowerSeriesRef.current?.setData(lowerLine);
       realPriceSeriesRef.current.setData(realPriceLine);
 
       if (mode.analysisResult) {
-        const markers = toBacktestAnalysisMarkers(mode.analysisResult, mode.overlaySettings, candles);
+        const markers = sanitizeMarkers(
+          toBacktestAnalysisMarkers(mode.analysisResult, mode.overlaySettings, chartCandles),
+          "backtest analysis markers",
+        );
         strategyMarkersRef.current?.setMarkers(markers);
-        const slTpLines = renderBacktestLines(mode.analysisResult, mode.overlaySettings, candles);
-        const visibleTrades = visibleBacktestTrades(mode.analysisResult, candles).length;
+        const slTpLines = renderBacktestLines(mode.analysisResult, mode.overlaySettings, chartCandles);
+        const visibleTrades = visibleBacktestTrades(mode.analysisResult, chartCandles).length;
         const debugMarkers = mode.overlaySettings?.showDebug
           ? markers.filter((marker) => String(marker.id ?? "").startsWith("analysis-debug")).length
           : 0;
         const totalTrades = mode.analysisResult?.trades?.length ?? 0;
-        setChartRenderStats({
-          cappedMarkers: Math.max(0, totalTrades - visibleTrades),
-          debugMarkers,
-          durationMs: Math.round(performance.now() - renderStartedAt),
-          markers: markers.length,
-          renderedCandles: candles.length,
-          skippedMarkers: Math.max(0, totalTrades - visibleTrades),
-          slTpLines,
-        });
-      } else {
-        const closedCandles = candles.filter((candle) => candle.isClosed !== false);
-        const closedHeikenAshiCandles = toHeikenAshi(closedCandles);
-        const strategyCandles =
-          renderSettings.strategySource === "raw-exchange" ? closedCandles : closedHeikenAshiCandles;
+	        setChartRenderStats({
+	          cappedMarkers: Math.max(0, totalTrades - visibleTrades),
+	          debugMarkers,
+	          durationMs: Math.round(performance.now() - renderStartedAt),
+	          markers: markers.length,
+	          renderedCandles: chartCandles.length,
+	          skippedMarkers: Math.max(0, totalTrades - visibleTrades),
+	          slTpLines,
+	        });
+	      } else {
+	        const closedCandles = chartCandles.filter((candle) => candle.isClosed !== false);
+	        const closedHeikenAshiCandles = sanitizeChartSeriesData(toHeikenAshi(closedCandles), "closed heiken ashi candles");
+	        const strategyCandles =
+	          renderSettings.strategySource === "raw-exchange" ? closedCandles : closedHeikenAshiCandles;
         const closedEnvelope = calculateNadarayaEnvelope(strategyCandles, {
           bandwidth: renderSettings.bandwidth,
           multiplier: renderSettings.envelopeMultiplier,
@@ -1016,20 +1185,21 @@ export default function TradingViewChart() {
           console.debug("Choromanski setup audit available at window.__CHOROMANSKI_SETUP_AUDIT__");
         }
 
-        const markerEvents = filterStrategyEvents(strategyEvents, renderSettings);
-        const cappedMarkerEvents = markerEvents.slice(-MAX_BACKTEST_CHART_MARKERS);
+	        const markerEvents = filterStrategyEvents(strategyEvents, renderSettings);
+	        const cappedMarkerEvents = markerEvents.slice(-MAX_BACKTEST_CHART_MARKERS);
+	        const strategyMarkers = sanitizeMarkers(toStrategyMarkers(cappedMarkerEvents), "strategy markers");
 
-        strategyMarkersRef.current?.setMarkers(toStrategyMarkers(cappedMarkerEvents));
-        renderStrategyLines(strategyEvents, closedCandles);
-        setChartRenderStats({
-          cappedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
-          debugMarkers: 0,
-          durationMs: Math.round(performance.now() - renderStartedAt),
-          markers: cappedMarkerEvents.length,
-          renderedCandles: candles.length,
-          skippedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
-          slTpLines: strategyLineSeriesRef.current.length,
-        });
+	        strategyMarkersRef.current?.setMarkers(strategyMarkers);
+	        renderStrategyLines(strategyEvents, closedCandles);
+	        setChartRenderStats({
+	          cappedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
+	          debugMarkers: 0,
+	          durationMs: Math.round(performance.now() - renderStartedAt),
+	          markers: strategyMarkers.length,
+	          renderedCandles: chartCandles.length,
+	          skippedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
+	          slTpLines: strategyLineSeriesRef.current.length,
+	        });
       }
 
       if (shouldFitContent) {
@@ -1053,14 +1223,25 @@ export default function TradingViewChart() {
     liveRenderFrameRef.current = window.requestAnimationFrame(() => {
       liveRenderFrameRef.current = 0;
       const nextCandles = pendingLiveCandlesRef.current;
-      const latestRaw = nextCandles?.[nextCandles.length - 1];
-
-      if (!latestRaw || !candleSeriesRef.current || !realPriceSeriesRef.current) {
-        return;
-      }
-
-      const haCache = heikenAshiCacheRef.current;
-      const previousHa = haCache[haCache.length - 2];
+	      const latestRaw = nextCandles?.[nextCandles.length - 1];
+	
+	      if (!latestRaw || !candleSeriesRef.current || !realPriceSeriesRef.current) {
+	        return;
+	      }
+	
+	      const latestTime = chartTimeValue(latestRaw.time);
+	      const lastCachedTime = chartTimeValue(heikenAshiCacheRef.current.at(-1)?.time);
+	
+	      if (latestTime === null || (lastCachedTime !== null && latestTime < lastCachedTime)) {
+	        warnSanitizedChartData("live candle update", {
+	          staleUpdate: lastCachedTime !== null && latestTime !== null && latestTime < lastCachedTime ? 1 : 0,
+	          invalid: latestTime === null ? 1 : 0,
+	        });
+	        return;
+	      }
+	
+	      const haCache = heikenAshiCacheRef.current;
+	      const previousHa = haCache[haCache.length - 2];
       const latestHa = toIncrementalHeikenAshi(latestRaw, previousHa);
 
       if (haCache.length === nextCandles.length) {
