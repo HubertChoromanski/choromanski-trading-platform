@@ -64,10 +64,11 @@ const defaultSettings = {
   showSl: true,
   showTrigger: false,
 };
-const MAX_BACKTEST_CHART_MARKERS = 500;
-const MAX_BACKTEST_DEBUG_MARKERS = 80;
-const MAX_STRATEGY_LINE_EVENTS = 220;
-const CHART_RENDER_CAP = 3000;
+const DEFAULT_CHART_RENDER_CAP = 1500;
+const ABSOLUTE_CHART_RENDER_CAP = 3000;
+const MAX_BACKTEST_CHART_MARKERS = 100;
+const MAX_BACKTEST_DEBUG_MARKERS = 40;
+const MAX_STRATEGY_LINE_EVENTS = 100;
 const DEFAULT_CHART_WINDOW_DAYS = 50;
 const MAX_CANDLES_BY_INTERVAL = {
   "10m": 10000,
@@ -81,8 +82,10 @@ const defaultBacktestOverlaySettings = {
   showDebug: false,
   showExits: true,
   showPnlLabels: true,
-  showSlTp: true,
+  showSelectedTradeSlTp: true,
+  showSlTp: false,
   showTrades: true,
+  showVisibleTradeSlTp: false,
 };
 
 function formatMeasurementValue(value) {
@@ -155,7 +158,7 @@ function intervalMinutes(interval) {
 }
 
 function chartWindowLimit(interval, days = DEFAULT_CHART_WINDOW_DAYS) {
-  return Math.max(100, Math.min(CHART_RENDER_CAP, Math.ceil(days * 1440 / intervalMinutes(interval))));
+  return Math.max(100, Math.min(DEFAULT_CHART_RENDER_CAP, Math.ceil(days * 1440 / intervalMinutes(interval))));
 }
 
 function chartWindowAround(candles = [], interval = "15m", centerTime = null, days = DEFAULT_CHART_WINDOW_DAYS) {
@@ -198,24 +201,30 @@ function isRenderableTrade(trade, times) {
   return Boolean(trade?.entryTime && (!times || times.has(trade.entryTime)));
 }
 
+function tradeKey(trade, index = 0) {
+  return String(trade?.id ?? trade?.setupId ?? `${trade?.entryTime ?? "entry"}-${trade?.direction ?? "trade"}-${index}`);
+}
+
+function visibleBacktestTrades(result, candles = []) {
+  const times = candles.length ? candleTimeSet(candles) : null;
+
+  return (result?.trades ?? [])
+    .filter((trade) => isRenderableTrade(trade, times))
+    .slice(-MAX_BACKTEST_CHART_MARKERS);
+}
+
 function renderedTradeCount(result, candles = [], overlaySettings = defaultBacktestOverlaySettings) {
   if (!result || !overlaySettings.showTrades) return 0;
   const times = candles.length ? candleTimeSet(candles) : null;
 
-  return (result.trades ?? [])
-    .slice(-MAX_BACKTEST_CHART_MARKERS)
-    .filter((trade) => isRenderableTrade(trade, times))
-    .length;
+  return visibleBacktestTrades(result, candles).length;
 }
 
 function toBacktestAnalysisMarkers(result, overlaySettings = defaultBacktestOverlaySettings, candles = []) {
   if (!result) return [];
-  const times = candles.length ? candleTimeSet(candles) : null;
 
   const tradeMarkers = overlaySettings.showTrades
-    ? (result.trades ?? [])
-      .slice(-MAX_BACKTEST_CHART_MARKERS)
-      .filter((trade) => isRenderableTrade(trade, times))
+    ? visibleBacktestTrades(result, candles)
       .flatMap((trade, index) => {
         const side = trade.direction === "LONG" ? "LONG" : "SHORT";
         const entryText = overlaySettings.showPnlLabels
@@ -231,7 +240,7 @@ function toBacktestAnalysisMarkers(result, overlaySettings = defaultBacktestOver
         const markers = [
           {
             color: trade.direction === "LONG" ? "#f5f5f5" : "#050505",
-            id: `analysis-entry-${trade.setupId ?? index}`,
+            id: `analysis-entry-${tradeKey(trade, index)}`,
             position: trade.direction === "LONG" ? "belowBar" : "aboveBar",
             shape: trade.direction === "LONG" ? "arrowUp" : "arrowDown",
             size: 1.12,
@@ -243,7 +252,7 @@ function toBacktestAnalysisMarkers(result, overlaySettings = defaultBacktestOver
         if (overlaySettings.showExits) {
           markers.push({
             color: "rgba(110, 20, 20, 0.78)",
-            id: `analysis-exit-${trade.setupId ?? index}`,
+            id: `analysis-exit-${tradeKey(trade, index)}`,
             position: trade.direction === "LONG" ? "aboveBar" : "belowBar",
             shape: "square",
             size: 0.72,
@@ -260,8 +269,10 @@ function toBacktestAnalysisMarkers(result, overlaySettings = defaultBacktestOver
     return tradeMarkers;
   }
 
+  const times = candles.length ? candleTimeSet(candles) : null;
   const debugMarkers = (result.diagnosticEvents ?? [])
     .filter((event) => !event.tradeOpened && event.reason && (event.bandTouchCondition || event.setupId))
+    .filter((event) => !times || times.has(event.candleTime))
     .slice(-MAX_BACKTEST_DEBUG_MARKERS)
     .map((event, index) => ({
       color: "rgba(44, 44, 44, 0.5)",
@@ -319,6 +330,7 @@ export default function TradingViewChart() {
   const dataDiagnosticsRef = useRef({});
   const rawCandlesRef = useRef([]);
   const selectedHistoricalWindowRef = useRef({ mode: "latest" });
+  const jumpRequestIdRef = useRef(0);
   const fitAfterRenderRef = useRef(false);
   const requestIdRef = useRef(0);
   const [selectedInterval, setSelectedInterval] = useState(
@@ -337,6 +349,15 @@ export default function TradingViewChart() {
     provider: "binance-futures",
     renderedCandles: 0,
     source: "binance-futures",
+  });
+  const [chartRenderStats, setChartRenderStats] = useState({
+    cappedMarkers: 0,
+    debugMarkers: 0,
+    durationMs: 0,
+    markers: 0,
+    renderedCandles: 0,
+    skippedMarkers: 0,
+    slTpLines: 0,
   });
   const [jumpDate, setJumpDate] = useState("");
   const [isLoading, setIsLoading] = useState(true);
@@ -488,6 +509,9 @@ export default function TradingViewChart() {
       ...currentStatus,
       state: "Unsaved changes",
     }));
+    clearStrategyLines();
+    strategyMarkersRef.current?.setMarkers([]);
+    strategyCacheRef.current = { key: "", events: [] };
     setSelectedHistoricalWindow({
       centerTime: null,
       from: null,
@@ -547,6 +571,7 @@ export default function TradingViewChart() {
       result.trades?.at(-1)?.entryTime ??
       fullRange.to ??
       backtestCandles.at(-1)?.time;
+    const selectedTradeId = context.focusTrade ? tradeKey(context.focusTrade) : null;
     const analysisCandles = chartWindowAround(
       backtestCandles,
       context.timeframe ?? result.timeframe ?? selectedInterval,
@@ -565,9 +590,15 @@ export default function TradingViewChart() {
       settings: context.settings ?? result.analysisSettings ?? settings,
       strategyDeckName: context.strategyDeckName ?? result.strategyDeckName ?? "Strategy Deck",
       timeframe: context.timeframe ?? result.timeframe ?? selectedInterval,
+      viewedTradeId: selectedTradeId,
     };
 
     setActiveBacktestSession(session);
+    setBacktestOverlaySettings((current) => ({
+      ...current,
+      selectedTradeId,
+      showSelectedTradeSlTp: selectedTradeId ? true : current.showSelectedTradeSlTp,
+    }));
     setBacktestAnalysisActive(true);
     fitAfterRenderRef.current = true;
   }
@@ -581,6 +612,7 @@ export default function TradingViewChart() {
   function viewBacktestTradeOnChart(trade) {
     if (!activeBacktestSession) return;
     const focusTime = trade?.entryTime ?? trade?.exitTime ?? activeBacktestSession.fullRange?.to;
+    const selectedTradeId = tradeKey(trade);
     const sourceCandles = activeBacktestSession.backtestCandles?.length
       ? activeBacktestSession.backtestCandles
       : activeBacktestSession.candles;
@@ -591,9 +623,14 @@ export default function TradingViewChart() {
           ...currentSession,
           candles: nextCandles,
           range: rangeFromCandles(nextCandles),
-          viewedTradeId: trade?.id ?? trade?.setupId ?? null,
+          viewedTradeId: selectedTradeId,
         }
       : currentSession);
+    setBacktestOverlaySettings((current) => ({
+      ...current,
+      selectedTradeId,
+      showSelectedTradeSlTp: true,
+    }));
     setBacktestAnalysisActive(true);
     fitAfterRenderRef.current = true;
   }
@@ -669,6 +706,8 @@ export default function TradingViewChart() {
   }
 
   async function jumpToHistoricalDate() {
+    const jumpRequestId = jumpRequestIdRef.current + 1;
+    jumpRequestIdRef.current = jumpRequestId;
     const targetMs = new Date(jumpDate).getTime();
 
     if (!Number.isFinite(targetMs)) {
@@ -684,18 +723,25 @@ export default function TradingViewChart() {
     }
 
     const halfWindowSeconds = Math.floor(DEFAULT_CHART_WINDOW_DAYS * 86400 / 2);
+    clearStrategyLines();
+    strategyMarkersRef.current?.setMarkers([]);
     setIsLoading(true);
     setError("");
 
     try {
       const payload = await fetchHistoricalCandles({
         from: new Date((targetSeconds - halfWindowSeconds) * 1000).toISOString(),
-        maxCandles: CHART_RENDER_CAP + 50,
+        maxCandles: ABSOLUTE_CHART_RENDER_CAP,
         provider: "binance-futures",
         symbol: "SOLUSDT",
         timeframe: selectedInterval,
         to: new Date((targetSeconds + halfWindowSeconds) * 1000).toISOString(),
       });
+
+      if (jumpRequestIdRef.current !== jumpRequestId) {
+        return;
+      }
+
       const visibleCandles = chartWindowAround(payload.candles, selectedInterval, targetSeconds);
 
       setFullHistoryDatasetState(payload.candles, payload.diagnostics);
@@ -830,15 +876,21 @@ export default function TradingViewChart() {
     (result, overlaySettings, candles = []) => {
       clearStrategyLines();
 
-      if (!overlaySettings.showSlTp) {
-        return;
+      const selectedTradeId = overlaySettings.selectedTradeId;
+      const showSelected = overlaySettings.showSelectedTradeSlTp && selectedTradeId;
+      const showVisible = overlaySettings.showVisibleTradeSlTp || overlaySettings.showSlTp;
+
+      if (!showSelected && !showVisible) {
+        return 0;
       }
 
       const times = candles.length ? candleTimeSet(candles) : null;
-      (result?.trades ?? [])
+      let linesRendered = 0;
+      visibleBacktestTrades(result, candles)
         .filter((trade) => !times || times.has(trade.entryTime) || times.has(trade.exitTime))
+        .filter((trade, index) => showVisible || tradeKey(trade, index) === selectedTradeId)
         .filter((trade) => Number.isFinite(Number(trade.stopLoss)) || Number.isFinite(Number(trade.takeProfit)))
-        .slice(-MAX_STRATEGY_LINE_EVENTS)
+        .slice(-MAX_STRATEGY_LINE_EVENTS / 2)
         .forEach((trade) => {
           const startTime = trade.entryTime;
           const endTime = trade.exitReason === "END"
@@ -855,6 +907,7 @@ export default function TradingViewChart() {
               startTime,
               value: Number(trade.stopLoss),
             });
+            linesRendered += 1;
           }
 
           if (Number.isFinite(Number(trade.takeProfit))) {
@@ -867,8 +920,11 @@ export default function TradingViewChart() {
               startTime,
               value: Number(trade.takeProfit),
             });
+            linesRendered += 1;
           }
         });
+
+      return linesRendered;
     },
     [addStrategySegment, clearStrategyLines],
   );
@@ -879,6 +935,7 @@ export default function TradingViewChart() {
         return;
       }
 
+      const renderStartedAt = performance.now();
       const renderSettings = mode.settings ?? settings;
       const heikenAshiCandles = toHeikenAshi(candles);
       const indicatorCandles =
@@ -899,8 +956,23 @@ export default function TradingViewChart() {
       realPriceSeriesRef.current.setData(realPriceLine);
 
       if (mode.analysisResult) {
-        strategyMarkersRef.current?.setMarkers(toBacktestAnalysisMarkers(mode.analysisResult, mode.overlaySettings, candles));
-        renderBacktestLines(mode.analysisResult, mode.overlaySettings, candles);
+        const markers = toBacktestAnalysisMarkers(mode.analysisResult, mode.overlaySettings, candles);
+        strategyMarkersRef.current?.setMarkers(markers);
+        const slTpLines = renderBacktestLines(mode.analysisResult, mode.overlaySettings, candles);
+        const visibleTrades = visibleBacktestTrades(mode.analysisResult, candles).length;
+        const debugMarkers = mode.overlaySettings?.showDebug
+          ? markers.filter((marker) => String(marker.id ?? "").startsWith("analysis-debug")).length
+          : 0;
+        const totalTrades = mode.analysisResult?.trades?.length ?? 0;
+        setChartRenderStats({
+          cappedMarkers: Math.max(0, totalTrades - visibleTrades),
+          debugMarkers,
+          durationMs: Math.round(performance.now() - renderStartedAt),
+          markers: markers.length,
+          renderedCandles: candles.length,
+          skippedMarkers: Math.max(0, totalTrades - visibleTrades),
+          slTpLines,
+        });
       } else {
         const closedCandles = candles.filter((candle) => candle.isClosed !== false);
         const closedHeikenAshiCandles = toHeikenAshi(closedCandles);
@@ -945,9 +1017,19 @@ export default function TradingViewChart() {
         }
 
         const markerEvents = filterStrategyEvents(strategyEvents, renderSettings);
+        const cappedMarkerEvents = markerEvents.slice(-MAX_BACKTEST_CHART_MARKERS);
 
-        strategyMarkersRef.current?.setMarkers(toStrategyMarkers(markerEvents));
+        strategyMarkersRef.current?.setMarkers(toStrategyMarkers(cappedMarkerEvents));
         renderStrategyLines(strategyEvents, closedCandles);
+        setChartRenderStats({
+          cappedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
+          debugMarkers: 0,
+          durationMs: Math.round(performance.now() - renderStartedAt),
+          markers: cappedMarkerEvents.length,
+          renderedCandles: candles.length,
+          skippedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
+          slTpLines: strategyLineSeriesRef.current.length,
+        });
       }
 
       if (shouldFitContent) {
@@ -1225,6 +1307,8 @@ export default function TradingViewChart() {
     async function loadMarketData() {
       setIsLoading(true);
       setError("");
+      clearStrategyLines();
+      strategyMarkersRef.current?.setMarkers([]);
 
       try {
         const payload = await fetchHistoricalCandles({
@@ -1276,7 +1360,7 @@ export default function TradingViewChart() {
       ignore = true;
       closeSocket?.();
     };
-  }, [historyLimit, scheduleLiveCandleUpdate, selectedInterval]);
+  }, [clearStrategyLines, historyLimit, scheduleLiveCandleUpdate, selectedInterval]);
 
   useEffect(() => {
     if (activeAnalysisSession) {
@@ -1389,6 +1473,7 @@ export default function TradingViewChart() {
 
       {activeAnalysisSession && (
         <BacktestAnalysisBanner
+          renderStats={chartRenderStats}
           overlaySettings={backtestOverlaySettings}
           session={activeAnalysisSession}
           onAnalyze={analyzeBacktestOnChart}
@@ -1407,6 +1492,7 @@ export default function TradingViewChart() {
       <div className="hubert-window-panel" aria-label="Chart window controls">
         <strong>{dataDiagnostics.provider ?? "binance-futures"}</strong>
         <span>{rawCandles.length} rendered / {fullHistoryDataset.length || dataDiagnostics.fullCandles || 0} loaded</span>
+        <span>{chartRenderStats.markers} markers · {chartRenderStats.slTpLines} lines · {chartRenderStats.durationMs}ms render</span>
         <span>{selectedHistoricalWindow.mode === "historical" ? "Viewing historical window" : "Live/latest window"}</span>
         <div>
           <input
@@ -1452,7 +1538,7 @@ export default function TradingViewChart() {
   );
 }
 
-function BacktestAnalysisBanner({ overlaySettings, session, onAnalyze, onExit, onToggle }) {
+function BacktestAnalysisBanner({ overlaySettings, renderStats, session, onAnalyze, onExit, onToggle }) {
   const range = session.range ?? rangeFromCandles(session.candles);
   const fullRange = session.fullRange ?? range;
   const tradeCount = session.result?.trades?.length ?? 0;
@@ -1482,11 +1568,9 @@ function BacktestAnalysisBanner({ overlaySettings, session, onAnalyze, onExit, o
       </div>
       <div className="hubert-backtest-banner__toggles">
         {[
-          ["showTrades", "Show trades"],
-          ["showSlTp", "Show SL/TP"],
-          ["showExits", "Show exits"],
-          ["showDebug", "Show skipped setups/debug"],
-          ["showPnlLabels", "Show PnL labels"],
+          ["showTrades", "Trades"],
+          ["showSelectedTradeSlTp", "Selected trade SL/TP"],
+          ["showPnlLabels", "PnL labels"],
         ].map(([key, label]) => (
           <label key={key}>
             <input
@@ -1497,6 +1581,24 @@ function BacktestAnalysisBanner({ overlaySettings, session, onAnalyze, onExit, o
             <span>{label}</span>
           </label>
         ))}
+        <details className="hubert-backtest-advanced">
+          <summary>Advanced / Debug</summary>
+          <label>
+            <input checked={Boolean(overlaySettings.showExits)} type="checkbox" onChange={(event) => onToggle("showExits", event.target.checked)} />
+            <span>Exit markers</span>
+          </label>
+          <label>
+            <input checked={Boolean(overlaySettings.showVisibleTradeSlTp || overlaySettings.showSlTp)} type="checkbox" onChange={(event) => onToggle("showVisibleTradeSlTp", event.target.checked)} />
+            <span>SL/TP for visible trades</span>
+          </label>
+          <label>
+            <input checked={Boolean(overlaySettings.showDebug)} type="checkbox" onChange={(event) => onToggle("showDebug", event.target.checked)} />
+            <span>Skipped/debug markers</span>
+          </label>
+          <span>
+            Rendered: {renderStats?.renderedCandles ?? 0} candles · {renderStats?.markers ?? 0} markers · {renderStats?.slTpLines ?? 0} lines · {renderStats?.durationMs ?? 0}ms
+          </span>
+        </details>
       </div>
       {hasMismatch && (
         <div className="hubert-backtest-banner__warning">

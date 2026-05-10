@@ -232,6 +232,31 @@ button {
   white-space: nowrap;
 }
 
+.hubert-backtest-advanced {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.hubert-backtest-advanced summary {
+  cursor: pointer;
+  color: rgba(0, 0, 0, 0.68);
+  font-size: 11px;
+  font-weight: 820;
+  list-style: none;
+}
+
+.hubert-backtest-advanced[open] {
+  flex-basis: 100%;
+  padding-top: 4px;
+}
+
+.hubert-backtest-advanced span {
+  display: inline-flex;
+  align-items: center;
+}
+
 .hubert-backtest-banner input {
   width: 14px;
   height: 14px;
@@ -597,6 +622,25 @@ button {
   line-height: 1.35;
 }
 
+.hubert-advanced {
+  grid-column: 1 / -1;
+  padding: 7px 9px;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  border-radius: 5px;
+  background: rgba(210, 210, 210, 0.44);
+}
+
+.hubert-advanced summary {
+  cursor: pointer;
+  color: rgba(0, 0, 0, 0.68);
+  font-size: 11px;
+  font-weight: 820;
+}
+
+.hubert-advanced .hubert-lab__grid {
+  margin-top: 8px;
+}
+
 .hubert-control-tabs {
   display: flex;
   flex-wrap: wrap;
@@ -949,7 +993,7 @@ button {
 
 .hubert-lab__table--sweep th:nth-child(12),
 .hubert-lab__table--sweep td:nth-child(12) {
-  width: 66px;
+  width: 92px;
 }
 
 .hubert-lab__table--sweep th:nth-child(13),

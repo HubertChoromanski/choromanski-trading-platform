@@ -779,6 +779,7 @@ function deckToProfile(battleDeck, existingProfile = {}) {
   const mm = battleDeck.mmSnapshot ?? {};
   const timeframe = battleDeck.timeframe ?? strategy.timeframe ?? "15m";
   const symbol = battleDeck.symbol ?? strategy.symbol ?? "SOLUSDT";
+  const sizingMode = strategy.sizingMode ?? (strategy.atrPositionSizing ? "fixed-risk" : "position-percent");
 
   return {
     ...existingProfile,
@@ -807,9 +808,9 @@ function deckToProfile(battleDeck, existingProfile = {}) {
       positionSizeMode:
         mm.mode === "constant"
           ? "fixed-usdt"
-          : strategy.atrPositionSizing === false
-            ? "percent-move"
-            : "risk-based",
+          : sizingMode === "fixed-risk"
+            ? "risk-based"
+            : "percent-move",
       priceMoveRiskPercent: Number(mm.positionPercent ?? mm.onePercentMovePercent ?? 10),
       riskPerTradePercent: Number(mm.riskPercent ?? mm.oneSlPercent ?? 1),
       startingBalance: Number(mm.startingBalance ?? 0),

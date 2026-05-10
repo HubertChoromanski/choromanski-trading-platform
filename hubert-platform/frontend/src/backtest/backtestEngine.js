@@ -5,6 +5,8 @@ import { calculateBacktestMetrics } from "./metrics";
 
 export const defaultBacktestConfig = {
   commissionPercent: 0.04,
+  maxExposurePercent: 100000,
+  maxLeverage: 1000,
   positionSizePercent: 100,
   slippagePercent: 0,
   startingBalance: 10000,
@@ -57,7 +59,15 @@ function closePosition({ candle, equity, exitPrice, position, reason, slippagePe
       netPnl,
       marginRequired: position.marginRequired,
       returnPercent: position.notional === 0 ? 0 : (netPnl / position.notional) * 100,
+      accountCapitalAtEntry: position.accountCapitalAtEntry,
+      configuredPositionPercent: position.configuredPositionPercent,
+      configuredRiskPercent: position.configuredRiskPercent,
+      expectedSlLossAmount: position.expectedSlLossAmount,
+      maxNotionalCap: position.maxNotionalCap,
+      rawNotional: position.rawNotional,
       riskAmount: position.riskAmount,
+      sizingClampReason: position.sizingClampReason,
+      sizingMode: position.sizingMode,
       setupId: position.setupId,
       slDistancePercent: position.slDistancePercent,
       size: position.notional,
@@ -67,39 +77,90 @@ function closePosition({ candle, equity, exitPrice, position, reason, slippagePe
   };
 }
 
+function resolveSizingMode(config) {
+  if (config.sizingMode === "position-percent" || config.sizingMode === "fixed-risk") {
+    return config.sizingMode;
+  }
+
+  return config.atrPositionSizing !== false ? "legacy-fixed-risk" : "position-percent";
+}
+
+function publicSizingMode(mode, mmDeck) {
+  if (mmDeck?.mode === "constant") return "CONSTANT fixed USDT";
+  if (mode === "fixed-risk" || mode === "legacy-fixed-risk") return "Fixed Risk Per Trade";
+  return "Position Percent";
+}
+
+function capNotional({ equity, mmDeck, notional, config }) {
+  const maxLeverage = Number(mmDeck?.maxLeverage ?? config.maxLeverage ?? defaultBacktestConfig.maxLeverage);
+  const maxExposurePercent = Number(mmDeck?.maxExposurePercent ?? config.maxExposurePercent ?? defaultBacktestConfig.maxExposurePercent);
+  const leverageCap = equity > 0 && maxLeverage > 0 ? equity * maxLeverage : Infinity;
+  const exposureCap = equity > 0 && maxExposurePercent > 0 ? equity * (maxExposurePercent / 100) : Infinity;
+  const maxNotionalCap = Math.min(leverageCap, exposureCap);
+
+  if (Number.isFinite(maxNotionalCap) && notional > maxNotionalCap) {
+    return {
+      maxNotionalCap,
+      notional: maxNotionalCap,
+      reason:
+        leverageCap <= exposureCap
+          ? `Clamped by max leverage cap ${maxLeverage}x`
+          : `Clamped by max exposure cap ${maxExposurePercent}% equity`,
+    };
+  }
+
+  return {
+    maxNotionalCap,
+    notional,
+    reason: "",
+  };
+}
+
 function openPosition({ candle, config, direction, equity, event }) {
   const rawEntry = event.trigger ?? candle.close;
   const entryPrice = applySlippage(rawEntry, direction, "entry", config.slippagePercent);
   const slDistancePercent = Math.abs(entryPrice - event.stopLoss) / entryPrice;
   const mmDeck = config.mmDeck;
-  const atrSizing = config.atrPositionSizing !== false;
-  const notional =
+  const sizingMode = resolveSizingMode(config);
+  const configuredRiskPercent = Number(mmDeck?.oneSlPercent ?? mmDeck?.riskPerSlPercent ?? config.riskPercent ?? 1);
+  const configuredPositionPercent = Number(mmDeck?.positionPercent ?? mmDeck?.onePercentMovePercent ?? config.positionSizePercent ?? 100);
+  const targetRiskAmount = equity * (configuredRiskPercent / 100);
+  const rawNotional =
     mmDeck?.mode === "constant"
       ? Number(mmDeck.fixedNotional ?? 0)
-      : mmDeck && atrSizing
+      : mmDeck && (sizingMode === "fixed-risk" || sizingMode === "legacy-fixed-risk")
         ? slDistancePercent > 0
-          ? (equity * (Number(mmDeck.oneSlPercent ?? mmDeck.riskPerSlPercent ?? 1) / 100)) / slDistancePercent
+          ? targetRiskAmount / slDistancePercent
           : 0
-        : mmDeck
-          ? equity * (Number(mmDeck.positionPercent ?? mmDeck.onePercentMovePercent ?? 10) / 100)
-          : equity * (config.positionSizePercent / 100);
+        : equity * (configuredPositionPercent / 100);
+  const capped = capNotional({ config, equity, mmDeck, notional: rawNotional });
+  const notional = capped.notional;
   const quantity = entryPrice === 0 ? 0 : notional / entryPrice;
   const entryCommission = notional * (config.commissionPercent / 100);
   const assumedLeverage = equity > 0 && notional > 0 ? Math.max(1, Math.ceil(notional / equity)) : 1;
-  const riskAmount = mmDeck && atrSizing ? equity * (Number(mmDeck.oneSlPercent ?? mmDeck.riskPerSlPercent ?? 1) / 100) : slDistancePercent * notional;
+  const expectedSlLossAmount = slDistancePercent * notional;
+  const riskAmount = expectedSlLossAmount;
 
   return {
+    accountCapitalAtEntry: equity,
     assumedLeverage,
     commissionRate: config.commissionPercent / 100,
+    configuredPositionPercent,
+    configuredRiskPercent,
     direction,
     entryCommission,
     entryIndex: event.index,
     entryPrice,
     entryTime: event.time,
+    expectedSlLossAmount,
     marginRequired: notional / assumedLeverage,
+    maxNotionalCap: capped.maxNotionalCap,
     notional,
     quantity,
+    rawNotional,
     riskAmount,
+    sizingClampReason: capped.reason,
+    sizingMode: publicSizingMode(sizingMode, mmDeck),
     setupId: event.setupId,
     slDistancePercent,
     stopLoss: event.stopLoss,

@@ -36,14 +36,15 @@ const PREVIEW_CURVE_POINTS = 420;
 const BACKTEST_CHART_TRADE_LIMIT = 500;
 const TRADE_TABLE_PAGE_SIZE = 50;
 const STORED_BACKTEST_EVENT_LIMIT = 1000;
-const SWEEP_MAX_COMBINATIONS = 100;
+const SWEEP_DEFAULT_COMBINATIONS = 200;
+const SWEEP_MAX_COMBINATIONS = 500;
 
 const defaultStrategyDeck = {
   allowLong: true,
   allowShort: true,
   atrLength: 14,
   atrMultiplier: 1.2,
-  atrPositionSizing: true,
+  atrPositionSizing: false,
   bandwidth: 8,
   confirmedEntries: true,
   diagnosticSetups: false,
@@ -54,6 +55,7 @@ const defaultStrategyDeck = {
   showSl: true,
   showTrigger: false,
   slLines: true,
+  sizingMode: "position-percent",
   strategySource: "pine-ha",
   symbol: "SOLUSDT",
   timeframe: "15m",
@@ -62,6 +64,8 @@ const defaultStrategyDeck = {
 
 const defaultMmDeck = {
   fixedNotional: 100,
+  maxExposurePercent: 100000,
+  maxLeverage: 1000,
   mode: "run",
   name: "",
   oneSlPercent: 1,
@@ -99,13 +103,14 @@ const defaultSweepForm = {
   manualMaxSameSideFailures: "2",
   manualPositionValues: "10",
   manualRiskValues: "1",
-  manualSizingMode: "run-risk",
+  manualSizingMode: "run-position",
   manualStartingBalance: 10000,
   manualStrategySource: "pine-ha",
   manualSymbol: "SOLUSDT",
   manualTimeframe: "15m",
   manualTo: "",
-  maxCombinations: SWEEP_MAX_COMBINATIONS,
+  maxCombinations: SWEEP_DEFAULT_COMBINATIONS,
+  sweepAdvancedCapacity: false,
   maxSameSideFailures: "",
   mode: "manual",
   positionValues: "",
@@ -208,13 +213,17 @@ function requireNumber(value, label, { min = -Infinity, positive = false } = {})
 }
 
 function normalizeStrategyDeck(deck) {
+  const sizingMode = deck.sizingMode ?? (deck.atrPositionSizing ? "fixed-risk" : "position-percent");
+
   return {
     ...deck,
     atrLength: requireNumber(deck.atrLength, "ATR length", { positive: true }),
     atrMultiplier: requireNumber(deck.atrMultiplier, "ATR multiplier", { positive: true }),
+    atrPositionSizing: sizingMode === "fixed-risk",
     bandwidth: requireNumber(deck.bandwidth, "Bandwidth", { positive: true }),
     envelopeMultiplier: requireNumber(deck.envelopeMultiplier, "NWE multiplier", { positive: true }),
     maxSameSideFailures: requireNumber(deck.maxSameSideFailures, "Max same-side failures", { min: 0 }),
+    sizingMode,
   };
 }
 
@@ -230,6 +239,8 @@ function normalizeMmDeck(deck) {
     ...deck,
     oneSlPercent: requireNumber(deck.oneSlPercent, "Risk per SL hit", { positive: true }),
     positionPercent: requireNumber(deck.positionPercent, "Position size", { positive: true }),
+    maxExposurePercent: isBlank(deck.maxExposurePercent) ? 100000 : requireNumber(deck.maxExposurePercent, "Max exposure cap", { positive: true }),
+    maxLeverage: isBlank(deck.maxLeverage) ? 1000 : requireNumber(deck.maxLeverage, "Max leverage cap", { positive: true }),
   };
 }
 
@@ -517,9 +528,19 @@ function sweepSizeKey(mmDeck, atrPositionSizing) {
 
 function sweepSizeLabel(key) {
   if (key === "fixedNotional") return "CONSTANT fixed USDT";
-  if (key === "oneSlPercent") return "RUN risk per SL";
-  if (key === "positionPercent") return "RUN position %";
+  if (key === "oneSlPercent") return "Fixed Risk Per Trade";
+  if (key === "positionPercent") return "Position Percent";
   return "Default size";
+}
+
+function sweepSizingModeForKey(key) {
+  if (key === "oneSlPercent") return "fixed-risk";
+  if (key === "fixedNotional") return "constant";
+  return "position-percent";
+}
+
+function engineSizingModeForKey(key) {
+  return key === "oneSlPercent" ? "fixed-risk" : "position-percent";
 }
 
 function hasExplicitSweepAtrMode(mode) {
@@ -592,14 +613,14 @@ function manualSweepSizeValues(form) {
     return {
       atrPositionSizing: false,
       key: "positionPercent",
-      values: parseSweepNumberList(form.manualPositionValues, "Position size values", { positive: true }),
+      values: parseSweepNumberList(form.manualPositionValues, "Position Percent values", { positive: true }),
     };
   }
 
   return {
     atrPositionSizing: true,
     key: "oneSlPercent",
-    values: parseSweepNumberList(form.manualRiskValues, "Risk per SL hit values", { positive: true }),
+    values: parseSweepNumberList(form.manualRiskValues, "Fixed Risk target values", { positive: true }),
   };
 }
 
@@ -645,12 +666,22 @@ function sizingAudit(trades = []) {
   const sizes = trades.map((trade) => Number(trade.size ?? 0)).filter((value) => value > 0);
   const leverages = trades.map((trade) => Number(trade.assumedLeverage ?? 0)).filter((value) => value > 0);
   const risks = trades.map((trade) => Number(trade.riskAmount ?? 0)).filter((value) => value > 0);
+  const capitalRiskPercents = trades
+    .map((trade) => {
+      const capital = Number(trade.accountCapitalAtEntry ?? 0);
+      const risk = Number(trade.expectedSlLossAmount ?? trade.riskAmount ?? 0);
+      return capital > 0 ? risk / capital * 100 : null;
+    })
+    .filter((value) => Number.isFinite(value));
+  const clamped = trades.filter((trade) => trade.sizingClampReason).length;
 
   return {
     averageLeverage: average(leverages),
+    averageCapitalRiskPercent: average(capitalRiskPercents),
     averageRisk: average(risks),
     averageSize: average(sizes),
     biggestExposure: sizes.length ? Math.max(...sizes) : 0,
+    clamped,
     maxSize: sizes.length ? Math.max(...sizes) : 0,
     minSize: sizes.length ? Math.min(...sizes) : 0,
     note:
@@ -829,10 +860,8 @@ export default function ControlCenter({
     [futuresBalance, selectedMm, selectedStrategy],
   );
   const sweepPreview = useMemo(() => {
-    const cap = Math.min(
-      SWEEP_MAX_COMBINATIONS,
-      Math.max(1, Number(sweepForm.maxCombinations) || SWEEP_MAX_COMBINATIONS),
-    );
+    const hardCap = sweepForm.sweepAdvancedCapacity ? SWEEP_MAX_COMBINATIONS : SWEEP_DEFAULT_COMBINATIONS;
+    const cap = Math.min(hardCap, Math.max(1, Number(sweepForm.maxCombinations) || SWEEP_DEFAULT_COMBINATIONS));
 
     try {
       const manualSweepForm = { ...sweepForm, mode: "manual" };
@@ -841,6 +870,11 @@ export default function ControlCenter({
         cap,
         count: combinations.length,
         error: "",
+        hardCap,
+        needsAdvanced: combinations.length > SWEEP_DEFAULT_COMBINATIONS && !sweepForm.sweepAdvancedCapacity,
+        warning: combinations.length > SWEEP_DEFAULT_COMBINATIONS
+          ? `This sweep has ${combinations.length} combinations. Above ${SWEEP_DEFAULT_COMBINATIONS}, use Advanced capacity and keep the browser focused until it finishes.`
+          : "",
         tooMany: combinations.length > cap,
       };
     } catch (error) {
@@ -1087,6 +1121,7 @@ export default function ControlCenter({
     onBacktestResult(backtestResult, {
       candles,
       diagnostics: dataset.diagnostics ?? null,
+      focusTrade,
       focusTime: focusTrade?.entryTime ?? focusTrade?.exitTime ?? null,
       mmDeckName: backtestResult.mmDeckName ?? "No MM deck",
       range,
@@ -1133,6 +1168,7 @@ export default function ControlCenter({
       backtestConfig: {
         commissionPercent: Number(form.commissionPercent),
         atrPositionSizing: deck.atrPositionSizing,
+        sizingMode: deck.sizingMode,
         mmDeck,
         slippagePercent: Number(form.slippagePercent),
         startingBalance: Number(form.startingBalance),
@@ -1195,6 +1231,8 @@ export default function ControlCenter({
             envelopeMultipliers.forEach((envelopeMultiplier) => {
               bandwidths.forEach((bandwidth) => {
                 sizing.values.forEach((sizeValue) => {
+                  const displaySizingMode = sweepSizingModeForKey(sizing.key);
+                  const engineSizingMode = engineSizingModeForKey(sizing.key);
                   const strategyDeck = {
                     ...defaultStrategyDeck,
                     atrLength,
@@ -1205,6 +1243,7 @@ export default function ControlCenter({
                     id: "manual-sweep-strategy",
                     maxSameSideFailures,
                     name: "Manual Sweep Strategy",
+                    sizingMode: engineSizingMode,
                     strategySource: form.manualStrategySource,
                     symbol: form.manualSymbol.trim().toUpperCase(),
                     timeframe: form.manualTimeframe,
@@ -1221,8 +1260,11 @@ export default function ControlCenter({
                       envelopeMultiplier,
                       maxSameSideFailures,
                       mode: "manual",
+                      positionPercent: sizing.key === "positionPercent" ? sizeValue : null,
+                      riskPercent: sizing.key === "oneSlPercent" ? sizeValue : null,
                       sizeKey: sizing.key,
                       sizeLabel: sweepSizeLabel(sizing.key),
+                      sizingMode: displaySizingMode,
                       sizeValue,
                       source: form.manualStrategySource,
                       symbol: form.manualSymbol.trim().toUpperCase(),
@@ -1290,6 +1332,7 @@ export default function ControlCenter({
                     bandwidth,
                     envelopeMultiplier,
                     maxSameSideFailures,
+                    sizingMode: atrPositionSizing ? "fixed-risk" : "position-percent",
                   };
                   const mmDeck = baseMmDeck
                     ? {
@@ -1346,13 +1389,11 @@ export default function ControlCenter({
     }
 
     const combinations = buildSweepCombinations({ baseDeck: null, baseMmDeck: null, form: manualSweepForm });
-    const cap = Math.min(
-      SWEEP_MAX_COMBINATIONS,
-      Math.max(1, Number(sweepForm.maxCombinations) || SWEEP_MAX_COMBINATIONS),
-    );
+    const hardCap = sweepForm.sweepAdvancedCapacity ? SWEEP_MAX_COMBINATIONS : SWEEP_DEFAULT_COMBINATIONS;
+    const cap = Math.min(hardCap, Math.max(1, Number(sweepForm.maxCombinations) || SWEEP_DEFAULT_COMBINATIONS));
 
     if (combinations.length > cap) {
-      throw new Error(`${combinations.length} combinations requested. Narrow the ranges or keep the sweep at ${cap} combinations or fewer.`);
+      throw new Error(`${combinations.length} combinations requested. Narrow the ranges or keep the sweep at ${cap} combinations or fewer${sweepForm.sweepAdvancedCapacity ? "." : ", or enable Advanced capacity."}`);
     }
 
     sweepCancelRef.current = false;
@@ -1377,6 +1418,7 @@ export default function ControlCenter({
         backtestConfig: {
           commissionPercent: Number(form.commissionPercent),
           atrPositionSizing: combination.strategyDeck.atrPositionSizing,
+          sizingMode: combination.strategyDeck.sizingMode,
           mmDeck: combination.mmDeck,
           slippagePercent: Number(form.slippagePercent),
           startingBalance: Number(form.startingBalance),
@@ -1412,7 +1454,7 @@ export default function ControlCenter({
       rows.push(row);
 
       if ((index + 1) % 4 === 0 || index === combinations.length - 1) {
-        setSweepResults(rankSweepRows(rows));
+        setSweepResults(rankSweepRows(rows).slice(0, 50));
         setSweepProgress({
           completed: index + 1,
           message: `Running ${index + 1} / ${combinations.length}`,
@@ -1424,7 +1466,7 @@ export default function ControlCenter({
     }
 
     const ranked = rankSweepRows(rows);
-    setSweepResults(ranked);
+    setSweepResults(ranked.slice(0, 50));
     setSweepProgress({
       completed: rows.length,
       message: sweepCancelRef.current ? `Cancelled at ${rows.length} / ${combinations.length}` : `Completed ${rows.length} combinations`,
@@ -1775,16 +1817,17 @@ function estimateDecision({ balance, mmDeck, strategyDeck }) {
   const safeBalance = Number(balance || 0);
   const riskPercent = Number(mmDeck.oneSlPercent ?? 1);
   const positionPercent = Number(mmDeck.positionPercent ?? mmDeck.onePercentMovePercent ?? 10);
+  const sizingMode = strategyDeck.sizingMode ?? (strategyDeck.atrPositionSizing ? "fixed-risk" : "position-percent");
   const notional =
     mmDeck.mode === "constant"
       ? Number(mmDeck.fixedNotional ?? 0)
-      : strategyDeck.atrPositionSizing
+      : sizingMode === "fixed-risk"
         ? safeBalance * riskPercent
         : safeBalance * (positionPercent / 100);
   const leverage = safeBalance > 0 && notional > 0 ? Math.max(1, Math.ceil(notional / safeBalance)) : 0;
   const margin = leverage > 0 ? notional / leverage : 0;
   const ready = safeBalance > 0 && notional > 0;
-  const lossText = strategyDeck.atrPositionSizing
+  const lossText = sizingMode === "fixed-risk"
     ? `If the SL is 1% away, estimated loss at SL is ${fmt(safeBalance * riskPercent / 100)} USDT.`
     : `A 1% move against this position is about ${fmt(notional * 0.01)} USDT.`;
 
@@ -2134,6 +2177,20 @@ function StrategyDecksPanel({ decks, favorites, form, onApplyChart, onDelete, on
         <NumberField label="ATR length" value={form.atrLength} step="1" onChange={(value) => setForm({ ...form, atrLength: value })} />
         <NumberField label="ATR multiplier" value={form.atrMultiplier} step="0.1" onChange={(value) => setForm({ ...form, atrMultiplier: value })} />
         <NumberField label="Max same-side failures" value={form.maxSameSideFailures} step="1" onChange={(value) => setForm({ ...form, maxSameSideFailures: value })} />
+        <SelectField
+          label="Sizing mode"
+          value={form.sizingMode ?? (form.atrPositionSizing ? "fixed-risk" : "position-percent")}
+          onChange={(value) => setForm({
+            ...form,
+            atrPositionSizing: value === "fixed-risk",
+            sizingMode: value,
+          })}
+          options={[
+            ["position-percent", "Position Percent"],
+            ["fixed-risk", "Fixed Risk Per Trade"],
+          ]}
+          help="Position Percent = fixed exposure. Fixed Risk = fixed capital risk at stop-loss."
+        />
         <ToggleGrid
           values={form}
           onChange={(key, value) => setForm({ ...form, [key]: value })}
@@ -2145,9 +2202,11 @@ function StrategyDecksPanel({ decks, favorites, form, onApplyChart, onDelete, on
             ["slLines", "SL lines"],
             ["allowLong", "Allow long"],
             ["allowShort", "Allow short"],
-            ["atrPositionSizing", "ATR position sizing"],
           ]}
         />
+        <MiniStatus>
+          Position Percent keeps exposure fixed. Fixed Risk Per Trade adjusts notional so the expected SL loss targets the risk % from the MM Deck.
+        </MiniStatus>
         {form.id && (
           <div className="hubert-lab__actions">
             <button type="button" onClick={() => onApplyChart(form)}>Apply to Chart</button>
@@ -2197,6 +2256,8 @@ function BacktestsPanel({
   const tableTradeCount = result?.trades?.length ?? 0;
   const renderedTrades = renderedBacktestTradeCount(result, analysisSession?.candles);
   const hasTradeRenderMismatch = result && renderedTrades !== tableTradeCount;
+  const selectedDeck = strategyDecks.find((deck) => deck.id === (form.strategyDeckId || strategyDecks[0]?.id));
+  const selectedSizingMode = selectedDeck?.sizingMode ?? (selectedDeck?.atrPositionSizing ? "fixed-risk" : "position-percent");
 
   return (
     <section className="hubert-lab__section">
@@ -2225,6 +2286,9 @@ function BacktestsPanel({
           </div>
           <MiniStatus>
             Historical Range Backtest uses {form.provider === "binance-spot" ? "Binance Spot" : "Binance Futures"} public candles for the selected range. It does not depend on the candles currently rendered on the chart.
+          </MiniStatus>
+          <MiniStatus>
+            Sizing mode: {selectedSizingMode === "fixed-risk" ? "Fixed Risk Per Trade" : "Position Percent"}. Position Percent keeps exposure fixed; Fixed Risk targets the configured SL loss.
           </MiniStatus>
           <div className="hubert-lab__actions">
             <button type="button" onClick={onRun}>Run Backtest</button>
@@ -2304,6 +2368,7 @@ function BacktestSweepPanel({
         Manual Sweep runs many explicit parameter sets without drawing chart overlays. Score = net profit % - max drawdown + trade-count bonus + profit-factor bonus.
       </MiniStatus>
       <MiniStatus>Manual Sweep ignores saved Strategy/MM Deck values. It fetches its own Binance Futures historical range and never draws chart overlays during the sweep.</MiniStatus>
+      <MiniStatus tone="good">Active sizing source: Manual Sweep. Strategy/MM Decks do not override this sweep.</MiniStatus>
       <div className="hubert-lab__subhead"><strong>Historical Range Sweep</strong><span>independent data</span></div>
       <div className="hubert-lab__grid">
         <TextField label="Symbol" value={form.manualSymbol} onChange={(value) => setForm({ ...form, manualSymbol: value })} />
@@ -2338,30 +2403,48 @@ function BacktestSweepPanel({
           value={form.manualSizingMode}
           onChange={(value) => setForm({ ...form, manualSizingMode: value })}
           options={[
-            ["run-risk", "RUN risk per SL"],
-            ["run-position", "RUN position % equity"],
+            ["run-position", "Position Percent"],
+            ["run-risk", "Fixed Risk Per Trade"],
             ["constant", "CONSTANT fixed USDT"],
           ]}
         />
         {form.manualSizingMode === "run-risk" && (
-          <TextField label="Risk per SL hit values (%)" value={form.manualRiskValues} onChange={(value) => setForm({ ...form, manualRiskValues: value })} />
+          <TextField label="Fixed Risk target % equity" value={form.manualRiskValues} onChange={(value) => setForm({ ...form, manualRiskValues: value })} />
         )}
         {form.manualSizingMode === "run-position" && (
-          <TextField label="Position size values (% equity)" value={form.manualPositionValues} onChange={(value) => setForm({ ...form, manualPositionValues: value })} />
+          <TextField label="Position Percent % equity" value={form.manualPositionValues} onChange={(value) => setForm({ ...form, manualPositionValues: value })} />
         )}
         {form.manualSizingMode === "constant" && (
           <TextField label="Fixed notional values (USDT)" value={form.manualFixedNotionalValues} onChange={(value) => setForm({ ...form, manualFixedNotionalValues: value })} />
         )}
       </div>
       <MiniStatus>{manualSweepSizingText(form.manualSizingMode)}</MiniStatus>
-      <div className="hubert-lab__grid">
-        <NumberField label="Max combinations" max={String(SWEEP_MAX_COMBINATIONS)} min="1" value={form.maxCombinations} onChange={(value) => setForm({ ...form, maxCombinations: value })} />
-      </div>
+      <details className="hubert-advanced">
+        <summary>Advanced sweep capacity</summary>
+        <div className="hubert-lab__grid">
+          <label className="hubert-inline-toggle">
+            <input
+              checked={Boolean(form.sweepAdvancedCapacity)}
+              type="checkbox"
+              onChange={(event) => setForm({ ...form, maxCombinations: event.target.checked ? form.maxCombinations : Math.min(Number(form.maxCombinations) || SWEEP_DEFAULT_COMBINATIONS, SWEEP_DEFAULT_COMBINATIONS), sweepAdvancedCapacity: event.target.checked })}
+            />
+            <span>Allow up to {SWEEP_MAX_COMBINATIONS} combinations</span>
+          </label>
+          <NumberField
+            label="Max combinations"
+            max={String(form.sweepAdvancedCapacity ? SWEEP_MAX_COMBINATIONS : SWEEP_DEFAULT_COMBINATIONS)}
+            min="1"
+            value={form.maxCombinations}
+            onChange={(value) => setForm({ ...form, maxCombinations: value })}
+          />
+        </div>
+      </details>
       <MiniStatus tone={previewTone}>
         {preview?.error
           ? preview.error
-          : `Combinations ready: ${preview?.count ?? 0} / ${preview?.cap ?? SWEEP_MAX_COMBINATIONS}${preview?.tooMany ? ". Narrow ranges before running." : "."}`}
+          : `Combinations ready: ${preview?.count ?? 0} / ${preview?.cap ?? SWEEP_DEFAULT_COMBINATIONS}${preview?.tooMany ? ". Narrow ranges or raise the Advanced cap." : "."}`}
       </MiniStatus>
+      {preview?.warning && <MiniStatus tone={preview?.tooMany ? "bad" : "neutral"}>{preview.warning}</MiniStatus>}
       <div className="hubert-lab__actions">
         <button disabled={progress.running || preview?.tooMany || Boolean(preview?.error)} type="button" onClick={onRun}>Run Sweep</button>
         <button disabled={!progress.running} type="button" onClick={onCancel}>Cancel</button>
@@ -2374,11 +2457,11 @@ function BacktestSweepPanel({
 
 function manualSweepSizingText(mode) {
   if (mode === "run-risk") {
-    return "RUN risk per SL sizes each position so an SL hit targets the selected % of current equity.";
+    return "Fixed Risk Per Trade sizes each position so an SL hit targets the selected % of current equity.";
   }
 
   if (mode === "run-position") {
-    return "RUN position % equity uses the selected % of current equity as position notional.";
+    return "Position Percent uses the selected % of current equity as position notional.";
   }
 
   return "CONSTANT fixed USDT uses the same notional size for every trade.";
@@ -2390,16 +2473,23 @@ function sweepSizingShortText(row) {
     ? ""
     : ` ${fmt(params.sizeValue, 2)}`;
 
-  if (params.sizeKey === "oneSlPercent") return `Risk${value}%`;
-  if (params.sizeKey === "positionPercent") return `Pos${value}%`;
-  if (params.sizeKey === "fixedNotional") return `Fixed${value}`;
+  if (params.sizeKey === "oneSlPercent") return `Fixed Risk${value}%`;
+  if (params.sizeKey === "positionPercent") return `Position${value}%`;
+  if (params.sizeKey === "fixedNotional") return `Fixed ${value} USDT`;
   return "Default";
 }
 
 function sweepParamDetails(row) {
   const params = row.params ?? {};
   const symbol = `${params.symbol ?? "SOLUSDT"} ${params.timeframe ?? ""}`.trim();
-  return `${symbol} · source ${params.source ?? "default"} · ATR length ${params.atrLength ?? "--"} · ${params.sizeLabel ?? "Sizing"} ${params.sizeValue ?? "--"}`;
+  return `${symbol} · source ${params.source ?? "default"} · ATR length ${params.atrLength ?? "--"} · ${params.sizeLabel ?? "Sizing"} ${params.sizeValue ?? "--"} · mode ${params.sizingMode ?? "--"}`;
+}
+
+function sweepHeaderSizingText(row) {
+  const params = row?.params ?? {};
+  const riskText = params.riskPercent === null || params.riskPercent === undefined ? "--" : `${fmt(params.riskPercent, 2)}%`;
+  const positionText = params.positionPercent === null || params.positionPercent === undefined ? "--" : `${fmt(params.positionPercent, 2)}%`;
+  return `Sizing: ${sweepSizingShortText(row)} · Fixed Risk target: ${riskText} · Position Percent: ${positionText}`;
 }
 
 function SweepResultTable({ onOpenResult, results }) {
@@ -2414,6 +2504,7 @@ function SweepResultTable({ onOpenResult, results }) {
         Sweep used {firstResult.candlesUsed ?? "--"} candles on {firstResult.params?.timeframe ?? "--"} from {firstResult.dataDiagnostics?.provider ?? "binance-futures"}.
         {firstResult.analysisRange ? ` Range: ${dateText(firstResult.analysisRange.from)} to ${dateText(firstResult.analysisRange.to)}.` : ""}
       </MiniStatus>
+      <MiniStatus>{sweepHeaderSizingText(firstResult)}</MiniStatus>
       <div className="hubert-lab__table hubert-lab__table--sweep">
         <table>
           <thead>
@@ -2598,12 +2689,20 @@ function MmDecksPanel({ decks, favorites, form, onDelete, onDuplicate, onEdit, o
         <SelectField label="Mode" value={form.mode} onChange={(value) => setForm({ ...form, mode: value })} options={[["run", "Run"], ["constant", "Constant"]]} />
         {form.mode === "run" ? (
           <>
-            <NumberField label="Risk per SL hit = % equity" value={form.oneSlPercent} step="0.1" onChange={(value) => setForm({ ...form, oneSlPercent: value })} help="Used when the Strategy Deck has ATR position sizing ON." />
-            <NumberField label="Position size = % equity" value={form.positionPercent ?? 10} step="1" onChange={(value) => setForm({ ...form, positionPercent: value })} help="Used when the Strategy Deck has ATR position sizing OFF." />
+            <NumberField label="Fixed Risk target = % equity" value={form.oneSlPercent} step="0.1" onChange={(value) => setForm({ ...form, oneSlPercent: value })} help="Used by Fixed Risk Per Trade. Position size changes so SL loss targets this percent." />
+            <NumberField label="Position Percent = % equity" value={form.positionPercent ?? 10} step="1" onChange={(value) => setForm({ ...form, positionPercent: value })} help="Used by Position Percent. Exposure is fixed and SL loss varies." />
+            <details className="hubert-advanced">
+              <summary>Advanced sizing caps</summary>
+              <div className="hubert-lab__grid">
+                <NumberField label="Max leverage cap" value={form.maxLeverage ?? 1000} step="1" onChange={(value) => setForm({ ...form, maxLeverage: value })} />
+                <NumberField label="Max exposure % equity" value={form.maxExposurePercent ?? 100000} step="100" onChange={(value) => setForm({ ...form, maxExposurePercent: value })} />
+              </div>
+            </details>
           </>
         ) : (
           <NumberField label="Every trade = USDT" value={form.fixedNotional} step="10" onChange={(value) => setForm({ ...form, fixedNotional: value })} />
         )}
+        <MiniStatus>Position Percent = fixed exposure. Fixed Risk = fixed capital risk at stop-loss.</MiniStatus>
         {form.id && (
           <div className="hubert-lab__actions">
             <button type="button" onClick={() => onDuplicate(form)}>Duplicate</button>
@@ -3078,7 +3177,9 @@ function BacktestResult({ onViewTrade, result }) {
         <Metric label="Max size" value={fmt(audit.maxSize)} />
         <Metric label="Average leverage" value={`${fmt(audit.averageLeverage, 1)}x`} />
         <Metric label="Average risk" value={fmt(audit.averageRisk)} />
+        <Metric label="Avg capital risk" value={`${fmt(audit.averageCapitalRiskPercent)}%`} />
         <Metric label="Biggest exposure" value={fmt(audit.biggestExposure)} />
+        <Metric label="Clamped trades" value={audit.clamped} />
       </div>
       <MiniStatus>{audit.note}</MiniStatus>
       <div className="hubert-lab__actions">
@@ -3235,23 +3336,24 @@ function TradeTable({ onViewTrade, trades }) {
       <div className="hubert-lab__table">
         <table>
           <thead>
-            <tr><th>Time</th><th>Side</th><th>Size</th><th>Lev</th><th>Margin</th><th>SL dist</th><th>Risk</th><th>PnL</th><th>Reason</th><th>Chart</th></tr>
+            <tr><th>Time</th><th>Side</th><th>Sizing</th><th>Capital</th><th>Size</th><th>Lev</th><th>SL dist</th><th>SL loss</th><th>Cap</th><th>PnL</th><th>Chart</th></tr>
           </thead>
           <tbody>
             {visibleTrades.map((trade, index) => (
               <tr key={trade.id ?? `${trade.entryTime}-${safePage}-${index}`}>
                 <td>{dateText(trade.entryTime)}</td>
                 <td>{trade.direction ?? trade.side}</td>
+                <td title={trade.sizingClampReason || ""}>{trade.sizingMode ?? "--"}</td>
+                <td>{fmt(trade.accountCapitalAtEntry)}</td>
                 <td>{fmt(trade.size)}</td>
                 <td>{trade.assumedLeverage ? `${fmt(trade.assumedLeverage, 1)}x` : "--"}</td>
-                <td>{fmt(trade.marginRequired)}</td>
                 <td>{trade.slDistancePercent ? `${fmt(trade.slDistancePercent * 100)}%` : "--"}</td>
-                <td>{fmt(trade.riskAmount)}</td>
+                <td title={`Configured risk: ${fmt(trade.configuredRiskPercent)}% · raw notional ${fmt(trade.rawNotional)}`}>{fmt(trade.expectedSlLossAmount ?? trade.riskAmount)}</td>
+                <td title={trade.sizingClampReason || "No sizing clamp"}>{trade.sizingClampReason ? "clamped" : "ok"}</td>
                 <td>{fmt(trade.netPnl ?? trade.pnl)}</td>
-                <td>{displayExitReason(trade.exitReason ?? trade.reason)}</td>
                 <td>
                   <button disabled={!onViewTrade} type="button" onClick={() => onViewTrade?.(trade)}>
-                    View
+                    {displayExitReason(trade.exitReason ?? trade.reason)} · View
                   </button>
                 </td>
               </tr>
