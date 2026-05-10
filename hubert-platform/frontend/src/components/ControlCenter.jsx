@@ -3099,9 +3099,14 @@ function AiPanel({
   return (
     <section className="hubert-lab__section">
       <div className="hubert-lab__subhead"><strong>AI Analyst Workbench</strong><span>analysis only</span></div>
-      <MiniStatus tone={aiStatus?.configured ? "good" : "neutral"}>
+      <MiniStatus tone={aiStatus?.connected ? "good" : aiStatus?.lastError ? "bad" : "neutral"}>
         {aiStatus?.message ?? "AI Workbench runs through the backend in mock mode."}
       </MiniStatus>
+      <div className="hubert-lab__metrics">
+        <Metric label="Provider" value={aiStatus?.provider ?? "mock"} />
+        <Metric label="Model" value={aiStatus?.model ?? "not connected"} />
+        <Metric label="State" value={aiStatus?.connected ? "Connected" : aiStatus?.lastError ? "Error" : "Mock / local"} />
+      </div>
       <MiniStatus>AI can analyze data and prepare reports, but it cannot place orders or change live execution.</MiniStatus>
       <ToggleGrid
         values={aiContext}
@@ -3117,7 +3122,7 @@ function AiPanel({
         ]}
       />
 
-      <div className="hubert-lab__subhead"><strong>Ask AI</strong><span>mock provider</span></div>
+      <div className="hubert-lab__subhead"><strong>Ask AI</strong><span>{aiStatus?.provider ?? "mock"} provider</span></div>
       <div className="hubert-ai-examples">
         {examples.map((example) => (
           <button key={example} type="button" onClick={() => setQuestion(example)}>{example}</button>

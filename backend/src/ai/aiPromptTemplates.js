@@ -1,6 +1,7 @@
 export const AI_PROVIDER_MODES = {
   DISABLED: "disabled",
   MOCK: "mock",
+  OPENAI: "openai",
   PLACEHOLDER: "local-placeholder",
 };
 
