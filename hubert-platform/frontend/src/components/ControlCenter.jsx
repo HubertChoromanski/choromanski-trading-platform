@@ -1777,40 +1777,12 @@ export default function ControlCenter({
       )}
 
 	      {panel === "AI" && (
-	        <AiPanel
+	        <AiAgentPanel
 	          apiRequest={apiFetch}
 	          aiStatus={aiStatus}
-	          aiContext={aiContext}
-	          mmDecks={mmDecks}
-	          messages={aiMessages}
-	          question={aiQuestion}
 	          runAction={runAction}
-	          setAiContext={setAiContext}
-	          setMessages={setAiMessages}
-	          setQuestion={setAiQuestion}
-	          strategyDecks={strategyDecks}
-	          onAsk={() =>
-	            runAction("ask-ai", "Ask AI", async () => {
-              if (!aiQuestion.trim()) throw new Error("Ask a question first.");
-              const userMessage = { role: "user", text: aiQuestion.trim(), time: new Date().toISOString() };
-              setAiMessages((current) => [...current, userMessage]);
-              setAiQuestion("");
-              const result = await apiFetch("/ai/chat", {
-                body: { context: aiContext, message: userMessage.text },
-                method: "POST",
-              });
-              setAiMessages((current) => [
-                ...current,
-                {
-                  role: "assistant",
-                  text: result.message,
-                  time: new Date().toISOString(),
-                },
-              ]);
-            })
-          }
-        />
-      )}
+	        />
+	      )}
 
       {panel === "Favorites" && (
         <FavoritesPanel
@@ -3018,6 +2990,231 @@ function CommunicationPanel({ communication, onSave, onTest, setCommunication })
         <button type="button" onClick={onSave}>Save Alerts</button>
         <button type="button" onClick={onTest}>Test Alert</button>
       </div>
+    </section>
+  );
+}
+
+function AiAgentPanel({ aiStatus, apiRequest, runAction }) {
+  const [prompt, setPrompt] = useState("Run a 50 combination sweep for SOLUSDT 15m over the last 31 days and rank robust settings.");
+  const [options, setOptions] = useState({
+    allowLongRunningJobs: false,
+    includeCodeContext: false,
+    includeLiveData: true,
+    maxCombinations: 1000,
+    objective: "robustness-adjusted return",
+  });
+  const [runs, setRuns] = useState([]);
+  const [activeRunId, setActiveRunId] = useState("");
+  const [manualResult, setManualResult] = useState(null);
+  const activeRun = runs.find((run) => run.id === activeRunId) ?? runs[0] ?? null;
+  const running = ["queued", "running"].includes(activeRun?.status);
+  const examples = [
+    "Run 1000 sweep combinations for SOLUSDT 15m over the last 2 years and give me the 5 best robust settings.",
+    "Compare Legacy vs Conservative fill mode across 15m, 30m and 1H.",
+    "Find the best MM sizing settings for Q1 2025 only.",
+    "Analyze why this strategy performs worse on 1H than 15m.",
+    "Prepare a report and export it to CSV and JSON.",
+  ];
+
+  async function loadRuns() {
+    const payload = await apiRequest("/ai/agent/runs");
+    setRuns(payload.runs ?? []);
+    if (!activeRunId && payload.runs?.[0]) setActiveRunId(payload.runs[0].id);
+    return payload;
+  }
+
+  async function startRun() {
+    return runAction("ai-agent-run", "Start agent", async () => {
+      if (!prompt.trim()) throw new Error("Tell the agent what to analyze first.");
+      const payload = await apiRequest("/ai/agent/run", {
+        body: {
+          options: {
+            confirmLargeJob: options.allowLongRunningJobs,
+            includeCodeContext: options.includeCodeContext,
+            includeLiveData: options.includeLiveData,
+            maxCombinations: options.maxCombinations,
+            objective: options.objective,
+          },
+          prompt,
+        },
+        method: "POST",
+      });
+      await loadRuns();
+      if (payload.run?.id) setActiveRunId(payload.run.id);
+      return payload;
+    });
+  }
+
+  async function cancelRun(runId) {
+    return runAction("ai-agent-cancel", "Cancel agent run", async () => {
+      await apiRequest(`/ai/agent/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST" });
+      await loadRuns();
+    });
+  }
+
+  async function exportRun(runId, format = "md") {
+    return runAction(`ai-agent-export-${format}`, `Export ${format.toUpperCase()}`, async () => {
+      const payload = await apiRequest(`/ai/agent/runs/${encodeURIComponent(runId)}/export`, {
+        body: { format },
+        method: "POST",
+      });
+      downloadText(payload.fileName, payload.content, payload.mime);
+    });
+  }
+
+  async function callManualTool(toolName, input = {}) {
+    return runAction(`ai-manual-${toolName}`, toolName, async () => {
+      const payload = await apiRequest("/ai/tool", {
+        body: { input, toolName },
+        method: "POST",
+      });
+      setManualResult(payload);
+      return payload;
+    });
+  }
+
+  useEffect(() => {
+    loadRuns().catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!running || !activeRun?.id) return undefined;
+    let ignore = false;
+    const timer = window.setInterval(async () => {
+      try {
+        const payload = await apiRequest(`/ai/agent/runs/${encodeURIComponent(activeRun.id)}`);
+        if (!ignore) {
+          setRuns((current) => [payload.run, ...current.filter((run) => run.id !== payload.run.id)]);
+        }
+      } catch {
+        // The next manual refresh will show any backend error in a normal action banner.
+      }
+    }, 1500);
+    return () => {
+      ignore = true;
+      window.clearInterval(timer);
+    };
+  }, [activeRun?.id, apiRequest, running]);
+
+  return (
+    <section className="hubert-lab__section">
+      <div className="hubert-lab__subhead"><strong>AI Agent</strong><span>analysis only</span></div>
+      <MiniStatus tone={aiStatus?.connected ? "good" : aiStatus?.lastError ? "bad" : "neutral"}>
+        {aiStatus?.message ?? "AI Agent runs through the backend. It cannot place orders."}
+      </MiniStatus>
+      <div className="hubert-lab__metrics">
+        <Metric label="Provider" value={aiStatus?.provider ?? "mock"} />
+        <Metric label="Model" value={aiStatus?.model ?? "not connected"} />
+        <Metric label="Trading" value="Blocked for AI" />
+      </div>
+
+      <label>
+        <span>Ask the agent to analyze, optimize, compare, report, or diagnose</span>
+        <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} />
+      </label>
+      <div className="hubert-lab__actions">
+        <button type="button" onClick={startRun}>Start Agent</button>
+        <button type="button" onClick={() => runAction("ai-agent-refresh", "Refresh agent runs", loadRuns)}>Refresh Runs</button>
+        {running && <button type="button" onClick={() => cancelRun(activeRun.id)}>Cancel Run</button>}
+      </div>
+
+      <details className="hubert-advanced">
+        <summary>Examples and advanced limits</summary>
+        <div className="hubert-ai-examples">
+          {examples.map((example) => (
+            <button key={example} type="button" onClick={() => setPrompt(example)}>{example}</button>
+          ))}
+        </div>
+        <div className="hubert-lab__grid">
+          <NumberField label="Max combinations" max="5000" min="1" value={options.maxCombinations} onChange={(value) => setOptions({ ...options, maxCombinations: value })} />
+          <SelectField label="Default objective" value={options.objective} onChange={(value) => setOptions({ ...options, objective: value })} options={[["robustness-adjusted return", "Robustness"], ["net profit", "Net profit"], ["profit factor", "Profit factor"], ["win rate", "Win rate"], ["drawdown-adjusted return", "Drawdown adjusted"]]} />
+        </div>
+        <ToggleGrid
+          values={options}
+          onChange={(key, value) => setOptions({ ...options, [key]: value })}
+          items={[
+            ["allowLongRunningJobs", "Allow >1000 tests"],
+            ["includeLiveData", "Include live status"],
+            ["includeCodeContext", "Include code map"],
+          ]}
+        />
+        <MiniStatus>Runs above 1000 combinations require the long-running option. The agent stores compact summaries, not full trade lists for every row.</MiniStatus>
+      </details>
+
+      {activeRun && (
+        <article className="hubert-live-card">
+          <div className="hubert-lab__subhead">
+            <strong>{activeRun.status.toUpperCase()}</strong>
+            <span>{activeRun.currentStep ?? "waiting"}</span>
+          </div>
+          <div className="hubert-lab__metrics">
+            <Metric label="Progress" value={`${activeRun.progress?.percent ?? 0}%`} />
+            <Metric label="Completed" value={`${activeRun.progress?.completed ?? 0}/${activeRun.progress?.total ?? 0}`} />
+            <Metric label="Intent" value={activeRun.parsedIntent ?? "analysis"} />
+            <Metric label="Started" value={dateText(activeRun.startedAt)} />
+          </div>
+          {activeRun.warnings?.length > 0 && <MiniStatus tone="warn">{activeRun.warnings[0]}</MiniStatus>}
+          {activeRun.errors?.length > 0 && <MiniStatus tone="bad">{activeRun.errors[0]}</MiniStatus>}
+          {activeRun.resultSummary && (
+            <div className="hubert-agent-result">
+              <strong>{activeRun.resultSummary.message}</strong>
+              {activeRun.resultSummary.topRows?.length > 0 && (
+                <div className="hubert-table-wrap">
+                  <table className="hubert-table">
+                    <thead><tr><th>Rank</th><th>Score</th><th>Net</th><th>PF</th><th>Win</th><th>Trades</th><th>Context</th></tr></thead>
+                    <tbody>
+                      {activeRun.resultSummary.topRows.slice(0, 6).map((row, index) => (
+                        <tr key={`${row.id ?? row.timeframe ?? index}`}>
+                          <td>{row.rank ?? index + 1}</td>
+                          <td>{fmt(row.score)}</td>
+                          <td>{fmt(row.metrics?.netProfit ?? row.netProfit)} USDT</td>
+                          <td>{fmt(row.metrics?.profitFactor ?? row.profitFactor)}</td>
+                          <td>{fmt(row.metrics?.winRate ?? row.winRate)}%</td>
+                          <td>{row.metrics?.totalTrades ?? row.totalTrades ?? 0}</td>
+                          <td>{row.timeframe ?? row.params?.sizingMode ?? "result"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+          {activeRun.artifacts?.length > 0 && (
+            <div className="hubert-lab__actions">
+              <button type="button" onClick={() => exportRun(activeRun.id, "md")}>Export Markdown</button>
+              <button type="button" onClick={() => exportRun(activeRun.id, "json")}>Export JSON</button>
+              <button type="button" onClick={() => exportRun(activeRun.id, "csv")}>Export CSV</button>
+            </div>
+          )}
+        </article>
+      )}
+
+      <div className="hubert-lab__subhead"><strong>Recent runs</strong><span>{runs.length}</span></div>
+      <div className="hubert-list-compact">
+        {runs.slice(0, 8).map((run) => (
+          <article key={run.id}>
+            <strong>{run.parsedIntent ?? "analysis"} · {run.status}</strong>
+            <span>{run.prompt}</span>
+            <div className="hubert-lab__actions">
+              <button type="button" onClick={() => setActiveRunId(run.id)}>Open</button>
+              {["queued", "running"].includes(run.status) && <button type="button" onClick={() => cancelRun(run.id)}>Cancel</button>}
+            </div>
+          </article>
+        ))}
+      </div>
+
+      <details className="hubert-advanced">
+        <summary>Manual backend tools</summary>
+        <div className="hubert-ai-actions">
+          <button type="button" onClick={() => callManualTool("explainCurrentSetup")}>Explain current setup</button>
+          <button type="button" onClick={() => callManualTool("getPlatformStatus")}>Platform status</button>
+          <button type="button" onClick={() => callManualTool("summarizeBacktest")}>Latest backtest</button>
+          <button type="button" onClick={() => callManualTool("createAlertDraft", { condition: "live data stale over 60 seconds", name: "Data freshness watch" })}>Create alert draft</button>
+        </div>
+        {manualResult && <pre className="hubert-ai-json">{JSON.stringify(manualResult, null, 2).slice(0, 12000)}</pre>}
+      </details>
     </section>
   );
 }

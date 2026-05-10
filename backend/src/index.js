@@ -5,6 +5,7 @@ import { createAiContextBuilder } from "./ai/aiContextBuilder.js";
 import { createAiMemoryStore } from "./ai/aiMemoryStore.js";
 import { createAiService } from "./ai/aiService.js";
 import { createAiTools } from "./ai/aiTools.js";
+import { createAgentOrchestrator } from "./ai/agent/agentOrchestrator.js";
 import { reportToCsv } from "./ai/aiReportBuilder.js";
 import { createBotRunner } from "./botRunner.js";
 import { createBingxClient } from "./exchanges/bingxClient.js";
@@ -1103,6 +1104,10 @@ const aiService = createAiService({
   provider: process.env.AI_PROVIDER ?? "mock",
   tools: aiTools,
 });
+const aiAgent = createAgentOrchestrator({
+  store,
+  tools: aiTools,
+});
 
 async function readBody(request) {
   const chunks = [];
@@ -1381,6 +1386,48 @@ const server = http.createServer(async (request, response) => {
 	      const body = await readBody(request);
 	      sendJson(response, 200, await aiService.chat(body));
 	      return;
+	    }
+
+	    if (request.method === "POST" && pathname === "/ai/agent/run") {
+	      const body = await readBody(request);
+	      const result = await aiAgent.startRun(body);
+	      sendJson(response, result.statusCode ?? 200, result);
+	      return;
+	    }
+
+	    if (request.method === "GET" && pathname === "/ai/agent/runs") {
+	      sendJson(response, 200, aiAgent.listRuns());
+	      return;
+	    }
+
+	    if (pathname.startsWith("/ai/agent/runs/")) {
+	      const parts = pathname.split("/").filter(Boolean);
+	      const runId = decodeURIComponent(parts[3] ?? "");
+
+	      if (request.method === "GET" && parts.length === 4) {
+	        const result = aiAgent.getRun(runId);
+	        sendJson(response, result.statusCode ?? 200, result);
+	        return;
+	      }
+
+	      if (request.method === "POST" && parts.length === 5 && parts[4] === "cancel") {
+	        const result = await aiAgent.cancelRun(runId);
+	        sendJson(response, result.statusCode ?? 200, result);
+	        return;
+	      }
+
+	      if (request.method === "GET" && parts.length === 5 && parts[4] === "artifacts") {
+	        const result = aiAgent.getArtifacts(runId);
+	        sendJson(response, result.statusCode ?? 200, result);
+	        return;
+	      }
+
+	      if (request.method === "POST" && parts.length === 5 && parts[4] === "export") {
+	        const body = await readBody(request);
+	        const result = aiAgent.exportRun(runId, body);
+	        sendJson(response, result.statusCode ?? 200, result);
+	        return;
+	      }
 	    }
 
 	    if (request.method === "POST" && pathname === "/ai/tool") {

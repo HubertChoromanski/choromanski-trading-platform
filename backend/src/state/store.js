@@ -106,6 +106,7 @@ const defaultExecutionConfig = {
 
 const collectionDefaults = {
   aiAlertDrafts: [],
+  aiAgentRuns: [],
   aiReports: [],
   aiSessions: [],
   analytics: [],
@@ -168,6 +169,7 @@ async function writeJson(fileName, value) {
 export async function createStateStore() {
 	  const store = {
 	    aiAlertDrafts: await readJson("ai-alert-drafts.json", collectionDefaults.aiAlertDrafts),
+	    aiAgentRuns: await readJson("ai-agent-runs.json", collectionDefaults.aiAgentRuns),
 	    aiReports: await readJson("ai-reports.json", collectionDefaults.aiReports),
 	    aiSessions: await readJson("ai-sessions.json", collectionDefaults.aiSessions),
 	    analytics: await readJson("analytics.json", collectionDefaults.analytics),
@@ -208,6 +210,10 @@ export async function createStateStore() {
 
   async function persist(key) {
     const fileNames = {
+      aiAlertDrafts: "ai-alert-drafts.json",
+      aiAgentRuns: "ai-agent-runs.json",
+      aiReports: "ai-reports.json",
+      aiSessions: "ai-sessions.json",
       battleDecks: "battle-decks.json",
       executionConfig: "execution-config.json",
       mmDecks: "mm-decks.json",
