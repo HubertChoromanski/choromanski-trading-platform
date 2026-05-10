@@ -83,7 +83,11 @@ function sidePnl(trades = [], side) {
 
 function summarizeBacktestResult(result, candles, range, provider, timeframe, symbol, settings) {
   return {
+    ambiguity: result.ambiguity,
+    ambiguousCandlesCount: result.ambiguousCandlesCount ?? result.ambiguity?.ambiguousCandlesCount ?? 0,
     candlesUsed: candles.length,
+    conservativeAdjustedTrades: result.conservativeAdjustedTrades ?? result.ambiguity?.conservativeAdjustedTrades ?? 0,
+    conservativeSkippedEntries: result.conservativeSkippedEntries ?? result.ambiguity?.conservativeSkippedEntries ?? 0,
     conclusion: backtestConclusion(result.metrics),
     diagnostics: {
       evaluatedSetupCount: result.diagnosticSummary?.evaluatedCandles ?? result.diagnosticSummary?.totalEvaluatedCandles ?? candles.length,
@@ -91,6 +95,7 @@ function summarizeBacktestResult(result, candles, range, provider, timeframe, sy
     },
     longResult: sidePnl(result.trades, "LONG"),
     metrics: result.metrics,
+    fillMode: result.fillMode ?? "legacy",
     provider,
     range,
     settings,
@@ -146,10 +151,12 @@ export function createAiTools({
     });
     const settings = strategySettings(strategyDeck, input);
     const sizingMode = input.sizingMode ?? strategyDeck.sizingMode ?? (strategyDeck.atrPositionSizing ? "fixed-risk" : "position-percent");
+    const fillMode = input.fillMode === "conservative" ? "conservative" : "legacy";
     const result = runBacktest({
       backtestConfig: {
         atrPositionSizing: sizingMode === "fixed-risk",
         commissionPercent: Number(input.commissionPercent ?? 0.04),
+        fillMode,
         mmDeck: {
           ...DEFAULT_MM,
           ...mmDeck,
@@ -208,9 +215,11 @@ export function createAiTools({
       });
       rows.push({
         id: `ai-sweep-${Date.now()}-${index}`,
+        fillMode: result.fillMode ?? "legacy",
         metrics: result.metrics,
         params: {
           ...combo,
+          fillMode: result.fillMode ?? "legacy",
           sizingMode,
         },
         score: sweepScore(result.metrics, Number(input.startingBalance ?? 10000)),

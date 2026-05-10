@@ -74,6 +74,7 @@ const defaultMmDeck = {
 
 const defaultBacktestForm = {
   commissionPercent: 0.04,
+  fillMode: "legacy",
   from: "",
   lastDays: 31,
   mmDeckId: "",
@@ -97,6 +98,7 @@ const defaultSweepForm = {
   manualAtrMultipliers: "1.2",
   manualBandwidths: "8",
   manualEnvelopeMultipliers: "3",
+  manualFillMode: "legacy",
   manualFixedNotionalValues: "100",
   manualFrom: "",
   manualLastDays: 31,
@@ -321,6 +323,10 @@ function profileStatusTitle(profile = {}) {
 function displayExitReason(reason) {
   if (reason === "END") return "END / open until test end";
   return reason ?? "--";
+}
+
+function fillModeLabel(mode) {
+  return mode === "conservative" ? "Conservative" : "Current / Legacy";
 }
 
 function daysFromCandles(candles, interval) {
@@ -648,6 +654,7 @@ function sweepRangeForm(backtestForm, form) {
 
   return {
     ...backtestForm,
+    fillMode: form.manualFillMode ?? backtestForm.fillMode ?? "legacy",
     from: form.manualFrom,
     lastDays: form.manualLastDays,
     startingBalance: form.manualStartingBalance,
@@ -710,7 +717,7 @@ function exportJson(fileName, value) {
 }
 
 function exportCsv(fileName, trades = []) {
-  const headers = ["entryTime", "direction", "entryPrice", "exitTime", "exitPrice", "netPnl", "exitReason"];
+  const headers = ["entryTime", "direction", "entryPrice", "exitTime", "exitPrice", "netPnl", "exitReason", "fillMode", "sameCandleSl", "ambiguityReason"];
   const rows = trades.map((trade) =>
     headers
       .map((key) => JSON.stringify(trade[key] ?? trade[key === "netPnl" ? "pnl" : key] ?? ""))
@@ -1168,6 +1175,7 @@ export default function ControlCenter({
       backtestConfig: {
         commissionPercent: Number(form.commissionPercent),
         atrPositionSizing: deck.atrPositionSizing,
+        fillMode: form.fillMode ?? "legacy",
         sizingMode: deck.sizingMode,
         mmDeck,
         slippagePercent: Number(form.slippagePercent),
@@ -1260,6 +1268,7 @@ export default function ControlCenter({
                       envelopeMultiplier,
                       maxSameSideFailures,
                       mode: "manual",
+                      fillMode: form.manualFillMode ?? "legacy",
                       positionPercent: sizing.key === "positionPercent" ? sizeValue : null,
                       riskPercent: sizing.key === "oneSlPercent" ? sizeValue : null,
                       sizeKey: sizing.key,
@@ -1418,6 +1427,7 @@ export default function ControlCenter({
         backtestConfig: {
           commissionPercent: Number(form.commissionPercent),
           atrPositionSizing: combination.strategyDeck.atrPositionSizing,
+          fillMode: form.fillMode ?? "legacy",
           sizingMode: combination.strategyDeck.sizingMode,
           mmDeck: combination.mmDeck,
           slippagePercent: Number(form.slippagePercent),
@@ -1435,6 +1445,11 @@ export default function ControlCenter({
         candlesUsed: candles.length,
         chartCandlesRendered: rawCandles.length,
         dataDiagnostics: dataset.diagnostics ?? null,
+        fillMode: result.fillMode,
+        ambiguity: result.ambiguity,
+        ambiguousCandlesCount: result.ambiguousCandlesCount,
+        conservativeAdjustedTrades: result.conservativeAdjustedTrades,
+        conservativeSkippedEntries: result.conservativeSkippedEntries,
         id: `sweep-${Date.now()}-${index}`,
         longResult: sidePnl(result.trades, "LONG"),
         maxDrawdown: metrics.maxDrawdown,
@@ -2287,12 +2302,19 @@ function BacktestsPanel({
             <NumberField label="Starting balance" value={form.startingBalance} onChange={(value) => setForm({ ...form, startingBalance: value })} />
             <NumberField label="Commission %" value={form.commissionPercent} step="0.01" onChange={(value) => setForm({ ...form, commissionPercent: value })} />
             <NumberField label="Slippage %" value={form.slippagePercent} step="0.01" onChange={(value) => setForm({ ...form, slippagePercent: value })} />
+            <SelectField label="Backtest Fill Mode" value={form.fillMode ?? "legacy"} onChange={(value) => setForm({ ...form, fillMode: value })} options={[
+              ["legacy", "Current / Legacy"],
+              ["conservative", "Conservative"],
+            ]} />
           </div>
           <MiniStatus>
             Historical Range Backtest uses {form.provider === "binance-spot" ? "Binance Spot" : "Binance Futures"} public candles for the selected range. It does not depend on the candles currently rendered on the chart.
           </MiniStatus>
           <MiniStatus>
             Sizing mode: {selectedSizingMode === "fixed-risk" ? "Fixed Risk Per Trade" : "Position Percent"}. Position Percent keeps exposure fixed; Fixed Risk targets the configured SL loss.
+          </MiniStatus>
+          <MiniStatus>
+            Fill mode: {fillModeLabel(form.fillMode)}. Legacy preserves existing results. Conservative assumes worst-case ordering when OHLC cannot prove intrabar sequence.
           </MiniStatus>
           <div className="hubert-lab__actions">
             <button type="button" onClick={onRun}>Run Backtest</button>
@@ -2307,6 +2329,9 @@ function BacktestsPanel({
                 </span>
                 <span>
                   Trades in table: {tableTradeCount} · rendered on chart: {renderedTrades}
+                </span>
+                <span>
+                  Fill Mode: {fillModeLabel(result.fillMode)} · ambiguous candles: {result.ambiguousCandlesCount ?? result.ambiguity?.ambiguousCandlesCount ?? 0} · conservative-adjusted trades: {result.conservativeAdjustedTrades ?? result.ambiguity?.conservativeAdjustedTrades ?? 0} · skipped entries: {result.conservativeSkippedEntries ?? result.ambiguity?.conservativeSkippedEntries ?? 0}
                 </span>
                 {hasTradeRenderMismatch && (
                   <span className="hubert-analysis-card__warning">
@@ -2379,9 +2404,16 @@ function BacktestSweepPanel({
         <SelectField label="Timeframe" value={form.manualTimeframe} onChange={(value) => setForm({ ...form, manualTimeframe: value })} options={TIMEFRAMES.map((item) => [item.interval, item.label])} />
         <NumberField label="Last X days" min="1" value={form.manualLastDays} onChange={(value) => setForm({ ...form, manualLastDays: value })} />
         <NumberField label="Starting balance" min="1" value={form.manualStartingBalance} onChange={(value) => setForm({ ...form, manualStartingBalance: value })} />
+        <SelectField label="Backtest Fill Mode" value={form.manualFillMode ?? "legacy"} onChange={(value) => setForm({ ...form, manualFillMode: value })} options={[
+          ["legacy", "Current / Legacy"],
+          ["conservative", "Conservative"],
+        ]} />
         <TextField label="From date/time" value={form.manualFrom} onChange={(value) => setForm({ ...form, manualFrom: value })} />
         <TextField label="To date/time" value={form.manualTo} onChange={(value) => setForm({ ...form, manualTo: value })} />
       </div>
+      <MiniStatus>
+        Fill mode: {fillModeLabel(form.manualFillMode)}. Legacy preserves existing results. Conservative assumes worst-case ordering when OHLC cannot prove intrabar sequence.
+      </MiniStatus>
       <div className="hubert-lab__subhead"><strong>Strategy Parameters</strong><span>all explicit</span></div>
       <div className="hubert-lab__grid">
         <TextField label="Bandwidth values" value={form.manualBandwidths} onChange={(value) => setForm({ ...form, manualBandwidths: value })} />
@@ -2486,7 +2518,7 @@ function sweepSizingShortText(row) {
 function sweepParamDetails(row) {
   const params = row.params ?? {};
   const symbol = `${params.symbol ?? "SOLUSDT"} ${params.timeframe ?? ""}`.trim();
-  return `${symbol} · source ${params.source ?? "default"} · ATR length ${params.atrLength ?? "--"} · ${params.sizeLabel ?? "Sizing"} ${params.sizeValue ?? "--"} · mode ${params.sizingMode ?? "--"}`;
+  return `${symbol} · source ${params.source ?? "default"} · fill ${fillModeLabel(params.fillMode ?? row.fillMode)} · ATR length ${params.atrLength ?? "--"} · ${params.sizeLabel ?? "Sizing"} ${params.sizeValue ?? "--"} · mode ${params.sizingMode ?? "--"}`;
 }
 
 function sweepHeaderSizingText(row) {
@@ -2507,6 +2539,9 @@ function SweepResultTable({ onOpenResult, results }) {
       <MiniStatus>
         Sweep used {firstResult.candlesUsed ?? "--"} candles on {firstResult.params?.timeframe ?? "--"} from {firstResult.dataDiagnostics?.provider ?? "binance-futures"}.
         {firstResult.analysisRange ? ` Range: ${dateText(firstResult.analysisRange.from)} to ${dateText(firstResult.analysisRange.to)}.` : ""}
+      </MiniStatus>
+      <MiniStatus>
+        Fill Mode: {fillModeLabel(firstResult.fillMode ?? firstResult.params?.fillMode)} · ambiguous candles: {firstResult.ambiguousCandlesCount ?? firstResult.ambiguity?.ambiguousCandlesCount ?? 0} · conservative-adjusted trades: {firstResult.conservativeAdjustedTrades ?? firstResult.ambiguity?.conservativeAdjustedTrades ?? 0} · skipped entries: {firstResult.conservativeSkippedEntries ?? firstResult.ambiguity?.conservativeSkippedEntries ?? 0}
       </MiniStatus>
       <MiniStatus>{sweepHeaderSizingText(firstResult)}</MiniStatus>
       <div className="hubert-lab__table hubert-lab__table--sweep">
@@ -3370,6 +3405,10 @@ function BacktestResult({ onViewTrade, result }) {
         <Metric label="Win rate" value={`${fmt(metrics.winRate)}%`} />
         <Metric label="Max drawdown" value={`${fmt(metrics.maxDrawdown)}%`} />
         <Metric label="Total trades" value={metrics.totalTrades} />
+        <Metric label="Fill mode" value={fillModeLabel(result.fillMode)} />
+        <Metric label="Ambiguous candles" value={result.ambiguousCandlesCount ?? result.ambiguity?.ambiguousCandlesCount ?? 0} />
+        <Metric label="Conservative adjusted" value={result.conservativeAdjustedTrades ?? result.ambiguity?.conservativeAdjustedTrades ?? 0} />
+        <Metric label="Skipped entries" value={result.conservativeSkippedEntries ?? result.ambiguity?.conservativeSkippedEntries ?? 0} />
         <Metric label="Expectancy" value={fmt(metrics.expectancy)} />
         <Metric label="Average trade" value={fmt(metrics.averageTrade)} />
         <Metric label="Best trade" value={fmt(metrics.largestWin)} />
@@ -3383,6 +3422,9 @@ function BacktestResult({ onViewTrade, result }) {
       <MiniStatus>
         Evaluated setups: {result.diagnosticSummary?.totalEvaluatedCandles ?? "--"} candles.
         {result.dataDiagnostics?.providerLimitMessage ? ` ${result.dataDiagnostics.providerLimitMessage}` : ""}
+      </MiniStatus>
+      <MiniStatus>
+        Fill Mode: {fillModeLabel(result.fillMode)}. Ambiguous candles: {result.ambiguousCandlesCount ?? result.ambiguity?.ambiguousCandlesCount ?? 0}. Conservative-adjusted trades: {result.conservativeAdjustedTrades ?? result.ambiguity?.conservativeAdjustedTrades ?? 0}. Skipped entries: {result.conservativeSkippedEntries ?? result.ambiguity?.conservativeSkippedEntries ?? 0}.
       </MiniStatus>
       {metrics.totalTrades === 0 && (
         <MiniStatus tone="neutral">
@@ -3563,7 +3605,7 @@ function TradeTable({ onViewTrade, trades }) {
       <div className="hubert-lab__table">
         <table>
           <thead>
-            <tr><th>Time</th><th>Side</th><th>Sizing</th><th>Capital</th><th>Size</th><th>Lev</th><th>SL dist</th><th>SL loss</th><th>Cap</th><th>PnL</th><th>Chart</th></tr>
+            <tr><th>Time</th><th>Side</th><th>Sizing</th><th>Fill</th><th>Ambiguity</th><th>Capital</th><th>Size</th><th>Lev</th><th>SL dist</th><th>SL loss</th><th>Cap</th><th>PnL</th><th>Chart</th></tr>
           </thead>
           <tbody>
             {visibleTrades.map((trade, index) => (
@@ -3571,6 +3613,10 @@ function TradeTable({ onViewTrade, trades }) {
                 <td>{dateText(trade.entryTime)}</td>
                 <td>{trade.direction ?? trade.side}</td>
                 <td title={trade.sizingClampReason || ""}>{trade.sizingMode ?? "--"}</td>
+                <td>{fillModeLabel(trade.fillMode)}</td>
+                <td title={trade.ambiguityReason || ""}>
+                  {trade.sameCandleSl ? "same-candle SL" : trade.ambiguity ? "ambiguous" : "--"}
+                </td>
                 <td>{fmt(trade.accountCapitalAtEntry)}</td>
                 <td>{fmt(trade.size)}</td>
                 <td>{trade.assumedLeverage ? `${fmt(trade.assumedLeverage, 1)}x` : "--"}</td>

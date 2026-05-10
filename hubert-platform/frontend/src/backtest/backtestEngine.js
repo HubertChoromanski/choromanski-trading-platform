@@ -5,6 +5,7 @@ import { calculateBacktestMetrics } from "./metrics.js";
 
 export const defaultBacktestConfig = {
   commissionPercent: 0.04,
+  fillMode: "legacy",
   maxExposurePercent: 100000,
   maxLeverage: 1000,
   positionSizePercent: 100,
@@ -31,7 +32,28 @@ function applySlippage(price, direction, side, slippagePercent) {
   return adverse ? price + adjustment : price - adjustment;
 }
 
-function closePosition({ candle, equity, exitPrice, position, reason, slippagePercent }) {
+function resolveFillMode(config) {
+  return config.fillMode === "conservative" ? "conservative" : "legacy";
+}
+
+function positionStopTouched(position, candle) {
+  return position.direction === "LONG"
+    ? candle.low <= position.stopLoss
+    : candle.high >= position.stopLoss;
+}
+
+function closePosition({
+  ambiguity = false,
+  ambiguityReason = "",
+  candle,
+  equity,
+  exitPrice,
+  fillMode = "legacy",
+  position,
+  reason,
+  sameCandleSl = false,
+  slippagePercent,
+}) {
   const slippedExit = applySlippage(exitPrice, position.direction, "exit", slippagePercent);
   const grossPnl =
     position.direction === "LONG"
@@ -60,12 +82,16 @@ function closePosition({ candle, equity, exitPrice, position, reason, slippagePe
       marginRequired: position.marginRequired,
       returnPercent: position.notional === 0 ? 0 : (netPnl / position.notional) * 100,
       accountCapitalAtEntry: position.accountCapitalAtEntry,
+      ambiguity,
+      ambiguityReason,
       configuredPositionPercent: position.configuredPositionPercent,
       configuredRiskPercent: position.configuredRiskPercent,
       expectedSlLossAmount: position.expectedSlLossAmount,
+      fillMode,
       maxNotionalCap: position.maxNotionalCap,
       rawNotional: position.rawNotional,
       riskAmount: position.riskAmount,
+      sameCandleSl,
       sizingClampReason: position.sizingClampReason,
       sizingMode: position.sizingMode,
       setupId: position.setupId,
@@ -153,6 +179,7 @@ function openPosition({ candle, config, direction, equity, event }) {
     entryPrice,
     entryTime: event.time,
     expectedSlLossAmount,
+    fillMode: resolveFillMode(config),
     marginRequired: notional / assumedLeverage,
     maxNotionalCap: capped.maxNotionalCap,
     notional,
@@ -183,6 +210,7 @@ export function runBacktest({ rawCandles, settings, backtestConfig = {} }) {
     ...defaultBacktestConfig,
     ...backtestConfig,
   };
+  const fillMode = resolveFillMode(config);
   const sourceCandles = sourceFromSettings(rawCandles, settings);
   const envelope = calculateNadarayaEnvelope(sourceCandles, {
     bandwidth: settings.bandwidth,
@@ -223,10 +251,20 @@ export function runBacktest({ rawCandles, settings, backtestConfig = {} }) {
   const trades = [];
   const equityCurve = [{ time: sourceCandles[0]?.time ?? 0, equity }];
   const lifecycleEvents = [...strategy.events];
+  const ambiguousCandleIndexes = new Set();
+  let conservativeAdjustedTrades = 0;
+  let conservativeSkippedEntries = 0;
+
+  function markAmbiguity(index) {
+    if (fillMode === "conservative") {
+      ambiguousCandleIndexes.add(index);
+    }
+  }
 
   sourceCandles.forEach((candle, index) => {
     const indexedCandle = { ...candle, index };
     const events = eventsByIndex.get(index) ?? [];
+    let conservativeSlExitThisCandle = false;
 
     events.forEach((event) => {
       if (event.type === STRATEGY_EVENT_TYPES.POSITION_EXITED) {
@@ -235,12 +273,16 @@ export function runBacktest({ rawCandles, settings, backtestConfig = {} }) {
             candle: indexedCandle,
             equity,
             exitPrice: event.exitPrice ?? position.stopLoss,
+            fillMode,
             position,
             reason: event.exitReason ?? "EXIT",
             slippagePercent: config.slippagePercent,
           });
           equity = closed.equity;
           trades.push(closed.trade);
+          if (fillMode === "conservative" && (event.exitReason === "SL" || event.tradeExitReason === "SL")) {
+            conservativeSlExitThisCandle = true;
+          }
           updateSetupAudit(position.setupId, {
             exitIndex: index,
             exitTime: candle.time,
@@ -258,23 +300,65 @@ export function runBacktest({ rawCandles, settings, backtestConfig = {} }) {
       }
 
       if (position && position.direction !== event.direction) {
+        const stopTouched = fillMode === "conservative" && positionStopTouched(position, indexedCandle);
+        const exitReason = stopTouched ? "SL" : "REVERSAL";
+        const ambiguityReason = stopTouched
+          ? "SL and reversal trigger were both inside this candle; Conservative mode assumed SL first."
+          : "";
         const closed = closePosition({
+          ambiguity: stopTouched,
+          ambiguityReason,
           candle: indexedCandle,
           equity,
-          exitPrice: event.trigger,
+          exitPrice: stopTouched ? position.stopLoss : event.trigger,
+          fillMode,
           position,
-          reason: "REVERSAL",
+          reason: exitReason,
+          sameCandleSl: stopTouched,
           slippagePercent: config.slippagePercent,
         });
         equity = closed.equity;
         trades.push(closed.trade);
+        if (stopTouched) {
+          conservativeAdjustedTrades += 1;
+          conservativeSlExitThisCandle = true;
+          markAmbiguity(index);
+        }
         updateSetupAudit(position.setupId, {
           exitIndex: index,
           exitTime: candle.time,
-          exitReason: "REVERSAL",
+          exitReason,
           status: SETUP_STATUSES.CLOSED,
         });
         position = null;
+      }
+
+      if (fillMode === "conservative" && conservativeSlExitThisCandle) {
+        conservativeAdjustedTrades += 1;
+        conservativeSkippedEntries += 1;
+        markAmbiguity(index);
+        diagnosticSummary.skippedByFilters = (diagnosticSummary.skippedByFilters ?? 0) + 1;
+        diagnosticEvents.push({
+          ambiguity: true,
+          ambiguityReason: "Same-candle SL exit and new entry trigger; Conservative mode skipped the unsequenced re-entry.",
+          atrReady: true,
+          bandTouchCondition: false,
+          candleTime: candle.time,
+          currentLongSlStreak: null,
+          currentShortSlStreak: null,
+          fillMode,
+          index,
+          limiterBlockingLong: null,
+          limiterBlockingShort: null,
+          positionState: "NEUTRAL",
+          reason: "Conservative fill skipped same-candle re-entry after SL",
+          setupId: event.setupId,
+          setupValid: true,
+          side: event.direction,
+          tradeOpened: false,
+          haConfirmationCondition: true,
+        });
+        return;
       }
 
       if (!position) {
@@ -320,6 +404,33 @@ export function runBacktest({ rawCandles, settings, backtestConfig = {} }) {
           entryTime: candle.time,
           status: SETUP_STATUSES.ENTERED,
         });
+
+        if (fillMode === "conservative" && positionStopTouched(position, indexedCandle)) {
+          const ambiguityReason = "Entry trigger and SL were both inside this candle; Conservative mode assumed SL after entry.";
+          const closed = closePosition({
+            ambiguity: true,
+            ambiguityReason,
+            candle: indexedCandle,
+            equity,
+            exitPrice: position.stopLoss,
+            fillMode,
+            position,
+            reason: "SL",
+            sameCandleSl: true,
+            slippagePercent: config.slippagePercent,
+          });
+          equity = closed.equity;
+          trades.push(closed.trade);
+          conservativeAdjustedTrades += 1;
+          markAmbiguity(index);
+          updateSetupAudit(position.setupId, {
+            exitIndex: index,
+            exitTime: candle.time,
+            exitReason: "SL",
+            status: SETUP_STATUSES.CLOSED,
+          });
+          position = null;
+        }
       }
     });
 
@@ -333,6 +444,7 @@ export function runBacktest({ rawCandles, settings, backtestConfig = {} }) {
       candle: { ...lastCandle, index: sourceCandles.length - 1 },
       equity,
       exitPrice: lastCandle.close,
+      fillMode,
       position,
       reason: "END",
       slippagePercent: config.slippagePercent,
@@ -359,11 +471,21 @@ export function runBacktest({ rawCandles, settings, backtestConfig = {} }) {
   }
 
   return {
+    ambiguity: {
+      ambiguousCandlesCount: ambiguousCandleIndexes.size,
+      conservativeAdjustedTrades,
+      conservativeSkippedEntries,
+      fillMode,
+    },
+    ambiguousCandlesCount: ambiguousCandleIndexes.size,
     config,
+    conservativeAdjustedTrades,
+    conservativeSkippedEntries,
     diagnosticEvents,
     diagnosticSummary,
     equityCurve,
     events: lifecycleEvents,
+    fillMode,
     metrics: calculateBacktestMetrics({
       equityCurve,
       startingBalance: config.startingBalance,
