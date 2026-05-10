@@ -15,7 +15,53 @@ import { fetchCandles } from "./strategy/strategyRunner.js";
 
 const PORT = Number(process.env.PORT || 8787);
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || "";
+const STARTED_AT = new Date().toISOString();
+
+function runtimeDetails(extra = {}) {
+  return {
+    nodeEnv: process.env.NODE_ENV ?? "development",
+    pid: process.pid,
+    pm2: {
+      appInstance: process.env.NODE_APP_INSTANCE ?? null,
+      id: process.env.pm_id ?? null,
+      name: process.env.name ?? process.env.pm_name ?? null,
+      watch: process.env.PM2_WATCH ?? process.env.watch ?? "unknown",
+    },
+    startedAt: STARTED_AT,
+    ...extra,
+  };
+}
+
+function logRuntimeEvent(event, extra = {}) {
+  console.log(`[backend-runtime] ${event} ${JSON.stringify(runtimeDetails(extra))}`);
+}
+
 const store = await createStateStore();
+process.on("unhandledRejection", (reason) => {
+  const message = reason instanceof Error ? reason.stack || reason.message : String(reason);
+  logRuntimeEvent("unhandledRejection", { reason: message });
+  console.warn(`[backend] unhandled rejection: ${message}`);
+});
+process.on("uncaughtException", (error) => {
+  const message = error instanceof Error ? error.stack || error.message : String(error);
+  logRuntimeEvent("uncaughtException", { error: message });
+  console.warn(`[backend] uncaught exception: ${message}`);
+  setTimeout(() => process.exit(1), 50).unref();
+});
+process.on("SIGINT", () => {
+  logRuntimeEvent("SIGINT");
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  logRuntimeEvent("SIGTERM");
+  process.exit(0);
+});
+process.on("beforeExit", (code) => {
+  logRuntimeEvent("beforeExit", { code });
+});
+process.on("exit", (code) => {
+  logRuntimeEvent("exit", { code });
+});
 const bingxClient = createBingxClient();
 await store.setState({
   bingx: {
@@ -24,7 +70,7 @@ await store.setState({
   runtime: {
     mode: process.env.NODE_ENV ?? "development",
     processManager: process.env.pm_id !== undefined ? "pm2" : "node",
-    startedAt: new Date().toISOString(),
+    startedAt: STARTED_AT,
   },
 });
 const botRunner = createBotRunner({ bingxClient, store });
@@ -1395,6 +1441,13 @@ const server = http.createServer(async (request, response) => {
 	      return;
 	    }
 
+	    if (request.method === "POST" && pathname === "/ai/agent/chat") {
+	      const body = await readBody(request);
+	      const result = await aiAgent.chat(body);
+	      sendJson(response, result.statusCode ?? 200, result);
+	      return;
+	    }
+
 	    if (request.method === "GET" && pathname === "/ai/agent/runs") {
 	      sendJson(response, 200, aiAgent.listRuns());
 	      return;
@@ -1412,6 +1465,25 @@ const server = http.createServer(async (request, response) => {
 
 	      if (request.method === "POST" && parts.length === 5 && parts[4] === "cancel") {
 	        const result = await aiAgent.cancelRun(runId);
+	        sendJson(response, result.statusCode ?? 200, result);
+	        return;
+	      }
+
+	      if (request.method === "POST" && parts.length === 5 && parts[4] === "rerun") {
+	        const body = await readBody(request);
+	        const result = await aiAgent.rerunExact(runId, body);
+	        sendJson(response, result.statusCode ?? 200, result);
+	        return;
+	      }
+
+	      if (request.method === "POST" && parts.length === 5 && parts[4] === "restart") {
+	        const result = await aiAgent.restartRun(runId);
+	        sendJson(response, result.statusCode ?? 200, result);
+	        return;
+	      }
+
+	      if (request.method === "GET" && parts.length === 5 && parts[4] === "debug") {
+	        const result = aiAgent.getRunDebug(runId);
 	        sendJson(response, result.statusCode ?? 200, result);
 	        return;
 	      }
@@ -1680,5 +1752,9 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(PORT, () => {
+  logRuntimeEvent("startup", {
+    maxMemoryRestart: process.env.max_memory_restart ?? process.env.PM2_MAX_MEMORY_RESTART ?? "configured-by-pm2",
+    port: PORT,
+  });
   console.log(`Choromański Trading Platform backend listening on http://127.0.0.1:${PORT}`);
 });

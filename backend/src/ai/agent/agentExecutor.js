@@ -73,15 +73,34 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
   }
 
   async function updateProgress(runId, progress, currentStep = "Working") {
-    await runStore.update(runId, {
+    const run = runStore.get(runId);
+    const completed = Number(progress.completed ?? run?.progress?.completed ?? 0);
+    const startedAt = Date.parse(run?.startedAt ?? run?.queuedAt ?? new Date().toISOString());
+    const elapsedSeconds = Math.max(1, (Date.now() - startedAt) / 1000);
+    const combinationsPerSecond = completed / elapsedSeconds;
+    await runStore.heartbeat(runId, {
+      cacheStats: progress.cacheStats ?? run?.cacheStats ?? {},
       currentStep,
-      progress: mergeProgress(runStore.get(runId)?.progress, progress),
+      partialResults: progress.topRows ?? run?.partialResults ?? [],
+      progress: {
+        ...mergeProgress(run?.progress, progress),
+        activeWorkers: progress.activeWorkers,
+        cacheHitRate: progress.cacheStats?.total
+          ? Math.round((progress.cacheStats.hits / progress.cacheStats.total) * 100)
+          : run?.progress?.cacheHitRate,
+        combinationsPerSecond: Number.isFinite(combinationsPerSecond) ? Number(combinationsPerSecond.toFixed(2)) : 0,
+        etaSeconds: progress.remainingSeconds ?? run?.progress?.etaSeconds,
+        stage: currentStep,
+        stageProgress: progress.stageProgress ?? progress.percent ?? run?.progress?.stageProgress,
+        worker: progress.worker ?? run?.progress?.worker,
+      },
     });
   }
 
   async function executeSweep(run) {
     const result = await toolRegistry.runLargeSweepBatched({
       isCancelled: () => isCancelled(run.id),
+      jobId: run.id,
       onProgress: (progress) => updateProgress(run.id, progress, "Running batched sweep"),
       plan: run.plan,
     });
@@ -99,13 +118,19 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
         : "No candidate was strong enough to recommend.",
       robustnessNotes: "The score rewards return quality, drawdown control, profit factor, and enough trades. It does not choose raw PnL only.",
       summary: result.cancelled
-        ? `Sweep cancelled after ${result.testedCombinations} tests.`
-        : `Sweep completed ${result.testedCombinations} tests and ranked the strongest compact results.`,
+        ? `Sweep cancelled after ${result.processedCombinations ?? result.testedCombinations} processed configs.`
+        : `Sweep completed ${result.processedCombinations ?? result.testedCombinations} processed configs and ranked the strongest compact results.`,
       toolsUsed: ["runHistoricalBacktest", "runLargeSweepBatched", "rankSweepResults"],
       warnings: [
         ...(run.warnings ?? []),
         result.requestedCombinations > result.totalCombinations
-          ? `Generated ${result.requestedCombinations} combinations and tested the first ${result.totalCombinations} by safety cap.`
+          ? `Requested ${result.requestedCombinations} combinations and tested ${result.totalCombinations} by safety cap.`
+          : "",
+        result.generatedCombinations > result.totalCombinations
+          ? `Parameter grid had ${result.generatedCombinations} possible combinations; this run planned ${result.totalCombinations}.`
+          : "",
+        result.failedCombinationsCount
+          ? `${result.failedCombinationsCount} combinations failed or timed out and were skipped.`
           : "",
       ].filter(Boolean),
     };
@@ -218,7 +243,7 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
     return runResearchWorkflow({
       isCancelled: () => isCancelled(run.id),
       onProgress: (progress, step) => updateProgress(run.id, progress, step),
-      plan: run.plan,
+      plan: { ...run.plan, jobId: run.id },
       toolRegistry,
     });
   }
@@ -230,6 +255,8 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
     try {
       await runStore.update(runId, {
         currentStep: "Starting",
+        heartbeatAt: new Date().toISOString(),
+        startedAt: initialRun.startedAt ?? new Date().toISOString(),
         status: "running",
       });
       await sleep(0);
@@ -256,7 +283,14 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
       const artifacts = reportArtifacts({ output, plan: latest.plan, run: latest });
       const resultSummary = {
         best: output.best ?? output.rankedResults?.[0] ?? output.rows?.[0] ?? null,
+        cacheStats: output.cacheStats ?? latest.cacheStats ?? {},
+        executedCombinations: output.processedCombinations ?? output.testedCombinations ?? output.totalCombinations ?? latest.progress?.completed ?? 0,
+        failedCombinations: output.failedCombinationsCount ?? 0,
+        generatedCombinations: output.generatedCombinations,
         message: output.summary,
+        plannedCombinations: latest.plan?.plannedCombinations ?? latest.plan?.maxCombinations,
+        requestedCombinations: latest.plan?.requestedCombinations ?? latest.plan?.maxCombinations,
+        requestedRange: latest.plan?.range,
         topRows: (output.rankedResults ?? output.rows ?? []).slice(0, 10),
       };
 

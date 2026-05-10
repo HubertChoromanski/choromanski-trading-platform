@@ -2,22 +2,23 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { runBacktest } from "../backtest/backtestEngine";
 import { fetchHistoricalCandles } from "../api/binance";
 
-const PANEL_TABS = [
-  "Livestream",
-  "Execution",
-  "Crisis",
-  "Indicator",
-  "Strategy Decks",
-  "MM Decks",
-  "Decision",
-  "Battle Decks",
-  "Backtests",
-  "Compare",
-  "Favorites",
-  "System",
-  "Analytics",
-  "Communication",
-  "AI",
+const PANEL_GROUPS = [
+  {
+    label: "Decks",
+    tabs: ["Indicator", "Strategy Decks", "MM Decks", "Battle Decks", "Favorites"],
+  },
+  {
+    label: "Centrum Decyzyjne",
+    tabs: ["Livestream", "Execution", "Decision", "Crisis"],
+  },
+  {
+    label: "Backtest",
+    tabs: ["Backtests", "Compare"],
+  },
+  {
+    label: "System",
+    tabs: ["System", "Analytics", "Communication"],
+  },
 ];
 
 const BACKEND_URL = normalizeBackendUrl(
@@ -408,6 +409,47 @@ function analyzeBacktest(result) {
   return "This deck lost money in the tested window. Review whether losses come from one side or from sideways market behavior.";
 }
 
+function strategyDraftFromAiRow(row, run) {
+  const params = row?.params ?? {};
+  const snapshot = row?.settings ?? row?.provenance?.strategySettings ?? {};
+  return {
+    ...defaultStrategyDeck,
+    allowLong: snapshot.allowLong ?? defaultStrategyDeck.allowLong,
+    allowShort: snapshot.allowShort ?? defaultStrategyDeck.allowShort,
+    atrLength: params.atrLength ?? 14,
+    atrMultiplier: params.atrMultiplier ?? 1.2,
+    atrPositionSizing: params.sizingMode === "fixed-risk",
+    bandwidth: params.bandwidth ?? 8,
+    confirmedEntries: snapshot.confirmedEntries ?? defaultStrategyDeck.confirmedEntries,
+    diagnosticSetups: snapshot.diagnosticSetups ?? defaultStrategyDeck.diagnosticSetups,
+    envelopeMultiplier: params.envelopeMultiplier ?? 3,
+    maxSameSideFailures: params.maxSameSideFailures ?? 2,
+    name: `AI Config ${row?.rank ? `#${row.rank}` : ""}`.trim(),
+    negatedSetups: snapshot.negatedSetups ?? defaultStrategyDeck.negatedSetups,
+    showSl: snapshot.showSl ?? defaultStrategyDeck.showSl,
+    showTrigger: snapshot.showTrigger ?? defaultStrategyDeck.showTrigger,
+    sizingMode: params.sizingMode ?? run?.plan?.sizingMode ?? "position-percent",
+    slLines: snapshot.slLines ?? defaultStrategyDeck.slLines,
+    strategySource: snapshot.strategySource ?? defaultStrategyDeck.strategySource,
+    symbol: row?.symbol ?? snapshot.symbol ?? run?.plan?.symbol ?? "SOLUSDT",
+    timeframe: row?.timeframe ?? snapshot.timeframe ?? run?.plan?.timeframe ?? "15m",
+    triggerLines: snapshot.triggerLines ?? defaultStrategyDeck.triggerLines,
+  };
+}
+
+function mmDeckFromAiRow(row) {
+  const params = row?.params ?? {};
+  const sizingMode = params.sizingMode ?? "position-percent";
+  const sizeValue = Number(params.sizingValue);
+
+  return {
+    ...defaultMmDeck,
+    name: `AI MM ${row?.rank ? `#${row.rank}` : ""}`.trim(),
+    oneSlPercent: sizingMode === "fixed-risk" && Number.isFinite(sizeValue) ? sizeValue : defaultMmDeck.oneSlPercent,
+    positionPercent: sizingMode === "position-percent" && Number.isFinite(sizeValue) ? sizeValue : defaultMmDeck.positionPercent,
+  };
+}
+
 function sampleCurve(curve = [], maxPoints = PREVIEW_CURVE_POINTS) {
   if (curve.length <= maxPoints) return curve;
   const step = (curve.length - 1) / (maxPoints - 1);
@@ -458,6 +500,66 @@ function drawdownPolyline(equityCurve) {
       return `${x.toFixed(2)},${y.toFixed(2)}`;
     })
     .join(" ");
+}
+
+function equityCurveForResult(result) {
+  if (result?.equityCurve?.length) return result.equityCurve;
+  const startingBalance = Number(result?.config?.startingBalance ?? result?.metrics?.endingBalance ?? 10000) - Number(result?.metrics?.netProfit ?? 0);
+  let equity = Number.isFinite(startingBalance) ? startingBalance : 10000;
+  const trades = result?.trades ?? [];
+  const curve = [{
+    equity,
+    time: result?.analysisRange?.from ?? trades[0]?.entryTime ?? 0,
+  }];
+
+  trades.forEach((trade) => {
+    equity += Number(trade.netPnl ?? trade.pnl ?? 0);
+    curve.push({
+      equity,
+      time: trade.exitTime ?? trade.entryTime ?? curve.at(-1)?.time ?? 0,
+    });
+  });
+
+  if (curve.length === 1 && result?.analysisRange?.to) {
+    curve.push({ equity, time: result.analysisRange.to });
+  }
+
+  return curve;
+}
+
+function equityStats(equityCurve = []) {
+  if (!equityCurve.length) {
+    return {
+      end: 0,
+      from: null,
+      highWater: 0,
+      maxDrawdownPercent: 0,
+      min: 0,
+      start: 0,
+      to: null,
+    };
+  }
+
+  let peak = Number(equityCurve[0]?.equity ?? 0);
+  let maxDrawdownPercent = 0;
+  const values = equityCurve.map((point) => Number(point.equity ?? 0));
+
+  equityCurve.forEach((point) => {
+    const equity = Number(point.equity ?? 0);
+    peak = Math.max(peak, equity);
+    const drawdown = peak > 0 ? ((peak - equity) / peak) * 100 : 0;
+    maxDrawdownPercent = Math.max(maxDrawdownPercent, drawdown);
+  });
+
+  return {
+    end: values.at(-1) ?? 0,
+    from: equityCurve[0]?.time ?? null,
+    highWater: Math.max(...values),
+    maxDrawdownPercent,
+    min: Math.min(...values),
+    start: values[0] ?? 0,
+    to: equityCurve.at(-1)?.time ?? null,
+  };
 }
 
 function sideBreakdown(trades = []) {
@@ -1217,6 +1319,60 @@ export default function ControlCenter({
     return named;
   }
 
+  async function openAiBacktest(run, row) {
+    if (!run || !row) throw new Error("Choose an AI result card first.");
+    const provenance = row.provenance ?? {};
+    const from = provenance.from ?? run.plan?.range?.from;
+    const to = provenance.to ?? run.plan?.range?.to;
+    if (!from || !to) {
+      throw new Error("This AI result does not include an exact date range. Re-run the AI analysis with an explicit range.");
+    }
+
+    const exact = await runBrowserBacktest({
+      form: {
+        commissionPercent: provenance.commissionPercent ?? backtestForm.commissionPercent,
+        fillMode: row.params?.fillMode ?? provenance.fillMode ?? run.plan?.fillMode ?? "legacy",
+        from,
+        lastDays: backtestForm.lastDays,
+        provider: provenance.provider ?? run.plan?.provider ?? "binance-futures",
+        slippagePercent: provenance.slippagePercent ?? backtestForm.slippagePercent,
+        startingBalance: provenance.startingBalance ?? run.plan?.startingBalance ?? backtestForm.startingBalance,
+        timeframe: row.timeframe ?? provenance.timeframe ?? run.plan?.timeframe ?? "15m",
+        to,
+      },
+      mmDeck: mmDeckFromAiRow(row),
+      name: `AI exact backtest ${row.rank ? `#${row.rank}` : ""}`.trim(),
+      strategyDeck: strategyDraftFromAiRow(row, run),
+      sweepParams: {
+        aiMetrics: row.metrics ?? {},
+        aiProvenance: provenance,
+        aiRunId: run.id,
+        exactParameters: row.params ?? {},
+      },
+      timeframe: row.timeframe ?? provenance.timeframe ?? run.plan?.timeframe ?? "15m",
+    });
+    const aiProfitFactor = Number(row.metrics?.profitFactor ?? NaN);
+    const openedProfitFactor = Number(exact.metrics?.profitFactor ?? NaN);
+    const aiNetProfit = Number(row.metrics?.netProfit ?? NaN);
+    const openedNetProfit = Number(exact.metrics?.netProfit ?? NaN);
+
+    return {
+      exact,
+      metricDiff: {
+        aiNetProfit,
+        aiProfitFactor,
+        openedNetProfit,
+        openedProfitFactor,
+        profitFactorDelta: Number.isFinite(aiProfitFactor) && Number.isFinite(openedProfitFactor)
+          ? openedProfitFactor - aiProfitFactor
+          : null,
+        netProfitDelta: Number.isFinite(aiNetProfit) && Number.isFinite(openedNetProfit)
+          ? openedNetProfit - aiNetProfit
+          : null,
+      },
+    };
+  }
+
   function buildSweepCombinations({ baseDeck, baseMmDeck, form }) {
     const combinations = [];
     const manualMode = true;
@@ -1563,16 +1719,34 @@ export default function ControlCenter({
       </div>
 
       <div className="hubert-control-tabs">
-        {PANEL_TABS.map((tab) => (
-          <button
-            data-active={panel === tab}
-            key={tab}
-            onClick={() => setActivePanel(tab)}
-            type="button"
-          >
-            {tab}
-          </button>
-        ))}
+        {PANEL_GROUPS.map((group) => {
+          const groupActive = group.tabs.includes(panel);
+          return (
+            <details className="hubert-tab-group" data-active={groupActive} key={group.label} open={groupActive}>
+              <summary>{group.label}</summary>
+              <div>
+                {group.tabs.map((tab) => (
+                  <button
+                    data-active={panel === tab}
+                    key={tab}
+                    onClick={() => setActivePanel(tab)}
+                    type="button"
+                  >
+                    {tab}
+                  </button>
+                ))}
+              </div>
+            </details>
+          );
+        })}
+        <button
+          className="hubert-tab-main"
+          data-active={panel === "AI"}
+          onClick={() => setActivePanel("AI")}
+          type="button"
+        >
+          AI
+        </button>
       </div>
 
       {action.message && (
@@ -1780,7 +1954,11 @@ export default function ControlCenter({
 	        <AiAgentPanel
 	          apiRequest={apiFetch}
 	          aiStatus={aiStatus}
+	          onBacktestResult={onBacktestResult}
+	          onOpenAiBacktest={openAiBacktest}
 	          runAction={runAction}
+	          setActivePanel={setActivePanel}
+	          setStrategyForm={setStrategyForm}
 	        />
 	      )}
 
@@ -2994,18 +3172,20 @@ function CommunicationPanel({ communication, onSave, onTest, setCommunication })
   );
 }
 
-function AiAgentPanel({ aiStatus, apiRequest, runAction }) {
+function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest, runAction, setActivePanel, setStrategyForm }) {
   const [prompt, setPrompt] = useState("Run a 50 combination sweep for SOLUSDT 15m over the last 31 days and rank robust settings.");
+  const [chatMessages, setChatMessages] = useState([]);
   const [options, setOptions] = useState({
     allowLongRunningJobs: false,
     includeCodeContext: false,
     includeLiveData: true,
-    maxCombinations: 1000,
+    maxCombinations: 100,
     objective: "robustness-adjusted return",
   });
   const [runs, setRuns] = useState([]);
   const [activeRunId, setActiveRunId] = useState("");
   const [manualResult, setManualResult] = useState(null);
+  const [queueStatus, setQueueStatus] = useState(null);
   const activeRun = runs.find((run) => run.id === activeRunId) ?? runs[0] ?? null;
   const running = ["queued", "running"].includes(activeRun?.status);
   const examples = [
@@ -3020,6 +3200,7 @@ function AiAgentPanel({ aiStatus, apiRequest, runAction }) {
   async function loadRuns() {
     const payload = await apiRequest("/ai/agent/runs");
     setRuns(payload.runs ?? []);
+    setQueueStatus(payload.queue ?? null);
     if (!activeRunId && payload.runs?.[0]) setActiveRunId(payload.runs[0].id);
     return payload;
   }
@@ -3053,6 +3234,15 @@ function AiAgentPanel({ aiStatus, apiRequest, runAction }) {
     });
   }
 
+  async function restartRun(runId) {
+    return runAction("ai-agent-restart", "Restart agent run", async () => {
+      const payload = await apiRequest(`/ai/agent/runs/${encodeURIComponent(runId)}/restart`, { method: "POST" });
+      await loadRuns();
+      if (payload.run?.id) setActiveRunId(payload.run.id);
+      return payload;
+    });
+  }
+
   async function exportRun(runId, format = "md") {
     return runAction(`ai-agent-export-${format}`, `Export ${format.toUpperCase()}`, async () => {
       const payload = await apiRequest(`/ai/agent/runs/${encodeURIComponent(runId)}/export`, {
@@ -3060,6 +3250,113 @@ function AiAgentPanel({ aiStatus, apiRequest, runAction }) {
         method: "POST",
       });
       downloadText(payload.fileName, payload.content, payload.mime);
+    });
+  }
+
+  function rowStrategyDraft(row) {
+    const params = row?.params ?? {};
+    return {
+      allowLong: true,
+      allowShort: true,
+      atrLength: params.atrLength ?? 14,
+      atrMultiplier: params.atrMultiplier ?? 1.2,
+      atrPositionSizing: params.sizingMode === "fixed-risk",
+      bandwidth: params.bandwidth ?? 8,
+      confirmedEntries: true,
+      diagnosticSetups: false,
+      envelopeMultiplier: params.envelopeMultiplier ?? 3,
+      maxSameSideFailures: params.maxSameSideFailures ?? 2,
+      name: `AI Draft ${row?.rank ? `#${row.rank}` : new Date().toLocaleTimeString()}`,
+      negatedSetups: false,
+      sizingMode: params.sizingMode ?? "position-percent",
+      slLines: true,
+      strategySource: "pine-ha",
+      symbol: row?.symbol ?? activeRun?.plan?.symbol ?? "SOLUSDT",
+      timeframe: row?.timeframe ?? activeRun?.plan?.timeframe ?? "15m",
+      triggerLines: true,
+    };
+  }
+
+  async function askFollowUp(message = prompt, row = null) {
+    return runAction("ai-agent-follow-up", "Ask copilot", async () => {
+      if (!message.trim()) throw new Error("Ask a follow-up first.");
+      const userMessage = { role: "user", text: message.trim(), time: new Date().toISOString() };
+      setChatMessages((current) => [...current, userMessage]);
+      const payload = await apiRequest("/ai/agent/chat", {
+        body: {
+          message: message.trim(),
+          rowId: row?.id,
+          runId: activeRun?.id,
+        },
+        method: "POST",
+      });
+      setChatMessages((current) => [
+        ...current,
+        {
+          evidence: payload.response?.evidence ?? [],
+          role: "assistant",
+          text: payload.response?.answer ?? "No answer came back.",
+          time: new Date().toISOString(),
+        },
+      ]);
+      await loadRuns();
+      return payload;
+    });
+  }
+
+  async function rerunExact(row, { openPanel = false } = {}) {
+    return runAction("ai-agent-rerun-exact", "Re-run exact config", async () => {
+      if (!activeRun?.id) throw new Error("Open an AI run first.");
+      if (openPanel) {
+        const opened = await onOpenAiBacktest(activeRun, row);
+        setActivePanel?.("Backtests");
+        setChatMessages((current) => [
+          ...current,
+          {
+            evidence: [
+              `AI PF: ${opened.metricDiff?.aiProfitFactor ?? "n/a"}`,
+              `Opened PF: ${opened.metricDiff?.openedProfitFactor ?? "n/a"}`,
+              `PF delta: ${opened.metricDiff?.profitFactorDelta ?? "n/a"}`,
+            ],
+            role: "assistant",
+            text: "Opened the exact AI config as a chart-linked backtest. Compare the metric parity before trusting the recommendation.",
+            time: new Date().toISOString(),
+          },
+        ]);
+        return opened;
+      }
+      const payload = await apiRequest(`/ai/agent/runs/${encodeURIComponent(activeRun.id)}/rerun`, {
+        body: { rowId: row?.id },
+        method: "POST",
+      });
+      const rawRange = payload.result?.range ?? (payload.provenance ? {
+        from: payload.provenance.from,
+        to: payload.provenance.to,
+      } : null);
+      const analysisRange = rawRange ? {
+        from: typeof rawRange.from === "number" ? rawRange.from : Math.floor(new Date(rawRange.from).getTime() / 1000),
+        to: typeof rawRange.to === "number" ? rawRange.to : Math.floor(new Date(rawRange.to).getTime() / 1000),
+      } : null;
+      const result = {
+        ...payload.result,
+        analysisRange,
+        name: `AI exact rerun ${row?.rank ? `#${row.rank}` : ""}`.trim(),
+      };
+      setChatMessages((current) => [
+        ...current,
+        {
+          evidence: [
+            `Cache: ${payload.cacheHit ? "hit" : "fresh run"}`,
+            `AI PF: ${payload.metricDiff?.aiProfitFactor ?? "n/a"}`,
+            `Rerun PF: ${payload.metricDiff?.rerunProfitFactor ?? "n/a"}`,
+            `Candles match: ${payload.metricDiff?.sameCandles ? "yes" : "no"}`,
+          ],
+          role: "assistant",
+          text: "Exact config re-run completed. Check the metric diff before trusting a recommendation.",
+          time: new Date().toISOString(),
+        },
+      ]);
+      return payload;
     });
   }
 
@@ -3100,7 +3397,7 @@ function AiAgentPanel({ aiStatus, apiRequest, runAction }) {
 
   return (
     <section className="hubert-lab__section">
-      <div className="hubert-lab__subhead"><strong>AI Agent</strong><span>analysis only</span></div>
+      <div className="hubert-lab__subhead"><strong>AI Copilot Workspace</strong><span>analysis only</span></div>
       <MiniStatus tone={aiStatus?.connected ? "good" : aiStatus?.lastError ? "bad" : "neutral"}>
         {aiStatus?.message ?? "AI Agent runs through the backend. It cannot place orders."}
       </MiniStatus>
@@ -3110,14 +3407,45 @@ function AiAgentPanel({ aiStatus, apiRequest, runAction }) {
         <Metric label="Trading" value="Blocked for AI" />
       </div>
 
-      <label>
-        <span>Ask the agent to analyze, optimize, compare, report, or diagnose</span>
-        <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} />
-      </label>
-      <div className="hubert-lab__actions">
-        <button type="button" onClick={startRun}>Start Agent</button>
-        <button type="button" onClick={() => runAction("ai-agent-refresh", "Refresh agent runs", loadRuns)}>Refresh Runs</button>
-        {running && <button type="button" onClick={() => cancelRun(activeRun.id)}>Cancel Run</button>}
+      <div className="hubert-copilot-grid">
+        <div>
+          <div className="hubert-chat-log">
+            {chatMessages.length === 0 ? (
+              <MiniStatus>Ask a research question, then follow up with “why config #2?” or “would this survive Conservative fill?”.</MiniStatus>
+            ) : (
+              chatMessages.slice(-10).map((message, index) => (
+                <div className="hubert-chat-message" data-role={message.role} key={`${message.time}-${index}`}>
+                  <strong>{message.role === "user" ? "You" : "Copilot"}</strong>
+                  <span>{message.text}</span>
+                  {message.evidence?.length > 0 && <small>{message.evidence.join(" · ")}</small>}
+                </div>
+              ))
+            )}
+          </div>
+          <label>
+            <span>Command or follow-up</span>
+            <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} />
+          </label>
+          <div className="hubert-lab__actions">
+            <button type="button" onClick={startRun}>Run Research</button>
+            <button type="button" onClick={() => askFollowUp(prompt)}>Ask Follow-up</button>
+            <button type="button" onClick={() => runAction("ai-agent-refresh", "Refresh agent runs", loadRuns)}>Refresh</button>
+            {running && <button type="button" onClick={() => cancelRun(activeRun.id)}>Cancel</button>}
+            {["interrupted", "stalled", "cancelled", "failed"].includes(activeRun?.status) && (
+              <button type="button" onClick={() => restartRun(activeRun.id)}>Restart Same Prompt</button>
+            )}
+          </div>
+        </div>
+        <aside className="hubert-live-card">
+          <div className="hubert-lab__subhead"><strong>Run Context</strong><span>{activeRun?.id?.slice(-6) ?? "none"}</span></div>
+          <ReadOnly label="Symbol" value={activeRun?.plan?.symbol ?? "SOLUSDT"} />
+          <ReadOnly label="Timeframe" value={(activeRun?.plan?.timeframes ?? [activeRun?.plan?.timeframe ?? "15m"]).join(", ")} />
+          <ReadOnly label="Provider" value={activeRun?.plan?.provider ?? "binance-futures"} />
+          <ReadOnly label="Range" value={activeRun?.plan?.range ? `${dateText(activeRun.plan.range.from)} → ${dateText(activeRun.plan.range.to)}` : "Latest"} />
+          <ReadOnly label="Capital" value={`${fmt(activeRun?.plan?.startingBalance ?? 10000)} USDT`} />
+          <ReadOnly label="Sizing" value={activeRun?.plan?.sizingMode ?? "position-percent"} />
+          <ReadOnly label="Fill" value={activeRun?.plan?.fillMode ?? "legacy"} />
+        </aside>
       </div>
 
       <details className="hubert-advanced">
@@ -3151,33 +3479,70 @@ function AiAgentPanel({ aiStatus, apiRequest, runAction }) {
           </div>
           <div className="hubert-lab__metrics">
             <Metric label="Progress" value={`${activeRun.progress?.percent ?? 0}%`} />
+            <Metric label="Stage" value={`${activeRun.progress?.stageProgress ?? activeRun.progress?.percent ?? 0}%`} />
             <Metric label="Completed" value={`${activeRun.progress?.completed ?? 0}/${activeRun.progress?.total ?? 0}`} />
+            <Metric label="Requested" value={activeRun.plan?.requestedCombinations ?? activeRun.plan?.maxCombinations ?? "--"} />
+            <Metric label="Planned" value={activeRun.plan?.plannedCombinations ?? activeRun.plan?.maxCombinations ?? "--"} />
+            <Metric label="Executed" value={activeRun.resultSummary?.executedCombinations ?? activeRun.progress?.completed ?? 0} />
+            <Metric label="Speed" value={`${fmt(activeRun.progress?.combinationsPerSecond ?? 0, 2)}/s`} />
+            <Metric label="ETA" value={activeRun.progress?.etaSeconds ? `${activeRun.progress.etaSeconds}s` : "--"} />
+            <Metric label="Cache hits" value={`${activeRun.cacheStats?.hits ?? activeRun.resultSummary?.cacheStats?.hits ?? 0}/${activeRun.cacheStats?.total ?? activeRun.resultSummary?.cacheStats?.total ?? 0}`} />
+            <Metric label="Workers" value={`${queueStatus?.activeWorkerCount ?? activeRun.progress?.activeWorkers ?? 0}/${queueStatus?.concurrency ?? "--"}`} />
+            <Metric label="Heartbeat" value={activeRun.heartbeatAt ? ageText(activeRun.heartbeatAt) : "--"} />
+            <Metric label="Last index" value={activeRun.progress?.worker?.lastCompletedIndex ?? "--"} />
+            <Metric label="Worker message" value={activeRun.progress?.worker?.lastMessage ?? "--"} />
+            <Metric label="Worker error" value={activeRun.progress?.worker?.lastError || "--"} />
             <Metric label="Intent" value={activeRun.parsedIntent ?? "analysis"} />
             <Metric label="Started" value={dateText(activeRun.startedAt)} />
           </div>
+          {activeRun.plan?.requestedCombinations !== activeRun.plan?.plannedCombinations && (
+            <MiniStatus tone="warn">
+              Requested {activeRun.plan?.requestedCombinations}, running {activeRun.plan?.plannedCombinations} after safety planning.
+            </MiniStatus>
+          )}
+          {activeRun.partialResults?.length > 0 && (
+            <MiniStatus>
+              Early best: rank {activeRun.partialResults[0]?.rank ?? 1} · score {fmt(activeRun.partialResults[0]?.score)} · {activeRun.partialResults[0]?.research?.label ?? "exploring"}
+            </MiniStatus>
+          )}
           {activeRun.warnings?.length > 0 && <MiniStatus tone="warn">{activeRun.warnings[0]}</MiniStatus>}
           {activeRun.errors?.length > 0 && <MiniStatus tone="bad">{activeRun.errors[0]}</MiniStatus>}
           {activeRun.resultSummary && (
             <div className="hubert-agent-result">
               <strong>{activeRun.resultSummary.message}</strong>
               {activeRun.resultSummary.topRows?.length > 0 && (
-                <div className="hubert-table-wrap">
-                  <table className="hubert-table">
-                    <thead><tr><th>Rank</th><th>Score</th><th>Net</th><th>PF</th><th>Win</th><th>Trades</th><th>Research</th></tr></thead>
-                    <tbody>
-                      {activeRun.resultSummary.topRows.slice(0, 6).map((row, index) => (
-                        <tr key={`${row.id ?? row.timeframe ?? index}`}>
-                          <td>{row.rank ?? index + 1}</td>
-                          <td>{fmt(row.score)}</td>
-                          <td>{fmt(row.metrics?.netProfit ?? row.netProfit)} USDT</td>
-                          <td>{fmt(row.metrics?.profitFactor ?? row.profitFactor)}</td>
-                          <td>{fmt(row.metrics?.winRate ?? row.winRate)}%</td>
-                          <td>{row.metrics?.totalTrades ?? row.totalTrades ?? 0}</td>
-                          <td>{row.research?.label ?? row.timeframe ?? row.params?.sizingMode ?? "result"}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                <div className="hubert-result-card-grid">
+                  {activeRun.resultSummary.topRows.slice(0, 5).map((row, index) => (
+                    <article className="hubert-live-card" key={`${row.id ?? row.timeframe ?? index}`}>
+                      <div className="hubert-lab__subhead"><strong>Config #{row.rank ?? index + 1}</strong><span>{row.research?.label ?? row.params?.sizingMode ?? "result"}</span></div>
+                      <div className="hubert-lab__metrics">
+                        <Metric label="Robustness" value={fmt(row.research?.robustnessScore ?? row.score)} />
+                        <Metric label="Net" value={`${fmt(row.metrics?.netProfit ?? row.netProfit)} USDT`} />
+                        <Metric label="PF" value={fmt(row.metrics?.profitFactor ?? row.profitFactor)} />
+                        <Metric label="Trades" value={row.metrics?.totalTrades ?? row.totalTrades ?? 0} />
+                      </div>
+                      <MiniStatus>
+                        {row.symbol ?? activeRun.plan?.symbol} · {row.timeframe ?? activeRun.plan?.timeframe} · {row.params ? `BW ${row.params.bandwidth}, NWE ${row.params.envelopeMultiplier}, ATR ${row.params.atrLength}/${row.params.atrMultiplier}` : "exact settings stored"}
+                      </MiniStatus>
+                      <MiniStatus>
+                        {dateText(row.provenance?.from ?? activeRun.plan?.range?.from)} → {dateText(row.provenance?.to ?? activeRun.plan?.range?.to)} · capital {fmt(row.provenance?.startingBalance ?? activeRun.plan?.startingBalance ?? 10000)} USDT · fill {row.params?.fillMode ?? activeRun.plan?.fillMode ?? "legacy"} · sizing {row.params?.sizingMode ?? activeRun.plan?.sizingMode ?? "position-percent"} · executed {activeRun.resultSummary?.executedCombinations ?? "--"} / planned {activeRun.resultSummary?.plannedCombinations ?? activeRun.plan?.plannedCombinations ?? "--"}
+                      </MiniStatus>
+                      <details className="hubert-advanced">
+                        <summary>Provenance</summary>
+                        <pre className="hubert-ai-json">{JSON.stringify(row.provenance ?? row.params ?? {}, null, 2).slice(0, 5000)}</pre>
+                      </details>
+                      <div className="hubert-lab__actions">
+                        <button type="button" onClick={() => rerunExact(row, { openPanel: true })}>Open Backtest</button>
+                        <button type="button" onClick={() => rerunExact(row, { openPanel: true })}>View on Chart</button>
+                        <button type="button" onClick={() => rerunExact(row)}>Re-run exact</button>
+                        <button type="button" onClick={() => {
+                          setStrategyForm?.(rowStrategyDraft(row));
+                          setActivePanel?.("Strategy Decks");
+                        }}>Open Strategy Draft</button>
+                        <button type="button" onClick={() => askFollowUp(`Explain config #${row.rank ?? index + 1}`, row)}>Ask about this</button>
+                      </div>
+                    </article>
+                  ))}
                 </div>
               )}
             </div>
@@ -3588,8 +3953,10 @@ function DeckList({ decks, deleteLabel = "Delete", extra, onDelete, onDuplicate,
 
 function BacktestResult({ onViewTrade, result }) {
   const audit = useMemo(() => sizingAudit(result?.trades ?? []), [result?.trades]);
-  const equityPoints = useMemo(() => equityPolyline(result?.equityCurve), [result?.equityCurve]);
-  const drawdownPoints = useMemo(() => drawdownPolyline(result?.equityCurve), [result?.equityCurve]);
+  const displayEquityCurve = useMemo(() => equityCurveForResult(result), [result]);
+  const curveStats = useMemo(() => equityStats(displayEquityCurve), [displayEquityCurve]);
+  const equityPoints = useMemo(() => equityPolyline(displayEquityCurve), [displayEquityCurve]);
+  const drawdownPoints = useMemo(() => drawdownPolyline(displayEquityCurve), [displayEquityCurve]);
   const hasEndTrade = Boolean(result?.trades?.some((trade) => trade.exitReason === "END" || trade.reason === "END"));
 
   if (!result) return <MiniStatus>Run a backtest to see equity, trades, and analysis.</MiniStatus>;
@@ -3612,6 +3979,14 @@ function BacktestResult({ onViewTrade, result }) {
         <Metric label="Best trade" value={fmt(metrics.largestWin)} />
         <Metric label="Worst trade" value={fmt(metrics.largestLoss)} />
       </div>
+      <div className="hubert-lab__metrics">
+        <Metric label="Starting capital" value={`${fmt(curveStats.start)} USDT`} />
+        <Metric label="Ending capital" value={`${fmt(curveStats.end)} USDT`} />
+        <Metric label="High-water mark" value={`${fmt(curveStats.highWater)} USDT`} />
+        <Metric label="Equity low" value={`${fmt(curveStats.min)} USDT`} />
+        <Metric label="Curve from" value={dateText(curveStats.from)} />
+        <Metric label="Curve to" value={dateText(curveStats.to)} />
+      </div>
       <MiniStatus>
         {result.strategyDeckName ?? "Strategy"} · {result.timeframe ?? "selected timeframe"} · provider {result.provider ?? result.dataDiagnostics?.provider ?? "binance-futures"} ·
         test candles {result.candlesUsed ?? result.sourceCandles?.length ?? "--"} · chart rendered {result.chartCandlesRendered ?? "--"}
@@ -3631,8 +4006,21 @@ function BacktestResult({ onViewTrade, result }) {
           valid SHORT setups: {result.diagnosticSummary?.validShortSetups ?? 0}.
         </MiniStatus>
       )}
-      <SingleCurveChart title="Equity Curve" caption="Higher line means higher account equity. Preview capped for speed." points={equityPoints} />
-      <SingleCurveChart title="Drawdown Curve" caption="Higher red line means deeper drawdown from the last equity peak. Preview capped for speed." points={drawdownPoints} drawdown />
+      <SingleCurveChart
+        title="Equity Curve"
+        caption={`Account equity over time. Start ${fmt(curveStats.start)} USDT, final ${fmt(curveStats.end)} USDT, high-water ${fmt(curveStats.highWater)} USDT.`}
+        footer={`${dateText(curveStats.from)} → ${dateText(curveStats.to)} · y-axis ${fmt(curveStats.min)} to ${fmt(curveStats.highWater)} USDT`}
+        yLabel="Account equity (USDT)"
+        points={equityPoints}
+      />
+      <SingleCurveChart
+        title="Drawdown Curve"
+        caption={`Drawdown from high-water mark. Max preview drawdown ${fmt(curveStats.maxDrawdownPercent)}%.`}
+        footer={`${dateText(curveStats.from)} → ${dateText(curveStats.to)} · y-axis 0% to ${fmt(curveStats.maxDrawdownPercent)}%`}
+        yLabel="Drawdown (%)"
+        points={drawdownPoints}
+        drawdown
+      />
       <MiniStatus>{analyzeBacktest(result)}</MiniStatus>
       {hasEndTrade && (
         <MiniStatus>END means the trade was still open when the selected test range ended. It is not a live open position.</MiniStatus>
@@ -3745,14 +4133,19 @@ function BacktestDebugSection({ result }) {
   );
 }
 
-function SingleCurveChart({ caption, drawdown = false, points, title }) {
+function SingleCurveChart({ caption, drawdown = false, footer = "", points, title, yLabel = "Value" }) {
   return (
     <div className="hubert-chart-box">
       <strong>{title}</strong>
       <span>{caption}</span>
+      <div className="hubert-chart-axis">
+        <span>Y: {yLabel}</span>
+        <span>X: date/time</span>
+      </div>
       <svg className={`hubert-lab__equity${drawdown ? " hubert-lab__equity--drawdown" : ""}`} viewBox="0 0 100 100" preserveAspectRatio="none">
         <polyline points={points} />
       </svg>
+      {footer && <span>{footer}</span>}
     </div>
   );
 }

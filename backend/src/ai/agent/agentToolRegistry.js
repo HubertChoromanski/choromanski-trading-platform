@@ -1,3 +1,5 @@
+import { Worker } from "node:worker_threads";
+
 function parseList(value, fallback, { integer = false, positive = false } = {}) {
   const source = Array.isArray(value) ? value : String(value ?? "").split(",");
   const parsed = source
@@ -22,6 +24,112 @@ function scoreResult(metrics = {}, startingBalance = 10000) {
 
 function sideValue(result, side) {
   return side === "LONG" ? result.longResult ?? 0 : result.shortResult ?? 0;
+}
+
+function cacheKey(value) {
+  return JSON.stringify(value, Object.keys(value).sort());
+}
+
+function clone(value) {
+  return value ? structuredClone(value) : value;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function compactError(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function withTimeout(promise, timeoutMs, label) {
+  let timeoutId;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
+function memorySnapshot() {
+  const memory = process.memoryUsage();
+  return {
+    heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024),
+    rssMb: Math.round(memory.rss / 1024 / 1024),
+  };
+}
+
+function runPreparedBacktestInWorker(prepared, { label, timeoutMs }) {
+  return new Promise((resolve, reject) => {
+    const workerStartedAt = new Date().toISOString();
+    const worker = new Worker(new URL("./agentBacktestWorker.js", import.meta.url), {
+      workerData: {
+        label,
+        prepared,
+      },
+    });
+    let settled = false;
+    let timeoutId;
+
+    function settle(callback) {
+      if (settled) return;
+      settled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      callback();
+    }
+
+    timeoutId = setTimeout(() => {
+      settle(() => {
+        worker.terminate().catch(() => {});
+        reject(new Error(`${label} worker timed out after ${timeoutMs}ms`));
+      });
+    }, timeoutMs);
+
+    worker.once("message", (message) => {
+      settle(() => {
+        if (message?.ok) {
+          resolve({
+            ...message.result,
+            workerDiagnostics: {
+              ...(message.diagnostics ?? {}),
+              finishedAt: new Date().toISOString(),
+              startedAt: workerStartedAt,
+              timeout: false,
+            },
+          });
+          return;
+        }
+
+        const error = new Error(message?.error?.message ?? `${label} worker failed`);
+        error.stack = message?.error?.stack || error.stack;
+        reject(error);
+      });
+    });
+
+    worker.once("error", (error) => {
+      settle(() => {
+        reject(error);
+      });
+    });
+
+    worker.once("exit", (code) => {
+      if (settled) return;
+      settle(() => {
+        if (code === 0) {
+          reject(new Error(`${label} worker exited without a result`));
+        } else {
+          reject(new Error(`${label} worker exited with code ${code}`));
+        }
+      });
+    });
+  });
 }
 
 export function buildSweepCombinations(plan) {
@@ -60,83 +168,388 @@ export function buildSweepCombinations(plan) {
 }
 
 export function createAgentToolRegistry({ tools }) {
-  async function runBacktest(plan, overrides = {}) {
+  const backtestCache = new Map();
+  const maxCacheEntries = Number(process.env.AI_AGENT_BACKTEST_CACHE_SIZE ?? 2500);
+  const concurrency = Math.max(1, Math.min(Number(process.env.AI_AGENT_SWEEP_CONCURRENCY ?? process.env.AI_AGENT_CONCURRENCY ?? 3), 6));
+  const batchSize = Math.max(1, Math.min(Number(process.env.AI_AGENT_BATCH_SIZE ?? 10), 25));
+  const combinationTimeoutMs = Math.max(5000, Number(process.env.AI_AGENT_COMBINATION_TIMEOUT_MS ?? 45000));
+  const batchTimeoutMs = Math.max(combinationTimeoutMs, Number(process.env.AI_AGENT_BATCH_TIMEOUT_MS ?? combinationTimeoutMs * Math.max(2, batchSize)));
+  const isolateBacktests = process.env.AI_AGENT_ISOLATE_BACKTESTS !== "false";
+
+  async function runBacktest(plan, overrides = {}, meta = {}) {
     const input = {
       fillMode: plan.fillMode ?? "legacy",
       from: plan.range?.from,
       maxCombinations: plan.maxCombinations,
       provider: plan.provider ?? "binance-futures",
       sizingMode: plan.sizingMode ?? "position-percent",
+      startingBalance: Number(plan.startingBalance ?? 10000),
       symbol: plan.symbol ?? "SOLUSDT",
       timeframe: overrides.timeframe ?? plan.timeframe ?? "15m",
       to: plan.range?.to,
       ...overrides,
     };
+    const key = cacheKey(input);
 
-    return tools.runHistoricalBacktest(input);
+    if (backtestCache.has(key)) {
+      return {
+        ...clone(backtestCache.get(key)),
+        cacheHit: true,
+        workerDiagnostics: {
+          cacheHit: true,
+          isolated: isolateBacktests,
+        },
+      };
+    }
+
+    const result = isolateBacktests && typeof tools.prepareHistoricalBacktest === "function"
+      ? await runPreparedBacktestInWorker(
+        await tools.prepareHistoricalBacktest(input),
+        {
+          label: `AI combination ${meta.index ?? "?"}/${meta.total ?? "?"}`,
+          timeoutMs: meta.timeoutMs ?? combinationTimeoutMs,
+        },
+      )
+      : await tools.runHistoricalBacktest(input);
+    const enriched = {
+      ...result,
+      cacheHit: false,
+      workerDiagnostics: {
+        ...(result.workerDiagnostics ?? {}),
+        isolated: isolateBacktests && typeof tools.prepareHistoricalBacktest === "function",
+      },
+      provenance: {
+        candlesUsed: result.candlesUsed,
+        commissionPercent: input.commissionPercent ?? 0.04,
+        fillMode: input.fillMode ?? "legacy",
+        from: input.from,
+        mmDeckId: input.mmDeckId ?? null,
+        pfFormula: "grossProfit / abs(grossLoss)",
+        provider: input.provider ?? "binance-futures",
+        sizingMode: input.sizingMode ?? "position-percent",
+        slippagePercent: input.slippagePercent ?? 0,
+        startingBalance: input.startingBalance ?? 10000,
+        strategyDeckId: input.strategyDeckId ?? null,
+        symbol: input.symbol ?? "SOLUSDT",
+        timeframe: input.timeframe ?? "15m",
+        to: input.to,
+      },
+    };
+
+    backtestCache.set(key, clone(enriched));
+    if (backtestCache.size > maxCacheEntries) {
+      backtestCache.delete(backtestCache.keys().next().value);
+    }
+
+    return enriched;
   }
 
-  async function runLargeSweepBatched({ isCancelled, onProgress, plan }) {
+  async function runLargeSweepBatched({ isCancelled, jobId = "agent-job", onProgress, plan }) {
     const allCombinations = buildSweepCombinations(plan);
     const combinations = allCombinations.slice(0, Number(plan.maxCombinations ?? 1000));
     const total = combinations.length;
     const rows = [];
     const startingBalance = Number(plan.startingBalance ?? 10000);
     const startedAt = Date.now();
+    const cacheStats = { hits: 0, misses: 0, total: 0 };
+    const failedCombinations = [];
 
-    for (const [index, combo] of combinations.entries()) {
-      if (await isCancelled()) {
-        return {
-          cancelled: true,
-          rankedResults: rankSweepResults(rows),
-          requestedCombinations: allCombinations.length,
-          testedCombinations: rows.length,
-          totalCombinations: total,
-        };
-      }
+    let completed = 0;
+    let activePromiseCount = 0;
+    let lastCompletedIndex = 0;
+    let lastCompletedConfig = null;
+    let lastError = "";
+    let progressWrite = Promise.resolve();
 
-      const sizingMode = plan.sizingMode ?? "position-percent";
-      const result = await runBacktest(plan, {
-        ...combo,
-        positionPercent: sizingMode === "position-percent" ? combo.sizingValue : undefined,
-        riskPercent: sizingMode === "fixed-risk" ? combo.sizingValue : undefined,
-        sizingMode,
-      });
-      const row = {
-        candlesUsed: result.candlesUsed,
-        fillMode: result.fillMode ?? plan.fillMode ?? "legacy",
-        id: `agent-sweep-row-${Date.now()}-${index}`,
-        longResult: sideValue(result, "LONG"),
-        metrics: result.metrics ?? {},
-        params: {
-          ...combo,
-          fillMode: result.fillMode ?? plan.fillMode ?? "legacy",
-          sizingMode,
-        },
-        score: scoreResult(result.metrics, startingBalance),
-        shortResult: sideValue(result, "SHORT"),
-        symbol: result.symbol,
-        timeframe: result.timeframe,
+    function logWorker(message, extra = {}) {
+      const compact = {
+        activePromiseCount,
+        completed,
+        jobId,
+        memory: memorySnapshot(),
+        total,
+        ...extra,
       };
-      rows.push(row);
+      console.info(`[ai-agent-worker] ${message} ${JSON.stringify(compact)}`);
+    }
 
-      if (index % 5 === 0 || index + 1 === total) {
-        const elapsedSeconds = Math.max(1, (Date.now() - startedAt) / 1000);
-        const rate = (index + 1) / elapsedSeconds;
-        await onProgress({
-          completed: index + 1,
-          percent: Math.round(((index + 1) / total) * 100),
-          remainingSeconds: Math.round((total - index - 1) / Math.max(rate, 0.1)),
-          total,
+    async function writeProgress(worker = {}) {
+      const elapsedSeconds = Math.max(1, (Date.now() - startedAt) / 1000);
+      const rate = completed / elapsedSeconds;
+      const payload = {
+        activeWorkers: activePromiseCount,
+        cacheStats: { ...cacheStats },
+        completed,
+        percent: Math.round((completed / Math.max(1, total)) * 100),
+        remainingSeconds: Math.round((total - completed) / Math.max(rate, 0.1)),
+        topRows: rankSweepResults(rows).slice(0, 5),
+        total,
+        worker: {
+          activePromiseCount,
+          failedCombinations: failedCombinations.length,
+          lastCompletedConfig,
+          lastCompletedIndex,
+          lastError,
+          memory: memorySnapshot(),
+          ...worker,
+        },
+      };
+      progressWrite = progressWrite
+        .then(() => onProgress(payload))
+        .catch((error) => {
+          console.warn(`[ai-agent-worker] progress write failed for ${jobId}: ${compactError(error)}`);
         });
-        await new Promise((resolve) => setTimeout(resolve, 0));
+      return progressWrite;
+    }
+
+    async function processCombination(combo, index, batchInfo, workerIndex = 0) {
+      const combinationStartedAt = Date.now();
+      const oneBasedIndex = index + 1;
+      const sizingMode = plan.sizingMode ?? "position-percent";
+      const workerId = `${jobId}:batch-${batchInfo.batchNumber}:worker-${workerIndex}`;
+      activePromiseCount += 1;
+      logWorker("combination:start", {
+        batch: batchInfo.batchNumber,
+        combo,
+        index: oneBasedIndex,
+        promiseState: "pending",
+        timeoutState: "armed",
+        workerId,
+      });
+      await writeProgress({
+        batchEndIndex: batchInfo.end + 1,
+        batchId: batchInfo.batchNumber,
+        batchStartIndex: batchInfo.start + 1,
+        currentCombinationIndex: oneBasedIndex,
+        currentConfig: combo,
+        lastMessage: `Started config ${oneBasedIndex}/${total}`,
+        promiseState: "pending",
+        timeoutState: "armed",
+        workerId,
+      });
+
+      try {
+        if (await isCancelled()) {
+          return { cancelled: true, index };
+        }
+
+        const resultPromise = runBacktest(
+          plan,
+          {
+            ...combo,
+            positionPercent: sizingMode === "position-percent" ? combo.sizingValue : undefined,
+            riskPercent: sizingMode === "fixed-risk" ? combo.sizingValue : undefined,
+            sizingMode,
+          },
+          {
+            combo,
+            index: oneBasedIndex,
+            jobId,
+            timeoutMs: combinationTimeoutMs,
+            total,
+            workerId,
+          },
+        );
+        const result = isolateBacktests
+          ? await resultPromise
+          : await withTimeout(resultPromise, combinationTimeoutMs, `AI combination ${oneBasedIndex}/${total}`);
+        cacheStats.total += 1;
+        if (result.cacheHit) cacheStats.hits += 1;
+        else cacheStats.misses += 1;
+        const row = {
+          candlesUsed: result.candlesUsed,
+          fillMode: result.fillMode ?? plan.fillMode ?? "legacy",
+          id: `agent-sweep-row-${Date.now()}-${index}`,
+          longResult: sideValue(result, "LONG"),
+          metrics: result.metrics ?? {},
+          params: {
+            ...combo,
+            fillMode: result.fillMode ?? plan.fillMode ?? "legacy",
+            sizingMode,
+          },
+          provenance: {
+            ...result.provenance,
+            exactParameters: combo,
+            grossLoss: result.metrics?.grossLoss ?? 0,
+            grossProfit: result.metrics?.grossProfit ?? 0,
+            netProfit: result.metrics?.netProfit ?? 0,
+            profitFactor: result.metrics?.profitFactor ?? 0,
+            robustnessFormula: "net% + capped PF + trade quality - drawdown penalty - validation penalties",
+            strategySettings: result.settings ?? null,
+            winRate: result.metrics?.winRate ?? 0,
+          },
+          score: scoreResult(result.metrics, startingBalance),
+          settings: result.settings ?? null,
+          shortResult: sideValue(result, "SHORT"),
+          symbol: result.symbol,
+          timeframe: result.timeframe,
+        };
+        rows.push(row);
+        completed += 1;
+        lastCompletedIndex = oneBasedIndex;
+        lastCompletedConfig = combo;
+        lastError = "";
+        const durationMs = Date.now() - combinationStartedAt;
+        logWorker("combination:complete", {
+          batch: batchInfo.batchNumber,
+          cacheHit: Boolean(result.cacheHit),
+          durationMs,
+          index: oneBasedIndex,
+          promiseState: "fulfilled",
+          timeoutState: result.workerDiagnostics?.timeout ? "timed-out" : "clear",
+          workerDiagnostics: result.workerDiagnostics ?? null,
+          workerId,
+        });
+        await writeProgress({
+          batchEndIndex: batchInfo.end + 1,
+          batchId: batchInfo.batchNumber,
+          batchStartIndex: batchInfo.start + 1,
+          currentCombinationIndex: null,
+          currentConfig: null,
+          durationMs,
+          lastMessage: `Completed config ${oneBasedIndex}/${total} in ${durationMs}ms`,
+          promiseState: "fulfilled",
+          timeoutState: "clear",
+          workerId,
+        });
+        return { index, row };
+      } catch (error) {
+        const durationMs = Date.now() - combinationStartedAt;
+        const message = compactError(error);
+        failedCombinations.push({
+          combo,
+          durationMs,
+          index: oneBasedIndex,
+          message,
+        });
+        completed += 1;
+        lastCompletedIndex = oneBasedIndex;
+        lastCompletedConfig = combo;
+        lastError = message;
+        logWorker("combination:failed", {
+          batch: batchInfo.batchNumber,
+          durationMs,
+          error: message,
+          index: oneBasedIndex,
+          promiseState: "rejected",
+          timeoutState: message.includes("timed out") ? "timed-out" : "clear",
+          workerId,
+        });
+        await writeProgress({
+          batchEndIndex: batchInfo.end + 1,
+          batchId: batchInfo.batchNumber,
+          batchStartIndex: batchInfo.start + 1,
+          currentCombinationIndex: null,
+          currentConfig: null,
+          durationMs,
+          lastMessage: `Failed config ${oneBasedIndex}/${total}; continuing`,
+          promiseState: "rejected",
+          timeoutState: message.includes("timed out") ? "timed-out" : "clear",
+          workerId,
+        });
+        return { error: message, index };
+      } finally {
+        activePromiseCount = Math.max(0, activePromiseCount - 1);
       }
     }
 
+    for (let start = 0, batchNumber = 1; start < total; start += batchSize, batchNumber += 1) {
+      if (await isCancelled()) break;
+      const end = Math.min(total, start + batchSize) - 1;
+      const batch = combinations.slice(start, end + 1);
+      const batchStartedAt = Date.now();
+      const batchInfo = { batchNumber, end, start };
+      logWorker("batch:start", {
+        batchNumber,
+        batchSize: batch.length,
+        endIndex: end + 1,
+        startIndex: start + 1,
+      });
+      await writeProgress({
+        batchEndIndex: end + 1,
+        batchStartIndex: start + 1,
+        lastMessage: `Starting batch ${batchNumber}: configs ${start + 1}-${end + 1}`,
+      });
+
+      const workers = Array.from({ length: Math.min(concurrency, batch.length) }, async (_, workerIndex) => {
+        for (let offset = workerIndex; offset < batch.length; offset += concurrency) {
+          if (await isCancelled()) return;
+          await processCombination(batch[offset], start + offset, batchInfo, workerIndex + 1);
+          await sleep(0);
+        }
+      });
+
+      const settled = await withTimeout(
+        Promise.allSettled(workers),
+        batchTimeoutMs,
+        `AI batch ${batchNumber} (${start + 1}-${end + 1})`,
+      ).catch(async (error) => {
+        const message = compactError(error);
+        lastError = message;
+        logWorker("batch:failed", {
+          batchNumber,
+          durationMs: Date.now() - batchStartedAt,
+          error: message,
+          startIndex: start + 1,
+        });
+        await writeProgress({
+          batchEndIndex: end + 1,
+          batchStartIndex: start + 1,
+          durationMs: Date.now() - batchStartedAt,
+          lastMessage: `Batch ${batchNumber} failed; moving to next batch`,
+        });
+        return [];
+      });
+
+      const rejected = settled.filter((item) => item.status === "rejected");
+      if (rejected.length) {
+        lastError = compactError(rejected[0].reason);
+        logWorker("batch:rejections", {
+          batchNumber,
+          rejected: rejected.length,
+          lastError,
+        });
+      }
+      logWorker("batch:end", {
+        batchNumber,
+        durationMs: Date.now() - batchStartedAt,
+        endIndex: end + 1,
+        failedCombinations: failedCombinations.length,
+        startIndex: start + 1,
+      });
+      await writeProgress({
+        batchEndIndex: end + 1,
+        batchStartIndex: start + 1,
+        durationMs: Date.now() - batchStartedAt,
+        lastMessage: `Finished batch ${batchNumber}: ${start + 1}-${end + 1}`,
+      });
+    }
+    await progressWrite;
+
+    if (await isCancelled()) {
+        return {
+          cacheStats,
+          cancelled: true,
+          failedCombinations: failedCombinations.slice(-100),
+          failedCombinationsCount: failedCombinations.length,
+          generatedCombinations: allCombinations.length,
+          rankedResults: rankSweepResults(rows),
+          requestedCombinations: plan.requestedCombinations ?? plan.maxCombinations ?? total,
+          processedCombinations: completed,
+          testedCombinations: rows.length,
+          totalCombinations: total,
+        };
+    }
+
     return {
+      cacheStats,
       cancelled: false,
+      failedCombinations: failedCombinations.slice(-100),
+      failedCombinationsCount: failedCombinations.length,
+      generatedCombinations: allCombinations.length,
       rankedResults: rankSweepResults(rows),
-      requestedCombinations: allCombinations.length,
+      requestedCombinations: plan.requestedCombinations ?? plan.maxCombinations ?? total,
+      processedCombinations: completed,
       testedCombinations: rows.length,
       totalCombinations: total,
     };

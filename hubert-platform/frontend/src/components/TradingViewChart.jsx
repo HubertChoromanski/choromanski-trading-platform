@@ -31,22 +31,23 @@ const timeframes = [
   { label: "1H", interval: "1h" },
   { label: "4H", interval: "4h" },
 ];
-const toolButtons = [
-  "Livestream",
-  "Execution",
-  "Crisis",
-  "Indicator",
-  "Strategy Decks",
-  "MM Decks",
-  "Decision",
-  "Battle Decks",
-  "Backtests",
-  "Compare",
-  "Favorites",
-  "System",
-  "Analytics",
-  "Communication",
-  "AI",
+const toolGroups = [
+  {
+    label: "Decks",
+    items: ["Indicator", "Strategy Decks", "MM Decks", "Battle Decks", "Favorites"],
+  },
+  {
+    label: "Centrum Decyzyjne",
+    items: ["Livestream", "Execution", "Decision", "Crisis"],
+  },
+  {
+    label: "Backtest",
+    items: ["Backtests", "Compare"],
+  },
+  {
+    label: "System",
+    items: ["System", "Analytics", "Communication"],
+  },
 ];
 const defaultSettings = {
   strategySource: "pine-ha",
@@ -1589,24 +1590,48 @@ export default function TradingViewChart() {
         </div>
 
         <div className="hubert-toolbar__group hubert-toolbar__group--tools">
-          {toolButtons.map((label) => (
-            <button
-              className="hubert-button"
-              data-active={settingsPanel === label}
-              key={label}
-              onClick={() => {
-                setSettingsPanel((currentPanel) => (currentPanel === label ? null : label));
-              }}
-              type="button"
-            >
-              {label}
-            </button>
-          ))}
-          <button className="hubert-button" onClick={exportConfig} type="button">
-            Export
-          </button>
-          <button className="hubert-button" onClick={() => importInputRef.current?.click()} type="button">
-            Import
+          {toolGroups.map((group) => {
+            const groupActive = group.items.includes(settingsPanel);
+            return (
+              <details className="hubert-toolbar-menu" data-active={groupActive} key={group.label} open={groupActive}>
+                <summary>{group.label}</summary>
+                <div>
+                  {group.items.map((label) => (
+                    <button
+                      className="hubert-button"
+                      data-active={settingsPanel === label}
+                      key={label}
+                      onClick={() => {
+                        setSettingsPanel((currentPanel) => (currentPanel === label ? null : label));
+                      }}
+                      type="button"
+                    >
+                      {label}
+                    </button>
+                  ))}
+                  {group.label === "System" && (
+                    <>
+                      <button className="hubert-button" onClick={exportConfig} type="button">
+                        Export
+                      </button>
+                      <button className="hubert-button" onClick={() => importInputRef.current?.click()} type="button">
+                        Import
+                      </button>
+                    </>
+                  )}
+                </div>
+              </details>
+            );
+          })}
+          <button
+            className="hubert-button"
+            data-active={settingsPanel === "AI"}
+            onClick={() => {
+              setSettingsPanel((currentPanel) => (currentPanel === "AI" ? null : "AI"));
+            }}
+            type="button"
+          >
+            AI
           </button>
           <input
             accept="application/json"

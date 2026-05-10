@@ -153,7 +153,9 @@ async function readJson(fileName, fallback) {
     if (error instanceof SyntaxError) {
       await rename(filePath, `${filePath}.bad-${Date.now()}`).catch(() => {});
     }
-    await writeJson(fileName, fallback);
+    await writeJson(fileName, fallback).catch((writeError) => {
+      console.warn(`[store] Could not initialize ${fileName}; using in-memory fallback: ${writeError instanceof Error ? writeError.message : String(writeError)}`);
+    });
     return structuredClone(fallback);
   }
 }
@@ -161,9 +163,19 @@ async function readJson(fileName, fallback) {
 async function writeJson(fileName, value) {
   await ensureDataDir();
   const filePath = path.join(DATA_DIR, fileName);
-  const tempPath = `${filePath}.tmp`;
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`);
-  await rename(tempPath, filePath);
+  try {
+    await rename(tempPath, filePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      console.warn(`[store] Temp file disappeared while writing ${fileName}; falling back to direct write.`);
+      await ensureDataDir();
+      await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`);
+      return;
+    }
+    throw error;
+  }
 }
 
 export async function createStateStore() {

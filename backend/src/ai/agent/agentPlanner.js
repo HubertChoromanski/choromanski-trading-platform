@@ -21,24 +21,75 @@ function parseSymbol(text) {
 }
 
 function parseMaxCombinations(text, fallback) {
-  const direct = String(text).match(/\b(\d{2,5})\s*(?:sweep\s*)?(?:combinations|combos|tests|runs)\b/i);
-  if (direct) return Number(direct[1]);
+  const direct =
+    String(text).match(/\b(\d{1,5})\s*(?:sweep\s*)?(?:combination|combinations|combos|tests|runs)\b/i) ??
+    String(text).match(/\b(?:sweep|test|run)\s*(\d{1,5})\s*(?:combination|combinations|combos|tests|runs)?\b/i);
+  if (direct) {
+    return {
+      explicit: true,
+      requested: Number(direct[1]),
+    };
+  }
   const sweep = /\b(sweep|optimi[sz]e|best settings|best configs?)\b/i.test(text);
-  return sweep ? fallback : Math.min(fallback, 100);
+  return {
+    explicit: false,
+    requested: sweep ? fallback : Math.min(fallback, 100),
+  };
+}
+
+function parseStartingBalance(text, fallback = 10000) {
+  const match = String(text).match(/\b(?:starting\s+balance|start(?:ing)?\s+capital|capital|balance)\s*(?:=|:|of|is)?\s*(\d+(?:[.,]\d+)?)\s*(?:usdt|usd)?\b/i);
+  if (!match) return Number(fallback) || 10000;
+  const parsed = Number(String(match[1]).replace(",", "."));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : Number(fallback) || 10000;
 }
 
 function isoDate(date) {
   return date.toISOString();
 }
 
+function parseFlexibleDate(value) {
+  const match = String(value).trim().match(/^(\d{4})[.-](\d{1,2})[.-](\d{1,2})$/);
+  if (!match) return null;
+  const [, year, month, day] = match;
+  return new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+}
+
+function parseExplicitDateRange(text) {
+  const source = String(text);
+  const datePattern = String.raw`(\d{4}[.-]\d{1,2}[.-]\d{1,2})`;
+  const range =
+    source.match(new RegExp(`from\\s+${datePattern}\\s+(?:to|until|through|-)\\s+${datePattern}`, "i")) ??
+    source.match(new RegExp(`${datePattern}\\s*(?:→|->|to|until|through|-)\\s*${datePattern}`, "i"));
+
+  if (range) {
+    const from = parseFlexibleDate(range[1]);
+    const to = parseFlexibleDate(range[2]);
+    if (from && to && to > from) {
+      return {
+        from: isoDate(from),
+        label: `${range[1]} to ${range[2]}`,
+        requestedFrom: range[1],
+        requestedTo: range[2],
+        to: isoDate(to),
+      };
+    }
+  }
+
+  return null;
+}
+
 function parseRange(text, options = {}) {
   if (options.from || options.to) {
-    const to = options.to ? new Date(options.to) : new Date();
-    const from = options.from ? new Date(options.from) : new Date(to.getTime() - 31 * 24 * 60 * 60 * 1000);
+    const to = options.to ? (parseFlexibleDate(options.to) ?? new Date(options.to)) : new Date();
+    const from = options.from ? (parseFlexibleDate(options.from) ?? new Date(options.from)) : new Date(to.getTime() - 31 * 24 * 60 * 60 * 1000);
     return { from: isoDate(from), label: "custom", to: isoDate(to) };
   }
 
   const lower = String(text).toLowerCase();
+  const explicitRange = parseExplicitDateRange(text);
+  if (explicitRange) return explicitRange;
+
   const to = new Date();
   let days = Number(options.lastDays) || 31;
 
@@ -46,6 +97,18 @@ function parseRange(text, options = {}) {
   const monthMatch = lower.match(/last\s+(\d+)\s+months?/);
   const dayMatch = lower.match(/last\s+(\d+)\s+days?/);
   const quarterMatch = lower.match(/\bq([1-4])\s+(\d{4})\b/i);
+  const previousYear = lower.includes("previous full year") || lower.includes("last calendar year");
+
+  if (previousYear) {
+    const year = new Date().getUTCFullYear() - 1;
+    return {
+      from: isoDate(new Date(Date.UTC(year, 0, 1))),
+      label: `${year} calendar year`,
+      requestedFrom: `${year}-01-01`,
+      requestedTo: `${year + 1}-01-01`,
+      to: isoDate(new Date(Date.UTC(year + 1, 0, 1))),
+    };
+  }
 
   if (yearMatch) days = Number(yearMatch[1]) * 365;
   if (monthMatch) days = Number(monthMatch[1]) * 30;
@@ -115,13 +178,20 @@ export function createAgentPlan({ options = {}, prompt = "" }) {
     ? "conservative"
     : options.fillMode ?? "legacy";
   const sizingMode = options.sizingMode ?? (/fixed risk|risk per/i.test(prompt) ? "fixed-risk" : "position-percent");
-  const maxCombinations = Math.max(1, Math.min(parseMaxCombinations(prompt, Number(options.maxCombinations) || 1000), 5000));
+  const fallbackCombinations = Number(options.maxCombinations) || (kind === "research" ? 100 : 1000);
+  const combinationRequest = parseMaxCombinations(prompt, fallbackCombinations);
+  const requestedCombinations = Math.max(1, combinationRequest.requested);
+  const maxCombinations = Math.max(1, Math.min(requestedCombinations, 5000));
+  const startingBalance = parseStartingBalance(prompt, options.startingBalance ?? 10000);
 
   return {
     artifacts: requestedArtifacts(prompt),
     fillMode,
     kind,
     maxCombinations,
+    plannedCombinations: maxCombinations,
+    requestedCombinations,
+    requestedCombinationsExplicit: combinationRequest.explicit,
     objective: inferObjective(prompt, options),
     outputFormat: options.outputFormat ?? "markdown",
     parameters: {
@@ -136,6 +206,7 @@ export function createAgentPlan({ options = {}, prompt = "" }) {
     range: parseRange(prompt, options),
     reportStyle: /presentation|slides/i.test(prompt) ? "presentation" : "operator",
     sizingMode,
+    startingBalance,
     symbol: options.symbol ? String(options.symbol).toUpperCase() : parseSymbol(prompt),
     timeframe: timeframes[0] ?? "15m",
     timeframes,

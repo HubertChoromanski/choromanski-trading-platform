@@ -4,13 +4,14 @@ const ADVANCED_HARD_MAX = 5000;
 export function checkAgentPlanSafety(plan, options = {}) {
   const warnings = [];
   const maxCombinations = Number(plan.maxCombinations ?? 0);
+  const requestedCombinations = Number(plan.requestedCombinations ?? maxCombinations);
   const confirmed = Boolean(options.confirmLargeJob || options.confirmed);
 
-  if (maxCombinations > ADVANCED_HARD_MAX) {
+  if (requestedCombinations > ADVANCED_HARD_MAX) {
     return {
       ok: false,
       code: "COMBINATION_LIMIT",
-      message: `This job asks for ${maxCombinations} combinations. The hard safety cap is ${ADVANCED_HARD_MAX}.`,
+      message: `This job asks for ${requestedCombinations} combinations. The hard safety cap is ${ADVANCED_HARD_MAX}.`,
       warnings,
     };
   }
@@ -37,6 +38,10 @@ export function checkAgentPlanSafety(plan, options = {}) {
 
   if (maxCombinations > DEFAULT_SAFE_MAX) {
     warnings.push(`Large job confirmed: ${maxCombinations} combinations. Progress is batched and can be cancelled.`);
+  }
+
+  if (requestedCombinations !== maxCombinations) {
+    warnings.push(`Requested ${requestedCombinations}, running ${maxCombinations} after safety planning.`);
   }
 
   return {

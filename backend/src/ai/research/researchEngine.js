@@ -47,17 +47,19 @@ export async function runResearchWorkflow({ isCancelled, onProgress, plan, toolR
   const timeframeRowsForSummary = [];
 
   await onProgress({ completed: 0, percent: 3, total: plan.maxCombinations ?? 1000 }, stages[0].name);
-  const exploration = await toolRegistry.runLargeSweepBatched({
-    isCancelled,
-    onProgress: (progress) => onProgress({ ...progress, percent: Math.min(45, Math.round(progress.percent * 0.45)) }, "Exploration sweep"),
-    plan,
-  });
+    const exploration = await toolRegistry.runLargeSweepBatched({
+      isCancelled,
+      jobId: plan.jobId,
+      onProgress: (progress) => onProgress({ ...progress, percent: Math.min(45, Math.round(progress.percent * 0.45)) }, "Exploration sweep"),
+      plan,
+    });
 
   if (exploration.cancelled) {
     return {
       ...exploration,
       cancelled: true,
       summary: `Research cancelled during exploration after ${exploration.testedCombinations} tests.`,
+      processedCombinations: exploration.processedCombinations,
       toolsUsed: ["runLargeSweepBatched"],
     };
   }
@@ -78,6 +80,7 @@ export async function runResearchWorkflow({ isCancelled, onProgress, plan, toolR
         cancelled: true,
         rankedResults: detailedCandidates,
         summary: "Research cancelled during validation.",
+        processedCombinations: exploration.processedCombinations,
         toolsUsed: ["runHistoricalBacktest", "runLargeSweepBatched"],
       };
     }
@@ -86,6 +89,17 @@ export async function runResearchWorkflow({ isCancelled, onProgress, plan, toolR
     const periodRows = [];
 
     for (const period of periods) {
+      if (await isCancelled()) {
+        return {
+          cancelled: true,
+          rankedResults: detailedCandidates.length ? detailedCandidates : initialRows,
+          summary: "Research cancelled during period validation.",
+          testedCombinations: exploration.testedCombinations,
+          processedCombinations: exploration.processedCombinations,
+          totalCombinations: exploration.totalCombinations,
+          toolsUsed: ["runHistoricalBacktest", "runLargeSweepBatched"],
+        };
+      }
       const result = await toolRegistry.runBacktest(
         { ...plan, range: { from: period.from, to: period.to }, timeframe: candidate.timeframe ?? plan.timeframe },
         overrides,
@@ -106,6 +120,17 @@ export async function runResearchWorkflow({ isCancelled, onProgress, plan, toolR
       { ...overrides, fillMode: "legacy" },
     );
     completed += 1;
+    if (await isCancelled()) {
+      return {
+        cancelled: true,
+        rankedResults: detailedCandidates.length ? detailedCandidates : initialRows,
+        summary: "Research cancelled during fill-mode validation.",
+        testedCombinations: exploration.testedCombinations,
+        processedCombinations: exploration.processedCombinations,
+        totalCombinations: exploration.totalCombinations,
+        toolsUsed: ["runHistoricalBacktest", "runLargeSweepBatched"],
+      };
+    }
     const conservative = await toolRegistry.runBacktest(
       { ...plan, fillMode: "conservative", timeframe: candidate.timeframe ?? plan.timeframe },
       { ...overrides, fillMode: "conservative" },
@@ -114,6 +139,17 @@ export async function runResearchWorkflow({ isCancelled, onProgress, plan, toolR
 
     const timeframeRows = [];
     for (const timeframe of neighboringTimeframes(candidate.timeframe ?? plan.timeframe).slice(0, 3)) {
+      if (await isCancelled()) {
+        return {
+          cancelled: true,
+          rankedResults: detailedCandidates.length ? detailedCandidates : initialRows,
+          summary: "Research cancelled during timeframe validation.",
+          testedCombinations: exploration.testedCombinations,
+          processedCombinations: exploration.processedCombinations,
+          totalCombinations: exploration.totalCombinations,
+          toolsUsed: ["runHistoricalBacktest", "runLargeSweepBatched"],
+        };
+      }
       const result = await toolRegistry.runBacktest(
         { ...plan, timeframe },
         { ...overrides, timeframe },
@@ -172,6 +208,11 @@ export async function runResearchWorkflow({ isCancelled, onProgress, plan, toolR
     robustnessNotes: narrative.productionViability,
     stageSummaries,
     summary: narrative.executiveSummary,
+    cacheStats: exploration.cacheStats,
+    failedCombinationsCount: exploration.failedCombinationsCount,
+    generatedCombinations: exploration.generatedCombinations,
+    processedCombinations: exploration.processedCombinations,
+    requestedCombinations: exploration.requestedCombinations,
     testedCombinations: exploration.testedCombinations,
     timeframeComparison: timeframeRowsForSummary,
     timeframeSummary,
@@ -179,7 +220,10 @@ export async function runResearchWorkflow({ isCancelled, onProgress, plan, toolR
     totalCombinations: exploration.totalCombinations,
     warnings: [
       ...(exploration.requestedCombinations > exploration.totalCombinations
-        ? [`Generated ${exploration.requestedCombinations} combinations and tested ${exploration.totalCombinations}.`]
+        ? [`Requested ${exploration.requestedCombinations} combinations and tested ${exploration.totalCombinations}.`]
+        : []),
+      ...(exploration.generatedCombinations > exploration.totalCombinations
+        ? [`Parameter grid had ${exploration.generatedCombinations} possible combinations; this run planned ${exploration.totalCombinations}.`]
         : []),
       "Research rankings are analytical recommendations only. AI cannot deploy or execute trades.",
     ],

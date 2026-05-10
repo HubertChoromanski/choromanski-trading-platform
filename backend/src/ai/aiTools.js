@@ -133,7 +133,27 @@ export function createAiTools({
   publicStatusPayload,
   store,
 }) {
-  async function runHistoricalBacktest(input = {}) {
+  const candleCache = new Map();
+  const maxCandleCacheEntries = Number(process.env.AI_CANDLE_CACHE_SIZE ?? 30);
+
+  async function cachedCandles(input) {
+    const key = JSON.stringify(input);
+    if (candleCache.has(key)) {
+      const cached = candleCache.get(key);
+      candleCache.delete(key);
+      candleCache.set(key, cached);
+      return structuredClone(cached);
+    }
+
+    const candles = await fetchCandles(input);
+    candleCache.set(key, structuredClone(candles));
+    if (candleCache.size > maxCandleCacheEntries) {
+      candleCache.delete(candleCache.keys().next().value);
+    }
+    return candles;
+  }
+
+  async function prepareHistoricalBacktest(input = {}) {
     const { mmDeck, strategyDeck } = selectedDecks(store, input);
     const symbol = String(input.symbol ?? strategyDeck.symbol ?? "SOLUSDT").toUpperCase();
     const timeframe = input.timeframe ?? strategyDeck.timeframe ?? "15m";
@@ -141,32 +161,56 @@ export function createAiTools({
     const range = normalizeRange(input);
     const minutes = intervalMinutes(timeframe);
     const maxCandles = Math.min(90000, Math.max(600, Math.ceil((Date.parse(range.to) - Date.parse(range.from)) / (minutes * 60_000)) + 8));
-    const candles = await fetchCandles({
+    const candleRequest = {
       from: Math.floor(Date.parse(range.from) / 1000),
       limit: maxCandles,
       provider,
       symbol,
       timeframe,
       to: Math.floor(Date.parse(range.to) / 1000),
-    });
+    };
+    const candles = await cachedCandles(candleRequest);
     const settings = strategySettings(strategyDeck, input);
     const sizingMode = input.sizingMode ?? strategyDeck.sizingMode ?? (strategyDeck.atrPositionSizing ? "fixed-risk" : "position-percent");
     const fillMode = input.fillMode === "conservative" ? "conservative" : "legacy";
-    const result = runBacktest({
-      backtestConfig: {
-        atrPositionSizing: sizingMode === "fixed-risk",
-        commissionPercent: Number(input.commissionPercent ?? 0.04),
-        fillMode,
-        mmDeck: {
-          ...DEFAULT_MM,
-          ...mmDeck,
-          ...(input.positionPercent ? { positionPercent: Number(input.positionPercent) } : {}),
-          ...(input.riskPercent ? { oneSlPercent: Number(input.riskPercent) } : {}),
-        },
-        sizingMode,
-        slippagePercent: Number(input.slippagePercent ?? 0),
-        startingBalance: Number(input.startingBalance ?? 10000),
+    const backtestConfig = {
+      atrPositionSizing: sizingMode === "fixed-risk",
+      commissionPercent: Number(input.commissionPercent ?? 0.04),
+      fillMode,
+      mmDeck: {
+        ...DEFAULT_MM,
+        ...mmDeck,
+        ...(input.positionPercent ? { positionPercent: Number(input.positionPercent) } : {}),
+        ...(input.riskPercent ? { oneSlPercent: Number(input.riskPercent) } : {}),
       },
+      sizingMode,
+      slippagePercent: Number(input.slippagePercent ?? 0),
+      startingBalance: Number(input.startingBalance ?? 10000),
+    };
+
+    return {
+      backtestConfig,
+      candles,
+      provider,
+      range,
+      settings,
+      symbol,
+      timeframe,
+    };
+  }
+
+  async function runHistoricalBacktest(input = {}) {
+    const {
+      backtestConfig,
+      candles,
+      provider,
+      range,
+      settings,
+      symbol,
+      timeframe,
+    } = await prepareHistoricalBacktest(input);
+    const result = runBacktest({
+      backtestConfig,
       rawCandles: candles,
       settings,
     });
@@ -365,6 +409,7 @@ export function createAiTools({
       };
     },
 
+    prepareHistoricalBacktest,
     runHistoricalBacktest,
     runSweepAnalysis,
 
