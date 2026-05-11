@@ -6,6 +6,7 @@ import { checkAgentPlanSafety } from "./agentRiskGuard.js";
 import { createAgentToolRegistry } from "./agentToolRegistry.js";
 import {
   clarificationForIntent,
+  describeResearchAssumptions,
   isResearchPlanningMessage,
   researchIntentToPlanOptions,
   updateResearchIntent,
@@ -19,7 +20,7 @@ function isPolishQuestion(value = "") {
     .normalize("NFD")
     .replace(/\p{Diacritic}/gu, "")
     .toLowerCase();
-  return /(^|\s)(czy|co|czemu|dlaczego|jak|gdzie|ile|pokaz|porownaj|wynik|dziala|nadal|robi|robia|ustawienia|blad|gorszy|lepszy|optymalnie|analiz)(\s|$)/u.test(normalized);
+  return /(^|\s)(czy|co|czemu|dlaczego|jak|gdzie|ile|pokaz|porownaj|wynik|dziala|nadal|robi|robia|ustawienia|blad|gorszy|lepszy|optymalnie|analiz|uzyj|ignoruj|bez|bazeline|baseline|chce|zebys|zrobil|badani|badania|zakres|katem|ostatnie|dni|nazwij|uwaga|okres|testow|testy)(\s|$)/u.test(normalized);
 }
 
 function normalizeCommandText(value = "") {
@@ -29,16 +30,58 @@ function normalizeCommandText(value = "") {
     .toLowerCase();
 }
 
+const LIVE_ACTION_VERBS = "(?:zmien|ustaw|przesun|move|set|change)";
+
+function hasResearchPriorityIntent(message = "") {
+  const normalized = normalizeCommandText(message);
+  return /(test|backtest|sweep|kombinacj|ustawien|ustawienia|zakres|optymaliz|adaptive|najlepsze\s+ustawien|pf|profit factor|skutecznosc|skuteczność|drawdown|\bdd\b|metoda|ranking|rankingu|badanie|research)/i.test(normalized) ||
+    isResearchPlanningMessage(message);
+}
+
+function hasExplicitLiveActionIntent(message = "") {
+  const normalized = normalizeCommandText(message);
+  const slOrTpAction = new RegExp(`(?:\\b${LIVE_ACTION_VERBS}\\b.{0,50}\\b(?:sl|tp)\\b|\\b(?:sl|tp)\\b.{0,50}\\b${LIVE_ACTION_VERBS}\\b)`, "i");
+  return slOrTpAction.test(normalized) ||
+    /(zamknij|close).*(pozyc|position)|\bclose position\b/i.test(normalized) ||
+    /(cancel|anuluj|skasuj).*(orders|order|zlecen|protection)|cancel orders/i.test(normalized) ||
+    /\b(market\s+(long|short)|otworz|otwórz|open).{0,30}\b(long|short)\b/i.test(normalized);
+}
+
+function isDateLikeNumberAt(source = "", index = -1) {
+  if (index < 0) return false;
+  return /^\d{4}[.-]\d{1,2}[.-]\d{1,2}/.test(source.slice(index));
+}
+
+function extractLiveActionPrice(normalized = "", target = "sl") {
+  const patterns = [
+    new RegExp(`\\b${target}\\b.{0,40}\\b(?:na|to|at|=)\\s*([0-9]+(?:[.,][0-9]+)?)`, "i"),
+    new RegExp(`\\b${LIVE_ACTION_VERBS}\\b.{0,40}\\b${target}\\b.{0,40}\\b(?:na|to|at|=)?\\s*([0-9]+(?:[.,][0-9]+)?)`, "i"),
+    new RegExp(`\\b${target}\\b\\s+([0-9]+(?:[.,][0-9]+)?)`, "i"),
+  ];
+
+  for (const pattern of patterns) {
+    const match = normalized.match(pattern);
+    if (!match?.[1]) continue;
+    const numberIndex = match.index + match[0].lastIndexOf(match[1]);
+    if (isDateLikeNumberAt(normalized, numberIndex)) continue;
+    const price = Number(match[1].replace(",", "."));
+    if (Number.isFinite(price)) return price;
+  }
+  return null;
+}
+
 function detectLiveExecutionIntent(message = "") {
   const normalized = normalizeCommandText(message);
-  const priceMatch = normalized.match(/(?:na|to|=)\s*([0-9]+(?:[.,][0-9]+)?)/i) ?? normalized.match(/\b([0-9]+(?:[.,][0-9]+)?)\b/);
-  const price = priceMatch?.[1] ? Number(priceMatch[1].replace(",", ".")) : null;
+  if (!hasExplicitLiveActionIntent(message)) return null;
 
-  if (/(zmien|ustaw|przesun|move|set|change).*\bsl\b|\bsl\b.*(zmien|ustaw|przesun|move|set|change)/i.test(normalized)) {
-    return { action: "MOVE_SL", label: "Move SL", price };
+  const slAction = new RegExp(`(?:\\b${LIVE_ACTION_VERBS}\\b.{0,50}\\bsl\\b|\\bsl\\b.{0,50}\\b${LIVE_ACTION_VERBS}\\b)`, "i");
+  const tpAction = new RegExp(`(?:\\b${LIVE_ACTION_VERBS}\\b.{0,50}\\btp\\b|\\btp\\b.{0,50}\\b${LIVE_ACTION_VERBS}\\b)`, "i");
+
+  if (slAction.test(normalized)) {
+    return { action: "MOVE_SL", label: "Move SL", price: extractLiveActionPrice(normalized, "sl") };
   }
-  if (/(zmien|ustaw|przesun|move|set|change).*\btp\b|\btp\b.*(zmien|ustaw|przesun|move|set|change)/i.test(normalized)) {
-    return { action: "MOVE_TP", label: "Move TP", price };
+  if (tpAction.test(normalized)) {
+    return { action: "MOVE_TP", label: "Move TP", price: extractLiveActionPrice(normalized, "tp") };
   }
   if (/(zamknij|close).*(pozyc|position)|\bclose position\b/i.test(normalized)) {
     return { action: "CLOSE_POSITION", label: "Close Position", price: null };
@@ -49,18 +92,148 @@ function detectLiveExecutionIntent(message = "") {
   return null;
 }
 
+function isResearchActionRequest(message = "") {
+  const normalized = normalizeCommandText(message);
+  return /(zrob|zrobil|zrób|uruchom|odpal|run|start|przetestuj|testuj|backtestuj|znajdz|znajdź|szukaj|optimi[sz]e|optymaliz|porownaj|porównaj|compare|analy[sz]e|analizuj|zbadaj|sprawdz|sprawdź)\b/i.test(normalized);
+}
+
+function isConversationalExplanationQuestion(message = "") {
+  const normalized = normalizeCommandText(message);
+  if (!normalized.trim()) return false;
+  if (isResearchActionRequest(message)) return false;
+
+  const conceptQuestion =
+    /(o co chodzi(?:\s+z)?|co to znaczy|co oznacza|co to jest|czym jest|jak dziala|jak działa|w jaki sposob|w jaki sposób|po co|czy to oznacza|what is|what does|what are|how does|explain|meaning of)/i.test(normalized);
+  if (conceptQuestion) return true;
+
+  const asksWhyConcept = /(czemu|dlaczego|why)\b/i.test(normalized) &&
+    /(baseline|hubert|adaptive|search|metodolog|methodolog|uzywasz|używasz|oznacza|means)/i.test(normalized) &&
+    !/(nie dziala|nie działa|failed|failure|error|blad|błąd|problem|sl|tp|order|position|pozyc|config|konfig|ranking|rank|wynik|result|pf|profit factor|drawdown|dd|lepszy|gorszy|better|worse|backtest|porownaj|porównaj|compare)/i.test(normalized);
+  return asksWhyConcept;
+}
+
+function activeResearchBaseline(memory = {}) {
+  const baseline = memory?.researchIntent?.baselineQuery;
+  return baseline ? String(baseline) : "";
+}
+
+function buildDirectConversationAnswer({ message = "", memory = {} } = {}) {
+  const normalized = normalizeCommandText(message);
+  const polish = isPolishQuestion(message) || /[ąćęłńóśźż]/i.test(message);
+  const activeBaseline = activeResearchBaseline(memory);
+  const mentionsHubert = /\bhubert\b/i.test(normalized);
+  const mentionsBaseline = /(baseline|bazeline|baza odniesienia|punkt odniesienia)/i.test(normalized);
+  const mentionsAdaptive = /(adaptive|adaptacyj|two-stage|dwustopni|search)/i.test(normalized);
+
+  if (mentionsBaseline || mentionsHubert) {
+    const answer = polish
+      ? [
+          "Baseline to po prostu punkt odniesienia.",
+          "W AH może nim być np. zapisany backtest „hubert”, żeby nowe wyniki porównywać do czegoś, co już uważasz za dobre.",
+          activeBaseline
+            ? `Aktualnie w planie tej rozmowy baseline to „${activeBaseline}”.`
+            : "Nie podpinam „hubert” automatycznie do każdego badania; użyję go tylko wtedy, gdy o to poprosisz albo potwierdzisz.",
+          "Mogę też działać całkowicie bez baseline.",
+        ].join(" ")
+      : [
+          "A baseline is simply a reference point.",
+          "In AH it can be a saved backtest such as “hubert”, so new results can be compared against something you already trust.",
+          activeBaseline
+            ? `The active research plan currently uses “${activeBaseline}” as baseline.`
+            : "I do not attach “hubert” automatically to every research run; I use it only when you ask or confirm it.",
+          "AH can also run research without any baseline.",
+        ].join(" ");
+    return {
+      answer,
+      confidence: {
+        label: "high",
+        reason: "This is a concept explanation, so AH answered before research planning.",
+        score: 90,
+      },
+      evidence: [
+        "Detected explanation/conversation intent before research planning.",
+        activeBaseline ? `Active conversation baseline: ${activeBaseline}` : "No active baseline is attached to this conversation plan.",
+        "No pending operation was created.",
+      ],
+      intent: "conversation-explanation",
+      nextAction: polish
+        ? "Jeśli chcesz, możesz napisać: „użyj hubert jako baseline” albo „ignoruj hubert”."
+        : "If you want, say “use hubert as baseline” or “ignore hubert”.",
+      recommendation: polish
+        ? "Traktuj baseline jako porównanie, nie jako obowiązkową część badania."
+        : "Treat a baseline as a comparison point, not a required part of research.",
+      risk: { label: "low", reasons: ["Explanation only; no research job was prepared or started."] },
+      sections: [],
+    };
+  }
+
+  if (mentionsAdaptive) {
+    const answer = polish
+      ? [
+          "Adaptive search to sposób szukania parametrów w etapach.",
+          "Najpierw robi się szerszy, grubszy przegląd, potem zawęża testy wokół najlepszych klastrów parametrów.",
+          "W tej platformie oznacza to praktycznie dwustopniowy sweep i walidację, nie pełną Bayesian optimization.",
+          "Czyli: mniej ślepego brute force, więcej stopniowego zawężania, ale nadal bez gwarancji znalezienia idealnego optimum.",
+        ].join(" ")
+      : [
+          "Adaptive search means searching parameters in stages.",
+          "First you run a broader coarse scan, then narrow around the strongest parameter clusters.",
+          "In this platform it currently means a two-stage sweep plus validation, not full Bayesian optimization.",
+          "So it is less blind brute force, but it still does not guarantee the perfect optimum.",
+        ].join(" ");
+    return {
+      answer,
+      confidence: {
+        label: "high",
+        reason: "This is a concept explanation, not a request to run research.",
+        score: 88,
+      },
+      evidence: [
+        "Detected explanation/conversation intent before research planning.",
+        "No combinations, methodology choice, or pending operation was injected into the answer.",
+      ],
+      intent: "conversation-explanation",
+      nextAction: polish
+        ? "Jeśli chcesz to uruchomić, napisz wprost: „zrób adaptive search dla ...”."
+        : "If you want to run it, say explicitly: “run adaptive search for ...”.",
+      recommendation: polish
+        ? "Używaj adaptive search, gdy chcesz najpierw znaleźć okolice dobrych parametrów, a potem je dopracować."
+        : "Use adaptive search when you want to find promising parameter regions first, then refine them.",
+      risk: { label: "low", reasons: ["Explanation only; no research job was prepared or started."] },
+      sections: [],
+    };
+  }
+
+  return {
+    answer: polish
+      ? "Najpierw odpowiem wprost: pytasz o wyjaśnienie, więc nie uruchamiam żadnego researchu ani planu. Doprecyzuj, które pojęcie mam rozłożyć na prostsze słowa, a odpowiem krótko i praktycznie."
+      : "Directly: you are asking for an explanation, so I am not starting research or building a plan. Tell me which term you want unpacked and I will explain it plainly.",
+    confidence: {
+      label: "medium",
+      reason: "Explanation intent was clear, but the exact concept was not specific enough.",
+      score: 64,
+    },
+    evidence: ["Detected explanation/conversation intent before research planning.", "No pending operation was created."],
+    intent: "conversation-explanation",
+    nextAction: polish ? "Podaj pojęcie albo przycisk, który mam wyjaśnić." : "Name the term or button you want explained.",
+    recommendation: polish ? "Zadaj krótkie pytanie w stylu: „co to znaczy X?”" : "Ask a short question like: “what does X mean?”",
+    risk: { label: "low", reasons: ["Explanation only."] },
+    sections: [],
+  };
+}
+
 function inferCopilotIntent(message = "", mode = "research") {
   const normalized = normalizeCommandText(message);
   const asksAboutButtons = /(przycisk|przyciski|button|buttons|verify integrity|re[- ]?run|rerun|open backtest|show metric diff)/i.test(normalized);
   const asksLimits = /(czego ai nie moze|czego ai nie może|what can.?t ai|what cannot ai|limitations|ograniczenia|nie moze jeszcze|nie może jeszcze)/i.test(normalized);
   const asksFailure = /(czemu|dlaczego|why|nie dziala|nie działa|failed|failure|error|blad|błąd|problem|unreachable|stale|lag)/i.test(normalized);
   const asksCode = /(kod|code|trace|sciezka|ścieżka|route|endpoint|function|plik|file|gdzie jest|where is)/i.test(normalized);
-  const asksResearchRun = /(run|uruchom|odpal|zrob|zrób|sweep|kombinacj|combination|znajdz najlepsze|znajdź najlepsze|optimi[sz]e|optymaln|szukasz|backtestuj|przetestuj|ustawien)/i.test(normalized) ||
-    isResearchPlanningMessage(message);
+  const asksResearchRun = hasResearchPriorityIntent(message);
   const asksBaselineDefinition = /(co to|czym jest|what is).*(baseline|hubert)|baseline hubert.*(co to|czym jest|what is)/i.test(normalized);
   const asksResult = /(config|konfig|ranking|rank|wynik|result|pf|profit factor|drawdown|dd|hubert|baseline|backtest|lepszy|gorszy|better|worse|porownaj|porównaj|compare|pelna analiz|pełna analiz|deep analysis|full analysis)/i.test(normalized);
   const asksChart = /(chart|wykres|candle|swiec|świec|timeframe|zakres|range|equity|drawdown)/i.test(normalized);
 
+  if (isConversationalExplanationQuestion(message)) return "conversation-explanation";
   if (asksAboutButtons || asksLimits) return "general-platform-question";
   if (asksBaselineDefinition) return "general-platform-question";
   if (asksCode) return "code-platform-diagnosis";
@@ -70,6 +243,61 @@ function inferCopilotIntent(message = "", mode = "research") {
   if (asksChart) return "chart-backtest-question";
   if (mode === "platform-diagnosis" || mode === "code-evidence" || mode === "platform") return "platform-diagnosis";
   return "general-platform-question";
+}
+
+function buildIntentAmbiguityResponse({ message = "" } = {}) {
+  const polish = isPolishQuestion(message) || /[ąćęłńóśźż]/i.test(message);
+  return {
+    answer: polish
+      ? "Widzę tu jednocześnie język badania/backtestu i komendę live dla pozycji. Nie zgaduję, bo to mogłoby być niebezpieczne. Czy chodzi Ci o badanie/backtest, czy o zmianę SL/TP na żywej pozycji?"
+      : "I see both research/backtest language and a live-position command. I will not guess because that could be unsafe. Do you mean a research/backtest task, or changing SL/TP on a live position?",
+    confidence: {
+      label: "low",
+      reason: "Message contains both research keywords and explicit live-action wording.",
+      score: 35,
+    },
+    evidence: [
+      "Research keywords were detected.",
+      "Explicit live-action wording was also detected.",
+      "No pending research job or live action was created.",
+    ],
+    intent: "intent-clarification",
+    nextAction: polish
+      ? "Odpowiedz: „badanie” albo „żywa pozycja”."
+      : "Reply with “research” or “live position”.",
+    recommendation: polish
+      ? "Dla SL w backteście pisz raczej „SL jako parametr strategii”; dla live użyj „zmień SL żywej pozycji na ...”."
+      : "For backtest SL, say “SL as strategy parameter”; for live, say “change live position SL to ...”.",
+    risk: { label: "moderate", reasons: ["Ambiguous live execution wording requires clarification."] },
+    sections: [],
+  };
+}
+
+function researchObjectiveLabels(message = "", { polish = false } = {}) {
+  const normalized = normalizeCommandText(message);
+  const objectives = [];
+  if (/\bpf\b|profit factor/i.test(normalized)) objectives.push(polish ? "najlepszy PF" : "best PF");
+  if (/skutecznosc|skuteczność|win rate|trafnosc|trafność/i.test(normalized)) objectives.push(polish ? "najlepsza skuteczność / win rate" : "best win rate");
+  if (/niski(?:ego|m)?\s+dd|niskiego\s+drawdown|low\s+drawdown|drawdown|\bdd\b/i.test(normalized)) objectives.push(polish ? "najniższy DD" : "lowest DD");
+  if (/calosciow|całościow|overall|optymaln|balanced|robust/i.test(normalized)) objectives.push(polish ? "najlepszy wynik całościowy" : "best overall");
+  return objectives.length ? objectives : [polish ? "robustness-adjusted return" : "robustness-adjusted return"];
+}
+
+function researchSizingLabel(message = "", plan = {}, { polish = false } = {}) {
+  const normalized = normalizeCommandText(message);
+  const percent = normalized.match(/\b(\d+(?:[.,]\d+)?)\s*%\s*(?:per\s*position|pozycj|position)/i);
+  const hasAtrSl = /\bsl\b.{0,40}\batr\b|\batr\b.{0,40}\bsl\b/i.test(normalized);
+  if (percent?.[1] && hasAtrSl) {
+    return polish
+      ? `${percent[1].replace(",", ".")}% per position z ATR SL sizing`
+      : `${percent[1].replace(",", ".")}% per position with ATR SL sizing`;
+  }
+  if (percent?.[1]) {
+    return polish
+      ? `${percent[1].replace(",", ".")}% per position`
+      : `${percent[1].replace(",", ".")}% per position`;
+  }
+  return `${plan.sizingMode ?? "position-percent"}${plan.parameters?.sizingValues?.length ? ` ${plan.parameters.sizingValues.join(", ")}` : ""}`;
 }
 
 function compactPositionForAnswer(position = {}) {
@@ -104,6 +332,13 @@ function isCombinationAdviceQuestion(message = "") {
     /(kombinacj|combination).*(ile|optymalnie|optimal)/i.test(normalized);
 }
 
+export const __intentTestHooks = {
+  detectLiveExecutionIntent,
+  hasExplicitLiveActionIntent,
+  hasResearchPriorityIntent,
+  inferCopilotIntent,
+};
+
 function isResearchMethodQuestion(message = "") {
   const normalized = normalizeCommandText(message);
   return /(w jaki sposob|w jaki sposób|jak pracujesz|how do you work|search strategy|szukasz optymaln|optymalnych ustawien|optymalnych ustawień|optymalne ustawien)/i.test(normalized);
@@ -134,6 +369,75 @@ function estimateDurationLabel(combinations = 0) {
   return "long run; likely 35+ minutes depending on cache and provider speed";
 }
 
+function isActivePlanningSession(session = null) {
+  return Boolean(session && ["collecting_info", "ready_to_confirm"].includes(session.status));
+}
+
+function isPlanningResetMessage(message = "") {
+  const normalized = normalizeCommandText(message);
+  return /(nowy temat|zacznij od nowa|start new|forget this|clear plan|anuluj plan|cancel plan|reset plan|od nowa)/i.test(normalized);
+}
+
+function classifyPlanningFollowUp(message = "", session = null) {
+  if (!isActivePlanningSession(session)) return "none";
+  const normalized = normalizeCommandText(message);
+  if (isPlanningResetMessage(message)) return "cancellation";
+  if (detectLiveExecutionIntent(message) && !hasResearchPriorityIntent(message)) return "unrelated";
+  if (isConversationalExplanationQuestion(message)) return "unrelated";
+  if (/(nazwij|nazwa|name|tytul|tytuł|badani|research|test ai|\bai\s*\d+\b)/i.test(normalized)) return "answer";
+  if (/(ostatnie|ostatnich|last)\s+\d{1,4}\s*(dni|days)|\d{4}[.-]\d{1,2}[.-]\d{1,2}|marzec|marca|styczen|stycznia|luty|lutego|kwiecien|kwietnia|maj|maja|czerwiec|czerwca|lipiec|lipca|sierpien|sierpnia|wrzesien|wrzesnia|pazdziernik|pazdziernika|listopad|listopada|grudzien|grudnia/i.test(normalized)) return "answer";
+  if (/(bez baseline|ignore baseline|ignoruj hubert|bez hubert|hubert|baseline)/i.test(normalized)) return "answer";
+  if (/(\d{2,5})\s*(kombinacj|testow|testów|runs|combinations)|\b(zrob|zrób|run|odpal|uruchom)\s*\d{2,5}\b/i.test(normalized)) return "answer";
+  if (/(pf|profit factor|dd|drawdown|trade|transakc|atr|nwe|bandwidth|conservative|legacy|fixed risk|risk per sl|per sl|na sl|mm deck|sizing|sl z atr|atr sl)/i.test(normalized)) return "answer";
+  if (session.lastQuestionAsked && normalized.length < 120) return "answer";
+  return "unrelated";
+}
+
+function extractOperationName(message = "") {
+  const source = String(message).trim();
+  const patterns = [
+    /\b(?:nazwij|nazwa|name|tytul|tytuł)\s+(?:badanie|badania|research|test)?\s*["“]?([^",.;\n]+)["”]?/i,
+    /\b(?:badanie|badania|research)\s+(?:ma\s+sie\s+nazywac|ma\s+się\s+nazywać|called)\s*["“]?([^",.;\n]+)["”]?/i,
+  ];
+  for (const pattern of patterns) {
+    const match = source.match(pattern);
+    if (match?.[1]) {
+      return match[1].trim().replace(/\s+(i|oraz|plus)\s+.*$/i, "").slice(0, 80);
+    }
+  }
+  return "";
+}
+
+function extractSizingInterpretationNote(message = "") {
+  const normalized = normalizeCommandText(message);
+  if (/(1\s*%|procent).{0,80}(sl|stop loss|mm deck|risk per sl|na sl|per sl)|(?:sl|stop loss|mm deck).{0,80}(1\s*%|procent)/i.test(normalized)) {
+    return "1% should be treated as MM/risk per SL sizing, not ordinary position size.";
+  }
+  return "";
+}
+
+function planningSessionFromIntent({
+  intent = {},
+  lastQuestionAsked = "",
+  operationName = "",
+  pendingOperation = null,
+  previous = null,
+  sizingInterpretationNote = "",
+  status = "collecting_info",
+} = {}) {
+  return {
+    accumulatedIntent: intent,
+    lastQuestionAsked,
+    missingFields: intent.unknownFields ?? [],
+    operationName: operationName || previous?.operationName || "",
+    pendingOperationId: pendingOperation?.id ?? previous?.pendingOperationId ?? null,
+    sizingInterpretationNote: sizingInterpretationNote || previous?.sizingInterpretationNote || "",
+    status,
+    startedAt: previous?.startedAt ?? new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 function buildPendingResearchOperation({ memory = {}, message = "", options = {}, researchIntent = null, workspaceContext = {} }) {
   const previous = recentResearchPrompt(memory);
   const combinedPrompt = previous && isResearchConfirmationMessage(message)
@@ -149,7 +453,14 @@ function buildPendingResearchOperation({ memory = {}, message = "", options = {}
     options: planOptions,
     prompt: combinedPrompt,
   });
-  const baseline = plan.baselineQuery || (/(hubert|baseline)/i.test(combinedPrompt) ? "hubert" : "");
+  if (intent.range?.label && plan.range) {
+    plan.range = {
+      ...plan.range,
+      label: intent.range.label,
+      requestedDays: intent.range.requestedDays ?? plan.range.requestedDays,
+    };
+  }
+  const baseline = plan.baselineQuery || "";
   const operation = {
     id: `ah-op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     estimatedDuration: estimateDurationLabel(plan.maxCombinations),
@@ -177,12 +488,44 @@ function buildPendingResearchOperation({ memory = {}, message = "", options = {}
       `${plan.provider}`,
       `fill ${plan.fillMode}`,
       `sizing ${plan.sizingMode}`,
-      `method ${plan.methodology}`,
+      plan.methodology ? `method ${plan.methodology}` : "method not selected",
       baseline ? `baseline ${baseline}` : "no explicit baseline",
     ].join(" · "),
     type: "research-job",
   };
   return operation;
+}
+
+function isResearchIntentReady(intent = {}) {
+  return Boolean(
+    intent?.range?.from &&
+    intent?.range?.to &&
+    intent?.symbol &&
+    intent?.timeframe &&
+    intent?.combinations &&
+    intent?.methodology
+  );
+}
+
+function decoratePlanningOperation(operation, { name = "", session = null, status = "ready_to_confirm" } = {}) {
+  const plan = { ...operation.plan, planningSession: session };
+  if (status === "collecting_info" && session?.missingFields?.includes("range")) {
+    plan.range = null;
+  }
+  const operationName = name || (
+    status === "collecting_info" && session?.missingFields?.includes("range")
+      ? `AH research ${operation.plan?.symbol ?? "market"} ${operation.plan?.timeframe ?? ""}`.trim()
+      : operation.name
+  );
+  return {
+    ...operation,
+    name: operationName,
+    plan,
+    status,
+    summary: status === "collecting_info"
+      ? `${operation.plan?.symbol ?? "market"} ${operation.plan?.timeframe ?? ""} · range missing · collecting missing info`
+      : operation.summary,
+  };
 }
 
 export function createAgentOrchestrator({ copilotMemory, store, tools }) {
@@ -235,6 +578,14 @@ export function createAgentOrchestrator({ copilotMemory, store, tools }) {
       run: { ...run, plan, prompt, status: "queued" },
       workspaceContext,
     });
+    if (memory?.researchPlanningSession) {
+      await copilotMemory?.rememberResearchPlanningSession?.({
+        ...memory.researchPlanningSession,
+        pendingOperationId: body.options?.operationId ?? memory.researchPlanningSession.pendingOperationId ?? null,
+        status: "confirmed",
+        updatedAt: new Date().toISOString(),
+      });
+    }
     jobQueue.enqueue(run.id);
 
     return {
@@ -679,18 +1030,186 @@ export function createAgentOrchestrator({ copilotMemory, store, tools }) {
     const run = body.runId ? runStore.get(body.runId) : runStore.list().find((item) => item.status === "completed");
     const memory = copilotMemory?.summary?.() ?? null;
     const workspaceContext = body.workspaceContext ?? null;
-    const liveIntent = detectLiveExecutionIntent(message);
+    const activePlanningSession = memory?.researchPlanningSession ?? null;
+    const planningFollowUp = classifyPlanningFollowUp(message, activePlanningSession);
+    if (planningFollowUp === "cancellation") {
+      await copilotMemory?.clearResearchPlanningSession?.();
+      const polish = isPolishQuestion(message) || /[ąćęłńóśźż]/i.test(message);
+      const response = {
+        answer: polish
+          ? "Jasne. Wyczyściłem aktywny plan badania. Możemy zacząć nowy temat od zera."
+          : "Done. I cleared the active research plan. We can start a new topic from scratch.",
+        confidence: { label: "high", reason: "User explicitly cancelled/reset the active planning session.", score: 90 },
+        evidence: ["Active AH planning session cleared.", "No job was queued."],
+        intent: "planning-cancelled",
+        nextAction: polish ? "Napisz nowy temat albo nowe badanie." : "Send a new topic or research request.",
+        risk: { label: "low", reasons: ["Conversation state only."] },
+      };
+      await copilotMemory?.rememberInteraction?.({ message, response, run, workspaceContext });
+      return { ok: true, response };
+    }
+
     const inferredIntent = inferCopilotIntent(message, mode);
-    const updatedResearchIntent = isResearchPlanningMessage(message)
+    const liveCandidate = detectLiveExecutionIntent(message);
+    const researchPriority = inferredIntent === "research-request" || hasResearchPriorityIntent(message);
+    const ambiguousLiveResearch = researchPriority && liveCandidate && hasExplicitLiveActionIntent(message);
+    const liveIntent = researchPriority ? null : liveCandidate;
+    const shouldContinuePlanning = planningFollowUp === "answer" || planningFollowUp === "update";
+    const shouldUpdateResearchIntent = (inferredIntent === "research-request" && isResearchPlanningMessage(message)) || shouldContinuePlanning;
+    const updatedResearchIntent = shouldUpdateResearchIntent
       ? updateResearchIntent({
+        forceInherit: shouldContinuePlanning,
         message,
-        previous: memory?.researchIntent,
+        previous: shouldContinuePlanning
+          ? activePlanningSession?.accumulatedIntent ?? memory?.researchIntent
+          : memory?.researchIntent,
         workspaceContext,
       })
       : memory?.researchIntent ?? null;
     const effectiveMemory = updatedResearchIntent
       ? { ...(memory ?? {}), researchIntent: updatedResearchIntent }
       : memory;
+
+    if (ambiguousLiveResearch) {
+      const response = buildIntentAmbiguityResponse({ message });
+      if (run) {
+        await runStore.update(run.id, {
+          messages: [
+            ...(run.messages ?? []),
+            { role: "user", text: message, time: new Date().toISOString() },
+            {
+              evidence: response.evidence,
+              confidence: response.confidence,
+              role: "assistant",
+              sections: response.sections,
+              text: response.answer,
+              time: new Date().toISOString(),
+            },
+          ].slice(-40),
+        });
+      }
+      await copilotMemory?.rememberInteraction?.({ message, response, run, workspaceContext });
+      return { ok: true, response };
+    }
+
+    if (shouldContinuePlanning) {
+      const polish = isPolishQuestion(message) || /[ąćęłńóśźż]/i.test(message);
+      const operationName = extractOperationName(message) || activePlanningSession?.operationName || "";
+      const sizingInterpretationNote = extractSizingInterpretationNote(message) || activePlanningSession?.sizingInterpretationNote || "";
+      if (sizingInterpretationNote) {
+        updatedResearchIntent.sizingMode = "fixed-risk";
+        updatedResearchIntent.parameterRanges = {
+          ...(updatedResearchIntent.parameterRanges ?? {}),
+          sizingValues: updatedResearchIntent.parameterRanges?.sizingValues?.length
+            ? updatedResearchIntent.parameterRanges.sizingValues
+            : [1],
+        };
+        updatedResearchIntent.unknownFields = updatedResearchIntent.unknownFields ?? [];
+      }
+      const pendingOperationBase = buildPendingResearchOperation({
+        memory: { ...(memory ?? {}), researchIntent: updatedResearchIntent },
+        message,
+        options: body.options ?? {},
+        researchIntent: updatedResearchIntent,
+        workspaceContext,
+      });
+      const clarification = clarificationForIntent(updatedResearchIntent, { polish });
+      const ready = !clarification && isResearchIntentReady(updatedResearchIntent);
+      const session = planningSessionFromIntent({
+        intent: updatedResearchIntent,
+        lastQuestionAsked: clarification,
+        operationName,
+        pendingOperation: pendingOperationBase,
+        previous: activePlanningSession,
+        sizingInterpretationNote,
+        status: ready ? "ready_to_confirm" : "collecting_info",
+      });
+      const pendingOperation = decoratePlanningOperation(pendingOperationBase, {
+        name: operationName,
+        session,
+        status: session.status,
+      });
+      await copilotMemory?.rememberResearchIntent?.(updatedResearchIntent);
+      await copilotMemory?.rememberResearchPlanningSession?.(session);
+
+      const added = [];
+      if (operationName && operationName !== activePlanningSession?.operationName) added.push(polish ? `nazwę: ${operationName}` : `name: ${operationName}`);
+      if (sizingInterpretationNote && sizingInterpretationNote !== activePlanningSession?.sizingInterpretationNote) {
+        added.push(polish ? "interpretację sizingu: 1% jako MM/risk per SL" : "sizing interpretation: 1% as MM/risk per SL");
+      }
+      if (updatedResearchIntent.range?.from && updatedResearchIntent.range?.to && updatedResearchIntent.range?.label !== activePlanningSession?.accumulatedIntent?.range?.label) {
+        added.push(polish ? `zakres: ${updatedResearchIntent.range.label}` : `range: ${updatedResearchIntent.range.label}`);
+      }
+      if (updatedResearchIntent.baselineExplicitlyDisabled && !activePlanningSession?.accumulatedIntent?.baselineExplicitlyDisabled) {
+        added.push(polish ? "baseline wyłączony" : "baseline disabled");
+      }
+      const assumptionBlock = describeResearchAssumptions(updatedResearchIntent, { polish });
+      const response = {
+        answer: ready
+          ? (polish
+              ? [
+                  added.length ? `Dopisałem ${added.join("; ")}.` : "Zaktualizowałem plan badania.",
+                  "Plan jest kompletny. Przygotowałem kartę potwierdzenia, ale niczego jeszcze nie uruchamiam.",
+                  `Zakres: ${rangeLabel(pendingOperation.plan.range)}.`,
+                  `Rynek: ${pendingOperation.plan.symbol} ${pendingOperation.plan.timeframe}.`,
+                  `Kombinacje: ${pendingOperation.plan.maxCombinations}.`,
+                  `Metoda: ${pendingOperation.plan.methodology}.`,
+                  "Kliknij Confirm, jeśli mam wrzucić badanie do kolejki.",
+                ].join(" ")
+              : [
+                  added.length ? `I added ${added.join("; ")}.` : "I updated the research plan.",
+                  "The plan is complete. I prepared a confirmation card, but I have not started anything.",
+                  `Range: ${rangeLabel(pendingOperation.plan.range)}.`,
+                  `Market: ${pendingOperation.plan.symbol} ${pendingOperation.plan.timeframe}.`,
+                  `Combinations: ${pendingOperation.plan.maxCombinations}.`,
+                  `Method: ${pendingOperation.plan.methodology}.`,
+                  "Click Confirm if you want me to queue the research.",
+                ].join(" "))
+          : (polish
+              ? [
+                  added.length ? `Dopisałem ${added.join("; ")}.` : "Zaktualizowałem aktywny plan badania.",
+                  sizingInterpretationNote ? "Rozumiem też, że 1% ma być traktowane jako ustawienie MM/risk per SL, nie zwykły position size." : "",
+                  assumptionBlock.missing.length ? `Nadal brakuje: ${assumptionBlock.missing.join(", ")}.` : "",
+                  clarification,
+                ].filter(Boolean).join(" ")
+              : [
+                  added.length ? `I added ${added.join("; ")}.` : "I updated the active research plan.",
+                  sizingInterpretationNote ? "I understand that 1% should be treated as MM/risk per SL, not ordinary position size." : "",
+                  assumptionBlock.missing.length ? `Still missing: ${assumptionBlock.missing.join(", ")}.` : "",
+                  clarification,
+                ].filter(Boolean).join(" ")),
+        confidence: { label: "high", reason: "Message was merged into the active AH planning session.", score: 86 },
+        evidence: [
+          `Planning status: ${session.status}`,
+          `Last question: ${activePlanningSession?.lastQuestionAsked ?? "none"}`,
+          `Missing fields: ${(session.missingFields ?? []).join(", ") || "none"}`,
+          `Operation name: ${operationName || "not set"}`,
+          `Sizing note: ${sizingInterpretationNote || "none"}`,
+        ],
+        intent: ready ? "research-confirmation" : "research-planning",
+        nextAction: ready
+          ? (polish ? "Sprawdź kartę i kliknij Confirm." : "Review the card and click Confirm.")
+          : clarification,
+        pendingOperation,
+        recommendation: polish ? "Kontynuuję ten sam plan, nie zaczynam nowego wątku." : "I am continuing the same plan, not starting a new thread.",
+        risk: { label: "low", reasons: ["Planning only; no job was queued."] },
+        sections: [
+          {
+            title: polish ? "Aktywny plan" : "Active plan",
+            bullets: [
+              `Name: ${operationName || "--"}`,
+              `Symbol/timeframe: ${updatedResearchIntent.symbol ?? "--"} ${updatedResearchIntent.timeframe ?? "--"}`,
+              `Range: ${updatedResearchIntent.range?.label ?? "--"}`,
+              `Combinations: ${updatedResearchIntent.combinations ?? "--"}`,
+              `Methodology: ${updatedResearchIntent.methodology ?? "--"}`,
+              `Sizing: ${updatedResearchIntent.sizingMode ?? "--"} ${updatedResearchIntent.parameterRanges?.sizingValues?.join(", ") ?? ""}`,
+            ],
+          },
+        ],
+      };
+      await copilotMemory?.rememberInteraction?.({ message, response, run, workspaceContext });
+      return { ok: true, response };
+    }
 
     if (liveIntent) {
       const freshState = typeof tools.getCurrentManualPositionState === "function"
@@ -783,6 +1302,30 @@ export function createAgentOrchestrator({ copilotMemory, store, tools }) {
       return { ok: true, response };
     }
 
+    if (inferredIntent === "conversation-explanation") {
+      const response = buildDirectConversationAnswer({ message, memory });
+
+      if (run) {
+        await runStore.update(run.id, {
+          messages: [
+            ...(run.messages ?? []),
+            { role: "user", text: message, time: new Date().toISOString() },
+            {
+              evidence: response.evidence,
+              confidence: response.confidence,
+              role: "assistant",
+              sections: response.sections,
+              text: response.answer,
+              time: new Date().toISOString(),
+            },
+          ].slice(-40),
+        });
+      }
+      await copilotMemory?.rememberInteraction?.({ message, response, run, workspaceContext });
+
+      return { ok: true, response };
+    }
+
     if (inferredIntent === "research-request") {
       const polish = isPolishQuestion(message) || /[ąćęłńóśźż]/i.test(message);
       if (updatedResearchIntent) {
@@ -843,23 +1386,51 @@ export function createAgentOrchestrator({ copilotMemory, store, tools }) {
         researchIntent: updatedResearchIntent,
         workspaceContext,
       });
+      const hasExecutableResearchPlan = Boolean(
+        updatedResearchIntent?.range?.from &&
+        updatedResearchIntent?.range?.to &&
+        updatedResearchIntent?.symbol &&
+        updatedResearchIntent?.timeframe &&
+        updatedResearchIntent?.combinations &&
+        updatedResearchIntent?.methodology
+      );
       const shouldPrepare = pendingOperation.plan.requestedCombinationsExplicit ||
         isResearchConfirmationMessage(message) ||
-        (Boolean(updatedResearchIntent?.combinations) && isResearchContinuationCommand(message));
+        (Boolean(updatedResearchIntent?.combinations) && isResearchContinuationCommand(message)) ||
+        (hasExecutableResearchPlan && hasResearchPriorityIntent(message));
       const clarification = clarificationForIntent(updatedResearchIntent ?? pendingOperation.plan.researchIntent, { polish });
       if (clarification) {
+        const assumptionBlock = describeResearchAssumptions(updatedResearchIntent ?? {}, { polish });
+        const session = planningSessionFromIntent({
+          intent: updatedResearchIntent,
+          lastQuestionAsked: clarification,
+          previous: memory?.researchPlanningSession,
+          status: "collecting_info",
+        });
+        const draftOperation = decoratePlanningOperation(
+          buildPendingResearchOperation({
+            memory: effectiveMemory,
+            message,
+            options: body.options ?? {},
+            researchIntent: updatedResearchIntent,
+            workspaceContext,
+          }),
+          { session, status: "collecting_info" },
+        );
+        session.pendingOperationId = draftOperation.id;
+        await copilotMemory?.rememberResearchPlanningSession?.(session);
         const response = {
           answer: [
-            polish ? "Zapisałem dotychczasowe założenia badania." : "I saved the current research assumptions.",
-            updatedResearchIntent?.symbol && updatedResearchIntent?.timeframe
-              ? (polish
-                  ? `Na razie używam ${updatedResearchIntent.symbol} ${updatedResearchIntent.timeframe}.`
-                  : `For now I am using ${updatedResearchIntent.symbol} ${updatedResearchIntent.timeframe}.`)
+            polish ? "Rozumiem. Nie uruchamiam jeszcze testu." : "Understood. I am not starting the test yet.",
+            polish ? `Założenia: ${assumptionBlock.assumptions.join("; ")}.` : `Assumptions: ${assumptionBlock.assumptions.join("; ")}.`,
+            assumptionBlock.defaults.length
+              ? (polish ? `Domyślnie: ${assumptionBlock.defaults.join("; ")}.` : `Defaults: ${assumptionBlock.defaults.join("; ")}.`)
               : "",
-            updatedResearchIntent?.baselineQuery
-              ? (polish
-                  ? `Baseline: ${updatedResearchIntent.baselineQuery}.`
-                  : `Baseline: ${updatedResearchIntent.baselineQuery}.`)
+            assumptionBlock.missing.length
+              ? (polish ? `Nieustalone: ${assumptionBlock.missing.join(", ")}.` : `Missing: ${assumptionBlock.missing.join(", ")}.`)
+              : "",
+            polish && !updatedResearchIntent?.baselineQuery && !updatedResearchIntent?.baselineExplicitlyDisabled
+              ? "Chcesz zrobić czyste badanie bez baseline, czy użyć np. hubert?"
               : "",
             clarification,
           ].filter(Boolean).join(" "),
@@ -872,6 +1443,7 @@ export function createAgentOrchestrator({ copilotMemory, store, tools }) {
           ],
           intent: "research-planning",
           nextAction: clarification,
+          pendingOperation: draftOperation,
           recommendation: polish ? "Doprecyzuj tylko brakujący element; resztę zachowuję w planie rozmowy." : "Clarify only the missing item; I am keeping the rest in the conversation plan.",
           risk: { label: "low", reasons: ["No job was queued."] },
           sections: [
@@ -881,7 +1453,8 @@ export function createAgentOrchestrator({ copilotMemory, store, tools }) {
                 `Symbol/timeframe: ${updatedResearchIntent?.symbol ?? "--"} ${updatedResearchIntent?.timeframe ?? "--"}`,
                 `Range: ${updatedResearchIntent?.range?.label ?? "--"}`,
                 `Baseline: ${updatedResearchIntent?.baselineQuery || "none"}`,
-                `Methodology: ${updatedResearchIntent?.methodology ?? "--"}`,
+                `Constraints: ${JSON.stringify(updatedResearchIntent?.constraints ?? {})}`,
+                `Methodology: ${updatedResearchIntent?.methodology ?? "not selected"}`,
               ],
             },
           ],
@@ -890,29 +1463,52 @@ export function createAgentOrchestrator({ copilotMemory, store, tools }) {
         return { ok: true, response };
       }
       if (shouldPrepare) {
+        const assumptionBlock = describeResearchAssumptions(pendingOperation.plan.researchIntent ?? updatedResearchIntent ?? {}, { polish });
+        const objectiveLabels = researchObjectiveLabels(message, { polish });
+        const sizingLabel = researchSizingLabel(message, pendingOperation.plan, { polish });
+        const session = planningSessionFromIntent({
+          intent: pendingOperation.plan.researchIntent ?? updatedResearchIntent,
+          lastQuestionAsked: "",
+          operationName: pendingOperation.name,
+          pendingOperation,
+          previous: memory?.researchPlanningSession,
+          sizingInterpretationNote: pendingOperation.plan.sizingMode === "fixed-risk" ? "Fixed risk/MM risk per SL sizing selected." : "",
+          status: "ready_to_confirm",
+        });
+        const readyOperation = decoratePlanningOperation(pendingOperation, {
+          name: session.operationName,
+          session,
+          status: "ready_to_confirm",
+        });
+        await copilotMemory?.rememberResearchPlanningSession?.(session);
         const response = {
           answer: polish
             ? [
             "OK. Przygotowałem zadanie badawcze, ale go jeszcze nie uruchamiam.",
                 `Cel: ${pendingOperation.plan.objective}.`,
+                `Kategorie wyników: ${objectiveLabels.join("; ")}.`,
                 `Zakres: ${rangeLabel(pendingOperation.plan.range)}.`,
                 `Rynek: ${pendingOperation.plan.symbol} ${pendingOperation.plan.timeframe}.`,
                 `Kombinacje: ${pendingOperation.plan.maxCombinations}.`,
                 `Metoda: ${pendingOperation.plan.methodology}.`,
-                pendingOperation.plan.baselineQuery ? `Użyję zapisanego backtestu „${pendingOperation.plan.baselineQuery}” jako baseline.` : "Nie widzę jawnego baseline; możesz dopisać hubert, jeśli ma być punktem odniesienia.",
+                `Sizing: ${sizingLabel}.`,
+                pendingOperation.plan.baselineQuery ? `Użyję zapisanego backtestu „${pendingOperation.plan.baselineQuery}” jako baseline.` : "Baseline: brak, bo nie podałeś go jawnie.",
                 pendingOperation.plan.constraints?.minProfitFactor ? `Filtr: PF minimum ${pendingOperation.plan.constraints.minProfitFactor}.` : "",
                 pendingOperation.plan.constraints?.maxDrawdown ? `Filtr: DD max ${pendingOperation.plan.constraints.maxDrawdown}.` : "",
                 pendingOperation.plan.constraints?.minTrades ? `Filtr: minimum ${pendingOperation.plan.constraints.minTrades} transakcji.` : "",
+                `Jawne założenia: ${assumptionBlock.assumptions.join("; ")}.`,
                 "Nadaj nazwę badania i kliknij Zatwierdź, jeśli mam je wrzucić do kolejki.",
               ].join(" ")
             : [
                 "OK. I prepared a research job, but I have not started it yet.",
                 `Objective: ${pendingOperation.plan.objective}.`,
+                `Result categories: ${objectiveLabels.join("; ")}.`,
                 `Range: ${rangeLabel(pendingOperation.plan.range)}.`,
                 `Market: ${pendingOperation.plan.symbol} ${pendingOperation.plan.timeframe}.`,
                 `Combinations: ${pendingOperation.plan.maxCombinations}.`,
                 `Method: ${pendingOperation.plan.methodology}.`,
-                pendingOperation.plan.baselineQuery ? `I will use saved backtest “${pendingOperation.plan.baselineQuery}” as baseline.` : "No explicit baseline was found; add hubert if it should be used.",
+                `Sizing: ${sizingLabel}.`,
+                pendingOperation.plan.baselineQuery ? `I will use saved backtest “${pendingOperation.plan.baselineQuery}” as baseline.` : "Baseline: none, because you did not request one explicitly.",
                 "Name it and confirm if you want me to queue it.",
               ].join(" "),
           confidence: { label: "high", reason: "AH prepared a pending research operation instead of launching a job silently.", score: 88 },
@@ -923,12 +1519,14 @@ export function createAgentOrchestrator({ copilotMemory, store, tools }) {
             `Combinations: requested ${pendingOperation.plan.requestedCombinations}, planned ${pendingOperation.plan.plannedCombinations}`,
             `Provider: ${pendingOperation.plan.provider}`,
             `Methodology: ${pendingOperation.plan.methodology}`,
+            `Objectives: ${objectiveLabels.join(", ")}`,
+            `Sizing note: ${sizingLabel}`,
             `Constraints: ${JSON.stringify(pendingOperation.plan.constraints ?? {})}`,
             `Parameter ranges: ${JSON.stringify(pendingOperation.plan.parameters ?? {})}`,
           ],
           intent: "research-confirmation",
           nextAction: polish ? "Sprawdź kartę pending operation i kliknij Zatwierdź." : "Review the pending operation card and click Confirm.",
-          pendingOperation,
+          pendingOperation: readyOperation,
           recommendation: polish ? "Najpierw potwierdź zakres i liczbę kombinacji." : "Confirm the range and combination count first.",
           risk: { label: pendingOperation.plan.maxCombinations > 1000 ? "moderate" : "low", reasons: pendingOperation.riskNotes },
         };

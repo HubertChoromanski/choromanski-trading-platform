@@ -20,6 +20,7 @@ const DEFAULT_MEMORY = {
     style: "direct",
   },
   previousConclusions: [],
+  researchPlanningSession: null,
   researchIntent: null,
   recentRuns: [],
   recentWorkspace: null,
@@ -36,7 +37,7 @@ function normalizeText(value = "") {
 }
 
 function isPolish(value = "") {
-  return /(^|\s)(co|czemu|dlaczego|jak|gdzie|porownaj|porównaj|wynik|dziala|działa|nadal|lepszy|gorszy|ustawienia|prosze|proszę)(\s|$)/u
+  return /(^|\s)(co|czemu|dlaczego|jak|gdzie|porownaj|porównaj|wynik|dziala|działa|nadal|lepszy|gorszy|ustawienia|prosze|proszę|uzyj|użyj|ignoruj|bez|baseline|chce|zebys|zrobil|badani|badania|zakres|katem|ostatnie|dni|nazwij|uwaga|okres|testow|testy)(\s|$)/u
     .test(normalizeText(value));
 }
 
@@ -102,6 +103,7 @@ function normalizeMemory(memory = {}) {
       metrics: Array.isArray(memory.preferences?.metrics) ? memory.preferences.metrics : [],
     },
     previousConclusions: Array.isArray(memory.previousConclusions) ? memory.previousConclusions : [],
+    researchPlanningSession: memory.researchPlanningSession && typeof memory.researchPlanningSession === "object" ? memory.researchPlanningSession : null,
     researchIntent: memory.researchIntent && typeof memory.researchIntent === "object" ? memory.researchIntent : null,
     recentRuns: Array.isArray(memory.recentRuns) ? memory.recentRuns : [],
     rejectedConfigs: Array.isArray(memory.rejectedConfigs) ? memory.rejectedConfigs : [],
@@ -266,6 +268,28 @@ export function createCopilotMemoryStore({ store }) {
       });
     },
 
+    async rememberResearchPlanningSession(session = null) {
+      const current = getMemory();
+      return save({
+        ...current,
+        researchPlanningSession: session && typeof session === "object"
+          ? sanitizeForAi({
+              ...session,
+              updatedAt: new Date().toISOString(),
+            })
+          : null,
+      });
+    },
+
+    async clearResearchPlanningSession() {
+      const current = getMemory();
+      return save({
+        ...current,
+        researchPlanningSession: null,
+        researchIntent: null,
+      });
+    },
+
     summary() {
       const memory = getMemory();
       return sanitizeForAi({
@@ -274,6 +298,7 @@ export function createCopilotMemoryStore({ store }) {
         discussedWeaknesses: memory.discussedWeaknesses.slice(0, 8),
         preferences: memory.preferences,
         previousConclusions: memory.previousConclusions.slice(0, 5),
+        researchPlanningSession: memory.researchPlanningSession,
         researchIntent: memory.researchIntent,
         recentRuns: memory.recentRuns.slice(0, 6),
         recentWorkspace: memory.recentWorkspace,

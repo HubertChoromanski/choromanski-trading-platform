@@ -139,6 +139,25 @@ function parseMonthRange(text) {
   };
 }
 
+function parseRelativeDayRange(text) {
+  const normalized = normalizeText(text);
+  const match =
+    normalized.match(/\b(?:ostatnie|ostatnich|last)\s+(\d{1,4})\s*(?:dni|days?)\b/i) ??
+    normalized.match(/\b(\d{1,4})\s*(?:dni|days?)\b/i);
+  if (!match) return null;
+  const days = Number(match[1]);
+  if (!Number.isFinite(days) || days <= 0) return null;
+  const to = new Date();
+  const from = new Date(to.getTime() - days * 24 * 60 * 60 * 1000);
+  return {
+    explicit: true,
+    from: isoDate(from),
+    label: `last ${days} days`,
+    requestedDays: days,
+    to: isoDate(to),
+  };
+}
+
 function parseSymbol(text, fallback = null) {
   const match = String(text).match(/\b([A-Z]{2,12}USDT)\b/i);
   return match?.[1]?.toUpperCase() ?? fallback ?? null;
@@ -158,10 +177,18 @@ function parseCombinations(text) {
     String(text).match(/\b(\d{2,5})\s*(?:kombinacj|kombinacje|testow|testów|combination|combinations|tests|runs)\b/i) ??
     String(text).match(/\b(?:zrob|zrób|run|odpal|uruchom)\s*(\d{2,5})\b/i) ??
     (String(text).trim().match(/^(\d{2,5})$/));
-  return match ? Number(match[1]) : null;
+  if (match) return Number(match[1]);
+  const normalized = normalizeText(text);
+  if (/(potezny|potężny|mocny|gleboki|głęboki|deep|large).{0,30}(test|badanie|research|sweep|kombinacj)/i.test(normalized)) return 1000;
+  return null;
+}
+
+function baselineClearRequested(text) {
+  return /(ignoruj|ignore|bez|without|clear|usun|usuń).{0,24}(hubert|baseline|baz[aeę])|(?:hubert|baseline|baz[aeę]).{0,24}(ignoruj|ignore|clear|usun|usuń)/i.test(normalizeText(text));
 }
 
 function parseBaseline(text, fallback = "") {
+  if (baselineClearRequested(text)) return "";
   if (/\bhubert\b/i.test(text)) return "hubert";
   const match = String(text).match(/\b(?:baseline|porownaj do|porównaj do|lepsze od|lepszy od|better than|worse than)\s+["“]?([a-z0-9][a-z0-9 _.-]{1,50})["”]?/i);
   return match?.[1]?.trim() ?? fallback ?? "";
@@ -208,11 +235,20 @@ function parseParameters(text, previous = {}) {
   const fixedRisk = parseSingleByAliases(text, ["fixed\\s*risk", "risk\\s*per\\s*trade", "ryzyko"]);
   if (fixedRisk) next.sizingValues = [fixedRisk];
 
+  const positionPercent = String(text).match(/\b(\d+(?:[.,]\d+)?)\s*%\s*(?:per\s*position|position|pozycj)/i);
+  if (positionPercent?.[1]) next.sizingValues = [numberValue(positionPercent[1])];
+
+  const slRiskPercent = String(text).match(/\b(\d+(?:[.,]\d+)?)\s*%[^.]{0,80}\b(?:sl|stop[-\s]*loss|risk\s*per\s*sl|na\s+sl|per\s+sl)\b/i);
+  if (slRiskPercent?.[1]) next.sizingValues = [numberValue(slRiskPercent[1])];
+
   return next;
 }
 
 function inferObjective(text, previous = null) {
   const normalized = normalizeText(text);
+  if (/(multiplier|multipayer|mnoznik|mnożnik|nwe|atr mult)/i.test(normalized) && /(widelek|widelki|widełek|widełki|range|zakres)/i.test(normalized)) {
+    return "multiplier range discovery";
+  }
   if ((normalized.includes("duzy zysk") || normalized.includes("duży zysk") || normalized.includes("large profit")) && /(stabil|dd|drawdown|robust)/i.test(normalized)) {
     return "risk-adjusted return";
   }
@@ -224,11 +260,11 @@ function inferObjective(text, previous = null) {
 
 function inferMethodology(intent = {}, text = "") {
   const normalized = normalizeText(text);
+  if (/(grid|siatka)/i.test(normalized)) return "grid search";
   if (/(zawez|zawęź|narrow|wokol|wokół|neighbor)/i.test(normalized)) return "adaptive two-stage search";
-  if (intent.baselineQuery) return "baseline-seeded grid";
-  if (normalized.includes("optymal") || normalized.includes("best") || normalized.includes("najlepsze")) return "adaptive two-stage search";
-  if (normalized.includes("conservative") || normalized.includes("walidac")) return "robustness validation";
-  return intent.methodology ?? "grid search";
+  if (/(adaptive|dwustopni|two-stage|dwuetap)/i.test(normalized)) return "adaptive two-stage search";
+  if (/(robustness|walidac|validation)/i.test(normalized)) return "robustness validation";
+  return intent.methodology ?? null;
 }
 
 function compactUnknowns(intent = {}) {
@@ -237,6 +273,7 @@ function compactUnknowns(intent = {}) {
   if (!intent.symbol) unknown.push("symbol");
   if (!intent.timeframe) unknown.push("timeframe");
   if (!intent.combinations) unknown.push("combinations");
+  if (!intent.methodology) unknown.push("methodology");
   return unknown;
 }
 
@@ -245,43 +282,65 @@ export function isResearchPlanningMessage(message = "") {
   return /(ustawien|ustawienia|najlepsze|optymal|sweep|kombinacj|testuj|zrob|zrób|zawez|zawęź|narrow|wokol|wokół|configu|config #|atr|nwe|bandwidth|\bpf\b|profit factor|\bdd\b|drawdown|trade|transakc|hubert|baseline|conservative|fixed risk|ryzyko|marzec|marca|styczen|stycznia|luty|lutego|kwiecien|kwietnia|maj|maja|czerwiec|czerwca|lipiec|lipca|sierpien|sierpnia|wrzesien|wrzesnia|pazdziernik|pazdziernika|listopad|listopada|grudzien|grudnia)/i.test(normalized);
 }
 
-export function updateResearchIntent({ message = "", previous = null, workspaceContext = null } = {}) {
+function hasExplicitRange(text = "") {
+  return Boolean(parseExplicitDateRange(text) || parseMonthRange(text) || parseRelativeDayRange(text));
+}
+
+function hasExplicitResearchStart(text = "") {
+  const normalized = normalizeText(text);
+  return /(znajdz|znajdź|szukaj|zrob test|zrób test|test roznych|test różnych|nowe badanie|new research|find|search|research|optymal|najlepsze)/i.test(normalized) ||
+    hasExplicitRange(text);
+}
+
+function isContinuationMessage(text = "") {
+  const normalized = normalizeText(text);
+  const onlyAddsDetails = /(atr|nwe|bandwidth|\bpf\b|\bdd\b|drawdown|trade|transakc|zrob|zrób|kombinacj|conservative|legacy|zawez|zawęź|wokol|wokół|configu|baseline|hubert|ignoruj|ignore|bez baseline)/i.test(normalized);
+  return onlyAddsDetails && !hasExplicitResearchStart(text);
+}
+
+export function updateResearchIntent({ message = "", previous = null, workspaceContext = null, forceInherit = false } = {}) {
   const previousIntent = previous && typeof previous === "object" ? previous : {};
+  const shouldInherit = forceInherit || isContinuationMessage(message);
+  const inherited = shouldInherit ? previousIntent : {};
   const chart = workspaceContext?.chart ?? {};
-  const range = parseExplicitDateRange(message) ?? parseMonthRange(message) ?? previousIntent.range ?? null;
-  const symbol = parseSymbol(message, previousIntent.symbol ?? chart.symbol ?? "SOLUSDT");
-  const timeframe = parseTimeframe(message, previousIntent.timeframe ?? chart.timeframe ?? "15m");
-  const combinations = parseCombinations(message) ?? previousIntent.combinations ?? null;
-  const baselineQuery = parseBaseline(message, previousIntent.baselineQuery ?? "");
-  const constraints = parseConstraints(message, previousIntent.constraints);
-  const parameterRanges = parseParameters(message, previousIntent.parameterRanges);
+  const range = parseExplicitDateRange(message) ?? parseMonthRange(message) ?? parseRelativeDayRange(message) ?? inherited.range ?? null;
+  const symbol = parseSymbol(message, inherited.symbol ?? chart.symbol ?? "SOLUSDT");
+  const timeframe = parseTimeframe(message, inherited.timeframe ?? chart.timeframe ?? "15m");
+  const combinations = parseCombinations(message) ?? inherited.combinations ?? null;
+  const baselineQuery = parseBaseline(message, inherited.baselineQuery ?? "");
+  const baselineExplicitlyDisabled = baselineClearRequested(message) ||
+    (!baselineQuery && Boolean(inherited.baselineExplicitlyDisabled));
+  const constraints = parseConstraints(message, inherited.constraints ?? {});
+  const parameterRanges = parseParameters(message, inherited.parameterRanges ?? {});
   const fillMode = /conservative/i.test(message)
     ? "conservative"
     : /legacy/i.test(message)
       ? "legacy"
-      : previousIntent.fillMode ?? "legacy";
-  const sizingMode = /(fixed risk|risk per trade|ryzyko)/i.test(message)
+      : inherited.fillMode ?? "legacy";
+  const sizingMode = /(fixed risk|risk per trade|ryzyko|risk per sl|per sl|na sl|sl z atr|atr sl|stop[-\s]*loss risk)/i.test(message)
     ? "fixed-risk"
     : /(position percent|pozycj|exposure)/i.test(message)
       ? "position-percent"
-      : previousIntent.sizingMode ?? "position-percent";
-  const objective = inferObjective(message, previousIntent.objective) ?? "robustness-adjusted return";
+      : inherited.sizingMode ?? "position-percent";
+  const objective = inferObjective(message, inherited.objective) ?? "robustness-adjusted return";
   const focusConfig = String(message).match(/\b(?:config|konfig|configu)\s*#?\s*(\d+)/i);
   const next = {
     baselineQuery,
+    baselineExplicitlyDisabled,
     combinations,
     confidence: "working",
     constraints,
     fillMode,
-    focusConfigRank: focusConfig?.[1] ? Number(focusConfig[1]) : previousIntent.focusConfigRank ?? null,
-    methodology: inferMethodology({ baselineQuery, methodology: previousIntent.methodology }, message),
+    focusConfigRank: focusConfig?.[1] ? Number(focusConfig[1]) : inherited.focusConfigRank ?? null,
+    inheritedFromPrevious: shouldInherit,
+    methodology: inferMethodology({ baselineQuery, methodology: inherited.methodology }, message),
     notes: [
       { message: String(message).slice(0, 500), time: new Date().toISOString() },
-      ...(previousIntent.notes ?? []),
+      ...(inherited.notes ?? []),
     ].slice(0, 10),
     objective,
     parameterRanges,
-    provider: previousIntent.provider ?? "binance-futures",
+    provider: inherited.provider ?? "binance-futures",
     range,
     sizingMode,
     symbol,
@@ -334,5 +393,35 @@ export function clarificationForIntent(intent = {}, { polish = false } = {}) {
       ? "Ile kombinacji chcesz: 200 szybki test, 500 solidnie, czy 1000 mocniej?"
       : "How many combinations do you want: 200 quick, 500 solid, or 1000 stronger?";
   }
+  if (!intent.methodology) {
+    return polish
+      ? "Jaką metodę wybrać: prosty grid search, czy adaptive two-stage search?"
+      : "Which method should I use: simple grid search or adaptive two-stage search?";
+  }
   return "";
+}
+
+export function describeResearchAssumptions(intent = {}, { polish = false } = {}) {
+  const assumptions = [];
+  const missing = [];
+  const defaults = [];
+  assumptions.push(polish
+    ? `zakres: ${intent.range?.label ?? "nieustalony"}`
+    : `range: ${intent.range?.label ?? "not set"}`);
+  assumptions.push(polish
+    ? `rynek: ${intent.symbol ?? "--"} ${intent.timeframe ?? "--"}`
+    : `market: ${intent.symbol ?? "--"} ${intent.timeframe ?? "--"}`);
+  assumptions.push(polish
+    ? `baseline: ${intent.baselineQuery || "brak"}`
+    : `baseline: ${intent.baselineQuery || "none"}`);
+  assumptions.push(polish
+    ? `limity PF/DD/trades: ${Object.keys(intent.constraints ?? {}).length ? JSON.stringify(intent.constraints) : "brak"}`
+    : `PF/DD/trade limits: ${Object.keys(intent.constraints ?? {}).length ? JSON.stringify(intent.constraints) : "none"}`);
+  if (!intent.combinations) missing.push(polish ? "liczba kombinacji" : "combination count");
+  if (!intent.methodology) missing.push(polish ? "metodologia" : "methodology");
+  if (!intent.baselineQuery) defaults.push(intent.baselineExplicitlyDisabled
+    ? (polish ? "baseline jest wyłączony w tej rozmowie" : "baseline is disabled in this conversation")
+    : (polish ? "nie dodaję baseline automatycznie" : "no baseline is added automatically"));
+  if (!Object.keys(intent.constraints ?? {}).length) defaults.push(polish ? "nie dodaję limitów PF/DD bez Twojej prośby" : "no PF/DD limits are added unless you ask");
+  return { assumptions, defaults, missing };
 }

@@ -242,7 +242,7 @@ export function createAgentPlan({ options = {}, prompt = "" }) {
       sizingValues: options.sizingValues,
     },
     constraints: options.constraints ?? {},
-    methodology: options.methodology ?? "grid search",
+    methodology: options.methodology ?? null,
     provider: options.provider ?? "binance-futures",
     range: parseRange(prompt, options),
     researchIntent: options.researchIntent ?? null,

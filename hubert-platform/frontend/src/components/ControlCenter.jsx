@@ -4072,12 +4072,16 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
       if (pendingAhOperation.type !== "research-job") {
         throw new Error("This pending operation is not wired for execution yet.");
       }
+      if (pendingAhOperation.status && pendingAhOperation.status !== "ready_to_confirm") {
+        throw new Error("AH is still collecting details for this research plan.");
+      }
       const payload = await apiRequest("/ai/agent/run", {
         body: {
           ...(pendingAhOperation.params ?? {}),
           name: pendingAhName || pendingAhOperation.name,
           options: {
             ...(pendingAhOperation.params?.options ?? {}),
+            operationId: pendingAhOperation.id,
             operationName: pendingAhName || pendingAhOperation.name,
             workspaceContext: activeWorkspaceContext,
           },
@@ -4108,6 +4112,16 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
       setPendingAhName("");
       return payload;
     });
+  }
+
+  async function cancelPendingAhOperation() {
+    setPendingAhOperation(null);
+    setPendingAhName("");
+    try {
+      await askFollowUp("zacznij od nowa");
+    } catch {
+      // The visible card is already cleared; backend cleanup failure is shown in chat diagnostics.
+    }
   }
 
   function updatePendingAhPlan(path, value) {
@@ -4220,6 +4234,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
     const labels = {
       "chart-backtest-question": "chart / backtest",
       "code-platform-diagnosis": "code / platform diagnosis",
+      "conversation-explanation": "conversation / explanation",
       "current-research-result": "current result",
       "general-platform-question": "general platform question",
       "platform-diagnosis": "platform diagnosis",
@@ -4699,7 +4714,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
         <span><b>Chart</b>{activeWorkspaceContext.chart?.symbol ?? "SOLUSDT"} · {activeWorkspaceContext.chart?.timeframe ?? "--"} · {activeWorkspaceContext.chart?.renderedCandles ?? 0} candles</span>
         <span><b>Panel</b>{activeWorkspaceContext.activePanel ?? "AI"}</span>
         <span><b>Live</b>{activeWorkspaceContext.live?.openPositions ?? 0} positions · {activeWorkspaceContext.live?.source ?? "syncing"}</span>
-        <span><b>Baseline</b>{copilotMemory?.favoriteBaselines?.[0]?.name ?? "none remembered"}</span>
+        <span><b>Research baseline</b>{copilotMemory?.researchIntent?.baselineQuery || "none active"}</span>
       </div>
       <div className="hubert-lab__actions hubert-chat-toolbar">
         <button type="button" onClick={() => setAhExpanded((value) => !value)}>{ahExpanded ? "Compact AH" : "Expand AH"}</button>
@@ -4761,7 +4776,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
             <article className="hubert-ah-pending">
               <div className="hubert-lab__subhead">
                 <strong>Pending AH operation</strong>
-                <span>{pendingAhOperation.type}</span>
+                <span>{pendingAhOperation.status ?? pendingAhOperation.type}</span>
               </div>
               <label>
                 <span>Research name</span>
@@ -4777,6 +4792,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
                 <Metric label="Baseline" value={pendingAhOperation.plan?.baselineQuery || "none"} />
                 <Metric label="Symbol" value={pendingAhOperation.plan?.symbol ?? "--"} />
                 <Metric label="TF" value={pendingAhOperation.plan?.timeframe ?? "--"} />
+                <Metric label="Missing" value={pendingAhOperation.plan?.planningSession?.missingFields?.join(", ") || "none"} />
               </div>
               <details className="hubert-advanced">
                 <summary>Edit pending parameters</summary>
@@ -4827,8 +4843,8 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
                 <pre className="hubert-ai-json">{JSON.stringify(pendingAhOperation.plan, null, 2).slice(0, 7000)}</pre>
               </details>
               <div className="hubert-lab__actions">
-                <button type="button" onClick={confirmPendingAhOperation}>Confirm</button>
-                <button type="button" onClick={() => setPendingAhOperation(null)}>Cancel</button>
+                <button type="button" disabled={pendingAhOperation.status && pendingAhOperation.status !== "ready_to_confirm"} onClick={confirmPendingAhOperation}>Confirm</button>
+                <button type="button" onClick={cancelPendingAhOperation}>Cancel</button>
               </div>
             </article>
           )}

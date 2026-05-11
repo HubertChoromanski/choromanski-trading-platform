@@ -10,6 +10,7 @@
     "start": "node src/index.js",
     "start:prod": "pm2 start ecosystem.config.cjs --env production",
     "status": "pm2 status choromanski-trading-backend",
+    "test:ai-intent": "node scripts/ai-intent-regression.mjs",
     "stop:prod": "pm2 stop choromanski-trading-backend"
   },
   "dependencies": {
