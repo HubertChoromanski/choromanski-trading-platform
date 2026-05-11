@@ -3,6 +3,7 @@ import { mergeProgress } from "./agentProgress.js";
 import { composeAgentMarkdown, composeEmailDraft, composeTelegramDraft, rowsToCsv } from "./agentReportComposer.js";
 import { normalizeResearchRows, summarizeIntegrity } from "./agentResultIntegrity.js";
 import { runResearchWorkflow } from "../research/researchEngine.js";
+import { runAgentOS } from "../agentOS/agentOS.js";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -264,6 +265,16 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
     });
   }
 
+  async function executeAgentOS(run) {
+    return runAgentOS({
+      isCancelled: () => isCancelled(run.id),
+      onProgress: (progress, step) => updateProgress(run.id, progress, step),
+      plan: { ...run.plan, jobId: run.id },
+      run,
+      toolRegistry,
+    });
+  }
+
   async function execute(runId) {
     const initialRun = runStore.get(runId);
     if (!initialRun) return null;
@@ -280,7 +291,9 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
       const run = runStore.get(runId);
       let output;
 
-      if (run.plan.kind === "research") {
+      if (run.plan.kind === "agent_os") {
+        output = await executeAgentOS(run);
+      } else if (run.plan.kind === "research") {
         output = await executeResearch(run);
       } else if (run.plan.kind === "sweep" || run.plan.kind === "report") {
         output = await executeSweep(run);
@@ -310,7 +323,10 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
           ...integrity.warnings.map((warning) => `Integrity: ${warning}`),
         ],
       };
-      const artifacts = reportArtifacts({ output: normalizedOutput, plan: latest.plan, run: latest });
+      const artifacts = [
+        ...reportArtifacts({ output: normalizedOutput, plan: latest.plan, run: latest }),
+        ...(normalizedOutput.artifacts ?? []),
+      ];
       const resultSummary = {
         best: normalizedRows[0] ?? null,
         cacheStats: normalizedOutput.cacheStats ?? latest.cacheStats ?? {},

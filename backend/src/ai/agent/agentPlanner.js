@@ -61,8 +61,8 @@ function parseExplicitDateRange(text) {
   const datePattern = String.raw`(\d{4}[.-]\d{1,2}[.-]\d{1,2})`;
   const range =
     source.match(new RegExp(`from\\s+${datePattern}\\s+(?:to|until|through|-)\\s+${datePattern}`, "i")) ??
-    source.match(new RegExp(`od\\s+${datePattern}\\s+(?:do|-)\\s+${datePattern}`, "i")) ??
-    source.match(new RegExp(`${datePattern}\\s*(?:→|->|to|until|through|-)\\s*${datePattern}`, "i"));
+    source.match(new RegExp(`od\\s+${datePattern}\\s+(?:do|–|-)\\s+${datePattern}`, "i")) ??
+    source.match(new RegExp(`${datePattern}\\s*(?:→|->|to|until|through|–|-)\\s*${datePattern}`, "i"));
 
   if (range) {
     const from = parseFlexibleDate(range[1]);
@@ -162,6 +162,8 @@ function parseBaselineQuery(text, options = {}) {
 
 function inferKind(text) {
   const lower = String(text).toLowerCase();
+  if (/(word|docx|excel|xlsx|artifact|pakiet|wnioski|wykres|tabel|multi[-\s]*objective|osobno)/i.test(lower) &&
+    /(znajd|find|zrob|zrób|prepare|przygotuj|research|badanie|test|ustawien|ustawienia)/i.test(lower)) return "agent_os";
   if (
     lower.includes("robust") ||
     lower.includes("overfit") ||
@@ -187,11 +189,14 @@ function requestedArtifacts(text) {
   const lower = String(text).toLowerCase();
   return {
     csv: lower.includes("csv"),
+    docx: lower.includes("word") || lower.includes("docx") || lower.includes("dokument"),
+    excel: lower.includes("excel") || lower.includes("xlsx"),
     emailDraft: lower.includes("email"),
     json: lower.includes("json") || lower.includes("export"),
     markdown: true,
     presentation: lower.includes("presentation") || lower.includes("slides"),
     telegramDraft: lower.includes("telegram"),
+    xlsx: lower.includes("excel") || lower.includes("xlsx") || lower.includes("arkusz"),
   };
 }
 

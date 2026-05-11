@@ -22,6 +22,20 @@ function scoreResult(metrics = {}, startingBalance = 10000) {
   return netPercent + profitFactor * 1.5 + tradeQuality - drawdown * 0.75;
 }
 
+function rrrFromMetrics(metrics = {}) {
+  const direct = Number(metrics.rrr ?? metrics.rewardRiskRatio);
+  if (Number.isFinite(direct)) return direct;
+  const averageWin = Number(metrics.averageWin);
+  const averageLoss = Number(metrics.averageLoss);
+  if (averageWin > 0 && averageLoss < 0) return averageWin / Math.abs(averageLoss);
+  return null;
+}
+
+function avgRFromMetrics(metrics = {}) {
+  const direct = Number(metrics.avgR ?? metrics.averageR ?? metrics.avgRPerTrade);
+  return Number.isFinite(direct) ? direct : null;
+}
+
 function constraintStatus(row = {}, constraints = {}) {
   const metrics = row.metrics ?? row;
   const failures = [];
@@ -710,6 +724,10 @@ export function createAgentToolRegistry({ tools }) {
         netProfit: row.metrics?.netProfit ?? 0,
         profitFactor: row.metrics?.profitFactor ?? 0,
         rank: index + 1,
+        rrr: rrrFromMetrics(row.metrics),
+        rrrSource: rrrFromMetrics(row.metrics) === null ? "unavailable" : "avg win / avg loss",
+        avgR: avgRFromMetrics(row.metrics),
+        avgRSource: avgRFromMetrics(row.metrics) === null ? "unavailable" : "average R multiple",
         totalTrades: row.metrics?.totalTrades ?? 0,
         winRate: row.metrics?.winRate ?? 0,
       }));

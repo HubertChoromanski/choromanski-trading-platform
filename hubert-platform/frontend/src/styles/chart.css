@@ -877,6 +877,23 @@ button {
   line-height: 1.35;
 }
 
+.hubert-range-mode {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  border-radius: 6px;
+  background: rgba(220, 220, 220, 0.58);
+}
+
+.hubert-range-mode span {
+  color: rgba(0, 0, 0, 0.64);
+  font-size: 11px;
+  font-weight: 760;
+}
+
 .hubert-details {
   display: grid;
   gap: 8px;
@@ -1421,6 +1438,69 @@ button {
   vector-effect: non-scaling-stroke;
 }
 
+.hubert-chart-box--analytics {
+  gap: 10px;
+}
+
+.hubert-chart-box--analytics .hubert-lab__subhead {
+  margin: 0;
+}
+
+.hubert-chart-box--analytics .hubert-lab__subhead button {
+  min-height: 28px;
+  padding: 4px 9px;
+  font-size: 10px;
+}
+
+.hubert-equity-interactive {
+  position: relative;
+  min-height: 260px;
+  cursor: crosshair;
+  user-select: none;
+}
+
+.hubert-equity-interactive .hubert-lab__equity {
+  height: 260px;
+  background:
+    linear-gradient(rgba(0, 0, 0, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 0, 0, 0.07) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(236, 236, 236, 0.92), rgba(198, 198, 198, 0.74));
+  background-size: 100% 52px, 86px 100%, auto;
+}
+
+.hubert-equity-interactive .hubert-lab__equity polyline {
+  stroke-width: 2.4;
+}
+
+.hubert-equity-hover-line {
+  stroke: rgba(0, 0, 0, 0.34);
+  stroke-dasharray: 3 3;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.hubert-equity-tooltip {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: grid;
+  gap: 3px;
+  max-width: min(260px, calc(100% - 20px));
+  padding: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  border-radius: 5px;
+  background: rgba(235, 235, 235, 0.94);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.12);
+  pointer-events: none;
+}
+
+.hubert-equity-tooltip strong,
+.hubert-equity-tooltip span {
+  color: rgba(0, 0, 0, 0.78);
+  font-size: 11px;
+  font-weight: 820;
+}
+
 .hubert-lab__equity--drawdown polyline {
   stroke: rgba(120, 24, 24, 0.78);
 }
@@ -1439,6 +1519,7 @@ button {
 
 .hubert-lab__table--sweep {
   overflow-x: hidden;
+  max-height: 460px;
 }
 
 .hubert-lab__table--sweep table {
@@ -1464,24 +1545,24 @@ button {
 
 .hubert-lab__table--sweep th:nth-child(1),
 .hubert-lab__table--sweep td:nth-child(1) {
-  width: 30px;
+  width: 28px;
 }
 
 .hubert-lab__table--sweep th:nth-child(2),
 .hubert-lab__table--sweep td:nth-child(2) {
-  width: 46px;
+  width: 40px;
 }
 
 .hubert-lab__table--sweep th:nth-child(3),
 .hubert-lab__table--sweep td:nth-child(3) {
-  width: 60px;
+  width: 56px;
 }
 
 .hubert-lab__table--sweep th:nth-child(4),
 .hubert-lab__table--sweep td:nth-child(4),
 .hubert-lab__table--sweep th:nth-child(6),
 .hubert-lab__table--sweep td:nth-child(6) {
-  width: 48px;
+  width: 42px;
 }
 
 .hubert-lab__table--sweep th:nth-child(5),
@@ -1495,17 +1576,23 @@ button {
 .hubert-lab__table--sweep th:nth-child(10),
 .hubert-lab__table--sweep td:nth-child(10),
 .hubert-lab__table--sweep th:nth-child(11),
-.hubert-lab__table--sweep td:nth-child(11) {
-  width: 40px;
-}
-
+.hubert-lab__table--sweep td:nth-child(11),
 .hubert-lab__table--sweep th:nth-child(12),
-.hubert-lab__table--sweep td:nth-child(12) {
-  width: 92px;
+.hubert-lab__table--sweep td:nth-child(12),
+.hubert-lab__table--sweep th:nth-child(13),
+.hubert-lab__table--sweep td:nth-child(13),
+.hubert-lab__table--sweep th:nth-child(14),
+.hubert-lab__table--sweep td:nth-child(14) {
+  width: 36px;
 }
 
-.hubert-lab__table--sweep th:nth-child(13),
-.hubert-lab__table--sweep td:nth-child(13) {
+.hubert-lab__table--sweep th:nth-child(15),
+.hubert-lab__table--sweep td:nth-child(15) {
+  width: 74px;
+}
+
+.hubert-lab__table--sweep th:nth-child(16),
+.hubert-lab__table--sweep td:nth-child(16) {
   width: 42px;
 }
 
@@ -1513,11 +1600,49 @@ button {
   font-size: 10px;
 }
 
+.hubert-sweep-row--top {
+  background: rgba(245, 245, 245, 0.48);
+}
+
+.hubert-sweep-detail-row td {
+  padding: 3px 6px 8px;
+  background: rgba(218, 218, 218, 0.52);
+}
+
+.hubert-sweep-detail-row details {
+  display: grid;
+  gap: 4px;
+}
+
+.hubert-sweep-detail-row summary {
+  cursor: pointer;
+  color: rgba(0, 0, 0, 0.68);
+  font-size: 10px;
+  font-weight: 820;
+  text-transform: uppercase;
+}
+
+.hubert-sweep-detail-row span {
+  display: block;
+  white-space: normal;
+  color: rgba(0, 0, 0, 0.68);
+  font-size: 10px;
+  font-weight: 720;
+  line-height: 1.35;
+}
+
 .hubert-sweep-open {
   min-height: 24px;
   padding: 4px 6px;
   font-size: 10px;
   line-height: 1;
+}
+
+.hubert-sweep-filters button[data-active="true"],
+.hubert-range-mode button[data-active="true"] {
+  background: #090909;
+  border-color: #090909;
+  color: #f3f3f3;
 }
 
 .hubert-lab table {
@@ -1568,16 +1693,17 @@ button {
   right: 56px;
   bottom: 34px;
   z-index: 3;
-  width: 34px;
+  width: auto;
+  min-width: 92px;
   height: 34px;
-  padding: 0;
+  padding: 0 10px;
   border: 1px solid rgba(0, 0, 0, 0.26);
   border-radius: 6px;
   background: rgba(190, 190, 190, 0.76);
   color: #0b0b0b;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.34);
   cursor: pointer;
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 850;
   line-height: 1;
 }

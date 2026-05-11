@@ -14,6 +14,7 @@ import {
 import { composeAgentMarkdown, rowsToCsv } from "./agentReportComposer.js";
 import { metricDiff as diffMetrics, normalizeResearchResult, summarizeIntegrity } from "./agentResultIntegrity.js";
 import { buildReasoningResponse } from "../reasoning/reasoningEngine.js";
+import { agentOSToolCatalog, createAgentOSPendingOperation, isAgentOSGoal, planAgentOSTask } from "../agentOS/agentOS.js";
 
 function isPolishQuestion(value = "") {
   const normalized = String(value)
@@ -300,6 +301,46 @@ function researchSizingLabel(message = "", plan = {}, { polish = false } = {}) {
   return `${plan.sizingMode ?? "position-percent"}${plan.parameters?.sizingValues?.length ? ` ${plan.parameters.sizingValues.join(", ")}` : ""}`;
 }
 
+function isSearchCoverageAuditQuestion(message = "") {
+  const normalized = normalizeCommandText(message);
+  return /(czemu|dlaczego|why).{0,80}(reczny|ręczny|manual).{0,80}(sweep|wynik|result|lepsze|lepszy)|(?:manual|reczny|ręczny).{0,80}(better|lepsze|lepszy).{0,80}(ah|ai)/i.test(normalized);
+}
+
+function buildSearchCoverageAuditAnswer({ message = "", run = null } = {}) {
+  const polish = isPolishQuestion(message) || /[ąćęłńóśźż]/i.test(message);
+  const plan = run?.plan ?? {};
+  const hasRun = Boolean(run);
+  return {
+    answer: polish
+      ? [
+          "Najbardziej prawdopodobne wyjaśnienie: ręczny sweep i AH nie testowały dokładnie tej samej przestrzeni albo nie użyły tych samych założeń.",
+          "Żeby to uczciwie sprawdzić, AH powinien porównać: zakres dat, timeframe, provider, fill mode, sizing mode, Strategy/MM deck, parametry gridu, constraints i ranking objective.",
+          hasRun
+            ? `Dla aktywnego runu widzę: ${plan.symbol ?? "symbol?"} ${plan.timeframe ?? "TF?"}, ${plan.range?.from ?? "from?"} → ${plan.range?.to ?? "to?"}, fill ${plan.fillMode ?? "?"}, sizing ${plan.sizingMode ?? "?"}.`
+            : "Nie mam teraz wybranego konkretnego runu i ręcznego wyniku, więc mogę opisać ścieżkę audytu, ale nie policzę jeszcze dokładnego diffu.",
+          "Jeśli podasz nazwę ręcznego backtestu/sweepu, np. hubert, użyję resolvera biblioteki i zrobię porównanie założeń oraz metryk.",
+        ].join(" ")
+      : [
+          "Most likely, the manual sweep and AH did not test the exact same search space or assumptions.",
+          "The fair audit compares date range, timeframe, provider, fill mode, sizing mode, Strategy/MM deck, grid parameters, constraints, and ranking objective.",
+          hasRun
+            ? `For the active run I see: ${plan.symbol ?? "symbol?"} ${plan.timeframe ?? "TF?"}, ${plan.range?.from ?? "from?"} to ${plan.range?.to ?? "to?"}, fill ${plan.fillMode ?? "?"}, sizing ${plan.sizingMode ?? "?"}.`
+            : "No concrete run/manual result is selected, so I can explain the audit path but cannot compute the exact diff yet.",
+          "Give me the saved manual result name, for example hubert, and I can compare assumptions and metrics.",
+        ].join(" "),
+    confidence: { label: hasRun ? "medium" : "low", reason: "Search coverage audit needs both AH run and manual baseline for exact diff.", score: hasRun ? 66 : 42 },
+    evidence: [
+      "Audit dimensions: range, timeframe, provider, fill mode, sizing mode, strategy/MM deck, parameter grid, constraints, ranking objective.",
+      hasRun ? `Active run: ${run.id}` : "No active run was selected.",
+    ],
+    intent: "search-coverage-audit",
+    nextAction: polish ? "Podaj nazwę ręcznego wyniku albo baseline, żebym zrobił dokładny diff." : "Provide the saved manual result/baseline name so I can compute the exact diff.",
+    recommendation: polish ? "Nie porównuj wyników po samym PF/net bez zgodności założeń." : "Do not compare by PF/net alone until assumptions match.",
+    risk: { label: "moderate", reasons: ["Exact audit requires a named manual result or saved backtest."] },
+    sections: [],
+  };
+}
+
 function compactPositionForAnswer(position = {}) {
   if (!position) return null;
   return {
@@ -382,6 +423,8 @@ function classifyPlanningFollowUp(message = "", session = null) {
   if (!isActivePlanningSession(session)) return "none";
   const normalized = normalizeCommandText(message);
   if (isPlanningResetMessage(message)) return "cancellation";
+  if (isAgentOSGoal(message) && normalized.length > 120) return "unrelated";
+  if (/^(czemu|dlaczego|why|co|jak)\b/i.test(normalized)) return "unrelated";
   if (detectLiveExecutionIntent(message) && !hasResearchPriorityIntent(message)) return "unrelated";
   if (isConversationalExplanationQuestion(message)) return "unrelated";
   if (/(nazwij|nazwa|name|tytul|tytuł|badani|research|test ai|\bai\s*\d+\b)/i.test(normalized)) return "answer";
@@ -645,7 +688,7 @@ export function createAgentOrchestrator({ copilotMemory, store, tools }) {
       };
     }
 
-    const format = body.format === "csv" ? "csv" : body.format === "json" ? "json" : "md";
+    const format = ["csv", "docx", "json", "md", "xlsx", "zip"].includes(body.format) ? body.format : "md";
     const rows = (run.resultSummary?.topRows ?? []).map((row, index) => normalizeResearchResult(row, {
       index,
       output: run.resultSummary,
@@ -653,7 +696,7 @@ export function createAgentOrchestrator({ copilotMemory, store, tools }) {
       run,
     }));
     const exportIntegrity = run.resultSummary?.integrity ?? summarizeIntegrity(rows, run.resultSummary ?? {});
-    if (rows.length || run.resultSummary) {
+    if ((rows.length || run.resultSummary) && !["docx", "xlsx", "zip"].includes(format)) {
       if (format === "csv") {
         return {
           content: rowsToCsv(rows),
@@ -717,6 +760,7 @@ export function createAgentOrchestrator({ copilotMemory, store, tools }) {
 
     return {
       content: artifact.content,
+      encoding: artifact.encoding,
       fileName: artifact.fileName,
       format: artifact.format,
       mime: artifact.mime,
@@ -1326,6 +1370,70 @@ export function createAgentOrchestrator({ copilotMemory, store, tools }) {
       return { ok: true, response };
     }
 
+    if (isAgentOSGoal(message)) {
+      const polish = isPolishQuestion(message) || /[ąćęłńóśźż]/i.test(message);
+      const pendingOperation = createAgentOSPendingOperation({
+        message,
+        options: body.options ?? {},
+        workspaceContext,
+      });
+      const task = pendingOperation.plan.agentOSTask ?? planAgentOSTask({ message, options: body.options ?? {}, workspaceContext });
+      const response = {
+        answer: polish
+          ? [
+              "Rozumiem to jako zadanie Agent OS: badanie + analiza + raportowanie, a nie zwykły pojedynczy sweep.",
+              `Cel: ${task.objectives.join("; ")}.`,
+              `Zakres: ${task.range ? `${task.range.from} → ${task.range.to}` : "nieustalony"}.`,
+              `Rynek: ${task.symbol} ${task.timeframe}.`,
+              `Metoda: ${task.methodology}.`,
+              `Planowane narzędzia: ${task.tools.slice(0, 10).join(", ")}.`,
+              `Artefakty: ${Object.entries(task.artifacts).filter(([, enabled]) => enabled).map(([key]) => key).join(", ")}.`,
+              task.missingFields.length
+                ? `Brakuje: ${task.missingFields.join(", ")}.`
+                : "Przygotowałem operację do potwierdzenia. Niczego nie uruchamiam bez Confirm.",
+            ].join(" ")
+          : [
+              "I understand this as an Agent OS task: research + analysis + reporting, not a single scripted sweep.",
+              `Goal: ${task.objectives.join("; ")}.`,
+              `Range: ${task.range ? `${task.range.from} → ${task.range.to}` : "missing"}.`,
+              `Market: ${task.symbol} ${task.timeframe}.`,
+              `Method: ${task.methodology}.`,
+              `Tools planned: ${task.tools.slice(0, 10).join(", ")}.`,
+              `Artifacts: ${Object.entries(task.artifacts).filter(([, enabled]) => enabled).map(([key]) => key).join(", ")}.`,
+              task.missingFields.length
+                ? `Missing: ${task.missingFields.join(", ")}.`
+                : "I prepared this operation for confirmation. Nothing starts until Confirm.",
+            ].join(" "),
+        confidence: { label: "high", reason: "Agent OS goal detected from multi-objective research/report request.", score: 88 },
+        evidence: [
+          `Agent OS objectives: ${task.objectives.join(", ")}`,
+          `Tools planned: ${task.tools.join(", ")}`,
+          `Artifacts requested: ${Object.entries(task.artifacts).filter(([, enabled]) => enabled).map(([key]) => key).join(", ")}`,
+          "No live execution is allowed from Agent OS.",
+        ],
+        intent: task.missingFields.length ? "agent-os-planning" : "agent-os-confirmation",
+        nextAction: task.missingFields.length
+          ? (polish ? `Doprecyzuj: ${task.missingFields.join(", ")}.` : `Clarify: ${task.missingFields.join(", ")}.`)
+          : (polish ? "Sprawdź kartę Agent OS i kliknij Confirm." : "Review the Agent OS card and click Confirm."),
+        pendingOperation,
+        recommendation: polish
+          ? "Użyj tego trybu do pakietów badawczych i raportów. Do prostych pytań AH nadal odpowiada normalnie."
+          : "Use this mode for research packages and reports. For simple questions AH still answers normally.",
+        risk: { label: "moderate", reasons: pendingOperation.riskNotes },
+        sections: [
+          { title: polish ? "Etapy" : "Stages", bullets: (task.experimentDesign?.stages ?? []).map((stage) => `${stage.name}: ${stage.purpose}`) },
+        ],
+      };
+      await copilotMemory?.rememberInteraction?.({ message, response, run, workspaceContext });
+      return { ok: true, response };
+    }
+
+    if (isSearchCoverageAuditQuestion(message)) {
+      const response = buildSearchCoverageAuditAnswer({ message, run });
+      await copilotMemory?.rememberInteraction?.({ message, response, run, workspaceContext });
+      return { ok: true, response };
+    }
+
     if (inferredIntent === "research-request") {
       const polish = isPolishQuestion(message) || /[ąćęłńóśźż]/i.test(message);
       if (updatedResearchIntent) {
@@ -1835,6 +1943,7 @@ export function createAgentOrchestrator({ copilotMemory, store, tools }) {
   }
 
   return {
+    agentOSToolCatalog,
     cancelRun,
     chat,
     exportRun,

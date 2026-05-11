@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { runBacktest } from "../backtest/backtestEngine";
 import { fetchHistoricalCandles } from "../api/binance";
 
@@ -38,7 +38,10 @@ const BACKTEST_CHART_TRADE_LIMIT = 500;
 const TRADE_TABLE_PAGE_SIZE = 50;
 const STORED_BACKTEST_EVENT_LIMIT = 1000;
 const SWEEP_DEFAULT_COMBINATIONS = 200;
-const SWEEP_MAX_COMBINATIONS = 500;
+const SWEEP_MAX_COMBINATIONS = 1000;
+const ACTIVE_SWEEP_STORAGE_KEY = "hubert.activeSweepId.v1";
+const RECENT_SWEEPS_STORAGE_KEY = "hubert.recentSweeps.v1";
+const RECENT_SWEEP_LIMIT = 8;
 
 const defaultStrategyDeck = {
   allowLong: true,
@@ -105,6 +108,7 @@ const defaultSweepForm = {
   manualLastDays: 31,
   manualMaxSameSideFailures: "2",
   manualPositionValues: "10",
+  manualRangeMode: "rolling",
   manualRiskValues: "1",
   manualSizingMode: "run-position",
   manualStartingBalance: 10000,
@@ -128,6 +132,51 @@ const collectionRoutes = {
   mmDecks: "/decks/mm",
   strategyDecks: "/decks/strategy",
 };
+
+function readRecentSweeps() {
+  if (typeof window === "undefined") return [];
+
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(RECENT_SWEEPS_STORAGE_KEY) ?? "[]");
+    return Array.isArray(parsed) ? parsed.slice(0, RECENT_SWEEP_LIMIT) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeRecentSweeps(sweeps = []) {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.localStorage.setItem(RECENT_SWEEPS_STORAGE_KEY, JSON.stringify(sweeps.slice(0, RECENT_SWEEP_LIMIT)));
+  } catch {
+    // Sweep persistence is a UX convenience; never fail a research run because local storage is full.
+  }
+}
+
+function readActiveSweepId() {
+  if (typeof window === "undefined") return "";
+
+  try {
+    return window.localStorage.getItem(ACTIVE_SWEEP_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeActiveSweepId(id) {
+  if (typeof window === "undefined") return;
+
+  try {
+    if (id) {
+      window.localStorage.setItem(ACTIVE_SWEEP_STORAGE_KEY, id);
+    } else {
+      window.localStorage.removeItem(ACTIVE_SWEEP_STORAGE_KEY);
+    }
+  } catch {
+    // Sweep persistence is a UX convenience; never fail a research run because local storage is full.
+  }
+}
 
 function normalizeBackendUrl(value) {
   if (!value) return "http://127.0.0.1:8787";
@@ -268,10 +317,14 @@ function normalizeMmDeck(deck) {
 }
 
 function normalizeBacktestForm(form) {
+  const hasExplicitRange = !isBlank(form.from) || !isBlank(form.to);
+
   return {
     ...form,
     commissionPercent: requireNumber(form.commissionPercent, "Commission", { min: 0 }),
-    lastDays: requireNumber(form.lastDays, "Last X days", { positive: true }),
+    lastDays: hasExplicitRange && isBlank(form.lastDays)
+      ? ""
+      : requireNumber(form.lastDays, "Last X days", { positive: true }),
     slippagePercent: requireNumber(form.slippagePercent, "Slippage", { min: 0 }),
     startingBalance: requireNumber(form.startingBalance, "Starting balance", { positive: true }),
   };
@@ -833,14 +886,15 @@ function makeManualMmDeck(key, value) {
 
 function sweepRangeForm(backtestForm, form) {
   if (form.mode !== "manual") return backtestForm;
+  const explicitRange = form.manualRangeMode === "explicit";
 
   return {
     ...backtestForm,
     fillMode: form.manualFillMode ?? backtestForm.fillMode ?? "legacy",
-    from: form.manualFrom,
-    lastDays: form.manualLastDays,
+    from: explicitRange ? form.manualFrom : "",
+    lastDays: explicitRange ? "" : form.manualLastDays,
     startingBalance: form.manualStartingBalance,
-    to: form.manualTo,
+    to: explicitRange ? form.manualTo : "",
   };
 }
 
@@ -884,6 +938,199 @@ function average(values) {
   return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
 }
 
+function median(values = []) {
+  const numbers = values.filter((value) => Number.isFinite(Number(value))).map(Number).sort((left, right) => left - right);
+  if (!numbers.length) return null;
+  const midpoint = Math.floor(numbers.length / 2);
+  return numbers.length % 2 ? numbers[midpoint] : (numbers[midpoint - 1] + numbers[midpoint]) / 2;
+}
+
+function tradeNetPnl(trade = {}) {
+  const value = Number(trade.netPnl ?? trade.pnl ?? trade.profit ?? 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function tradeRiskAmount(trade = {}) {
+  const value = Number(trade.expectedSlLossAmount ?? trade.riskAmount ?? trade.initialRiskAmount ?? 0);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function rMultipleForTrade(trade = {}) {
+  const risk = tradeRiskAmount(trade);
+  if (!risk) return null;
+  return tradeNetPnl(trade) / risk;
+}
+
+function avgRFromTrades(trades = []) {
+  const rMultiples = trades.map(rMultipleForTrade).filter((value) => Number.isFinite(value));
+  return rMultiples.length
+    ? { source: "average R multiple", value: average(rMultiples) }
+    : { source: "unavailable", value: null };
+}
+
+function trueRrrFromTrades(trades = []) {
+  const wins = trades.map(tradeNetPnl).filter((value) => value > 0);
+  const losses = trades.map(tradeNetPnl).filter((value) => value < 0);
+
+  if (wins.length && losses.length) {
+    return {
+      source: "avg win / avg loss",
+      value: average(wins) / Math.abs(average(losses)),
+    };
+  }
+
+  return {
+    source: "unavailable",
+    value: null,
+  };
+}
+
+function trueRrrFromMetrics(metrics = {}) {
+  const averageWin = Number(metrics.averageWin);
+  const averageLoss = Number(metrics.averageLoss);
+  if (averageWin > 0 && averageLoss < 0) {
+    return { source: "avg win / avg loss", value: averageWin / Math.abs(averageLoss) };
+  }
+  return { source: "unavailable", value: null };
+}
+
+function avgRFromMetrics(metrics = {}) {
+  const direct = Number(metrics.averageR ?? metrics.avgRPerTrade ?? metrics.averageRMultiple);
+  return Number.isFinite(direct)
+    ? { source: "stored average R multiple", value: direct }
+    : { source: "unavailable", value: null };
+}
+
+function resultRrr(result = {}) {
+  const metricsRrr = trueRrrFromMetrics(result.metrics ?? result);
+  if (Number.isFinite(metricsRrr.value)) return metricsRrr;
+  if (result.trades?.length) return trueRrrFromTrades(result.trades);
+  const stored = Number(result.rrr ?? result.metrics?.rrr);
+  const storedSource = String(result.rrrSource ?? result.metrics?.rrrSource ?? "");
+  if (Number.isFinite(stored) && !storedSource.toLowerCase().includes("r multiple")) {
+    return { source: storedSource || "stored RRR", value: stored };
+  }
+  return { source: "unavailable", value: null };
+}
+
+function resultAvgR(result = {}) {
+  if (result.trades?.length) return avgRFromTrades(result.trades);
+  return avgRFromMetrics(result.metrics ?? result);
+}
+
+function rrrText(result = {}, digits = 2) {
+  const rrr = resultRrr(result);
+  return Number.isFinite(rrr.value) ? fmt(rrr.value, digits) : "RRR unavailable";
+}
+
+function avgRText(result = {}, digits = 2) {
+  const avgR = resultAvgR(result);
+  return Number.isFinite(avgR.value) ? fmt(avgR.value, digits) : "Avg R unavailable";
+}
+
+function maxConsecutiveByPnl(trades = [], win = true) {
+  let current = 0;
+  let best = 0;
+  trades.forEach((trade) => {
+    const pnl = tradeNetPnl(trade);
+    const matched = win ? pnl > 0 : pnl < 0;
+    current = matched ? current + 1 : 0;
+    best = Math.max(best, current);
+  });
+  return best;
+}
+
+function monthlyConsistency(trades = []) {
+  const buckets = new Map();
+  trades.forEach((trade) => {
+    const time = trade.exitTime ?? trade.entryTime;
+    if (!time) return;
+    const date = new Date((typeof time === "number" ? time * 1000 : new Date(time).getTime()));
+    if (!Number.isFinite(date.getTime())) return;
+    const key = `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
+    buckets.set(key, (buckets.get(key) ?? 0) + tradeNetPnl(trade));
+  });
+  const values = [...buckets.values()];
+  const profitable = values.filter((value) => value > 0).length;
+  return {
+    profitable,
+    text: values.length ? `${profitable}/${values.length} profitable months` : "Monthly consistency unavailable",
+    total: values.length,
+  };
+}
+
+function profitConcentration(trades = []) {
+  const wins = trades.map(tradeNetPnl).filter((value) => value > 0).sort((left, right) => right - left);
+  const grossProfit = wins.reduce((sum, value) => sum + value, 0);
+  if (!wins.length || grossProfit <= 0) return null;
+  const topCount = Math.max(1, Math.ceil(wins.length * 0.1));
+  const topProfit = wins.slice(0, topCount).reduce((sum, value) => sum + value, 0);
+  return topProfit / grossProfit * 100;
+}
+
+function longestDrawdownRecovery(equityCurve = []) {
+  if (equityCurve.length < 2) return null;
+  let peak = Number(equityCurve[0]?.equity ?? 0);
+  let drawdownStart = null;
+  let longestSeconds = 0;
+
+  equityCurve.forEach((point) => {
+    const equity = Number(point.equity ?? 0);
+    const time = Number(point.time ?? 0);
+    if (!Number.isFinite(equity) || !Number.isFinite(time)) return;
+
+    if (equity >= peak) {
+      if (drawdownStart !== null) {
+        longestSeconds = Math.max(longestSeconds, time - drawdownStart);
+        drawdownStart = null;
+      }
+      peak = equity;
+      return;
+    }
+
+    if (drawdownStart === null) drawdownStart = time;
+  });
+
+  if (drawdownStart !== null) {
+    const lastTime = Number(equityCurve.at(-1)?.time ?? drawdownStart);
+    longestSeconds = Math.max(longestSeconds, lastTime - drawdownStart);
+  }
+
+  return longestSeconds > 0 ? longestSeconds : null;
+}
+
+function durationText(seconds) {
+  if (seconds === null || seconds === undefined || !Number.isFinite(Number(seconds))) return "Unavailable";
+  const days = seconds / 86400;
+  if (days >= 1) return `${fmt(days, 1)} days`;
+  const hours = seconds / 3600;
+  return `${fmt(hours, 1)} hours`;
+}
+
+function derivedBacktestAnalytics(result = {}, equityCurve = []) {
+  const trades = result.trades ?? [];
+  const pnl = trades.map(tradeNetPnl);
+  const metrics = result.metrics ?? {};
+  const rrr = resultRrr(result);
+  const avgR = resultAvgR(result);
+  const consistency = monthlyConsistency(trades);
+  const concentration = profitConcentration(trades);
+  const recovery = longestDrawdownRecovery(equityCurve);
+
+  return {
+    averageTrade: Number.isFinite(Number(metrics.averageTrade)) ? Number(metrics.averageTrade) : average(pnl),
+    expectancy: Number.isFinite(Number(metrics.expectancy)) ? Number(metrics.expectancy) : average(pnl),
+    maxConsecutiveLosses: metrics.consecutiveLosses ?? maxConsecutiveByPnl(trades, false),
+    maxConsecutiveWins: metrics.consecutiveWins ?? maxConsecutiveByPnl(trades, true),
+    medianTrade: median(pnl),
+    monthlyConsistency: consistency.text,
+    profitConcentration: concentration,
+    recoverySeconds: recovery,
+    rrr,
+    avgR,
+  };
+}
+
 function downloadText(fileName, text, type) {
   const blob = new Blob([text], { type });
   const url = URL.createObjectURL(blob);
@@ -894,18 +1141,121 @@ function downloadText(fileName, text, type) {
   URL.revokeObjectURL(url);
 }
 
+function downloadPayload(fileName, content, type, encoding = "") {
+  if (encoding === "base64") {
+    const binary = atob(content ?? "");
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    const blob = new Blob([bytes], { type });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = fileName.replace(/[^\w.-]+/g, "-");
+    anchor.click();
+    URL.revokeObjectURL(url);
+    return;
+  }
+  downloadText(fileName, content, type);
+}
+
 function exportJson(fileName, value) {
   downloadText(fileName, JSON.stringify(value, null, 2), "application/json");
 }
 
 function exportCsv(fileName, trades = []) {
-  const headers = ["entryTime", "direction", "entryPrice", "exitTime", "exitPrice", "netPnl", "exitReason", "fillMode", "sameCandleSl", "ambiguityReason"];
+  const headers = [
+    "entryTime",
+    "direction",
+    "entryPrice",
+    "exitTime",
+    "exitPrice",
+    "netPnl",
+    "exitReason",
+    "fillMode",
+    "sameCandleSl",
+    "ambiguityReason",
+    "sizingMode",
+    "slDistancePercent",
+    "riskAmount",
+    "expectedSlLossAmount",
+    "rMultiple",
+  ];
   const rows = trades.map((trade) =>
     headers
-      .map((key) => JSON.stringify(trade[key] ?? trade[key === "netPnl" ? "pnl" : key] ?? ""))
+      .map((key) => JSON.stringify(key === "rMultiple"
+        ? rMultipleForTrade(trade) ?? ""
+        : trade[key] ?? trade[key === "netPnl" ? "pnl" : key] ?? ""))
       .join(","),
   );
   downloadText(fileName, [headers.join(","), ...rows].join("\n"), "text/csv");
+}
+
+function exportBacktestCsv(fileName, result = {}) {
+  const rrr = resultRrr(result);
+  const metadata = [
+    ["field", "value"],
+    ["name", result.name ?? ""],
+    ["symbol", result.symbol ?? "SOLUSDT"],
+    ["timeframe", result.timeframe ?? ""],
+    ["provider", result.provider ?? result.dataDiagnostics?.provider ?? ""],
+    ["rangeFrom", result.analysisRange?.from ? dateText(result.analysisRange.from) : ""],
+    ["rangeTo", result.analysisRange?.to ? dateText(result.analysisRange.to) : ""],
+    ["fillMode", result.fillMode ?? ""],
+    ["sizingMode", result.sweepParams?.sizingMode ?? result.analysisSettings?.sizingMode ?? ""],
+    ["atrLength", result.sweepParams?.atrLength ?? result.analysisSettings?.atrLength ?? ""],
+    ["atrMultiplier", result.sweepParams?.atrMultiplier ?? result.analysisSettings?.atrMultiplier ?? ""],
+    ["bandwidth", result.sweepParams?.bandwidth ?? result.analysisSettings?.bandwidth ?? ""],
+    ["nweMultiplier", result.sweepParams?.envelopeMultiplier ?? result.analysisSettings?.envelopeMultiplier ?? ""],
+    ["maxSameSideFailures", result.sweepParams?.maxSameSideFailures ?? result.analysisSettings?.maxSameSideFailures ?? ""],
+    ["netProfit", result.metrics?.netProfit ?? ""],
+    ["profitFactor", result.metrics?.profitFactor ?? ""],
+    ["maxDrawdown", result.metrics?.maxDrawdown ?? ""],
+    ["winRate", result.metrics?.winRate ?? ""],
+    ["trades", result.metrics?.totalTrades ?? result.trades?.length ?? ""],
+    ["rrr", Number.isFinite(rrr.value) ? rrr.value : "RRR unavailable"],
+    ["rrrSource", rrr.source],
+    ["avgRPerTrade", Number.isFinite(resultAvgR(result).value) ? resultAvgR(result).value : "Avg R unavailable"],
+    ["avgRSource", resultAvgR(result).source],
+  ];
+  const tradeHeaders = ["entryTime", "direction", "entryPrice", "exitTime", "exitPrice", "netPnl", "exitReason", "fillMode", "sizingMode", "slDistancePercent", "riskAmount", "expectedSlLossAmount", "rMultiple"];
+  const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+  const tradeRows = (result.trades ?? []).map((trade) =>
+    tradeHeaders.map((key) => escape(key === "rMultiple" ? rMultipleForTrade(trade) ?? "" : trade[key] ?? trade[key === "netPnl" ? "pnl" : key] ?? "")).join(","),
+  );
+
+  downloadText(
+    fileName,
+    [
+      ...metadata.map((row) => row.map(escape).join(",")),
+      "",
+      tradeHeaders.join(","),
+      ...tradeRows,
+    ].join("\n"),
+    "text/csv",
+  );
+}
+
+function exportableBacktestResult(result = {}) {
+  const displayEquityCurve = equityCurveForResult(result);
+  const analytics = derivedBacktestAnalytics(result, displayEquityCurve);
+
+  return {
+    ...result,
+    presentationMetrics: {
+      averageTrade: analytics.averageTrade,
+      expectancy: analytics.expectancy,
+      longestDrawdownRecovery: analytics.recoverySeconds,
+      maxConsecutiveLosses: analytics.maxConsecutiveLosses,
+      maxConsecutiveWins: analytics.maxConsecutiveWins,
+      medianTrade: analytics.medianTrade,
+      monthlyConsistency: analytics.monthlyConsistency,
+      profitConcentrationPercent: analytics.profitConcentration,
+      rrr: analytics.rrr.value,
+      rrrSource: analytics.rrr.source,
+      avgRPerTrade: analytics.avgR.value,
+      avgRSource: analytics.avgR.source,
+    },
+  };
 }
 
 function compactBacktestResult(result) {
@@ -963,6 +1313,7 @@ export default function ControlCenter({
   onClearBacktest,
   onClose,
   onExitBacktestAnalysis,
+  onResetChartView,
   onViewBacktestTrade,
   rawCandles,
   selectedHistoricalWindow,
@@ -999,6 +1350,7 @@ export default function ControlCenter({
   const [aiMessages, setAiMessages] = useState([]);
   const [aiQuestion, setAiQuestion] = useState("");
   const [compareIds, setCompareIds] = useState([]);
+  const [backtestMode, setBacktestMode] = useState("single");
   const [strategyForm, setStrategyForm] = useState({ ...defaultStrategyDeck, ...settings, name: "" });
   const [mmForm, setMmForm] = useState(defaultMmDeck);
   const [backtestForm, setBacktestForm] = useState(defaultBacktestForm);
@@ -1011,6 +1363,13 @@ export default function ControlCenter({
     total: 0,
   });
   const [sweepResults, setSweepResults] = useState([]);
+  const [recentSweeps, setRecentSweeps] = useState(readRecentSweeps);
+  const [activeSweepId, setActiveSweepId] = useState(() => {
+    const stored = readActiveSweepId();
+    const recent = readRecentSweeps();
+    return recent.some((item) => item.id === stored) ? stored : recent[0]?.id ?? "";
+  });
+  const restoredActiveSweepRef = useRef(false);
   const sweepCancelRef = useRef(false);
   const [decision, setDecision] = useState({
     apiProfile: "main",
@@ -1126,15 +1485,20 @@ export default function ControlCenter({
     try {
       const manualSweepForm = { ...sweepForm, mode: "manual" };
       const combinations = buildSweepCombinations({ baseDeck: null, baseMmDeck: null, form: manualSweepForm });
+      const warning =
+        combinations.length > 500
+          ? "Heavy sweep, keep browser/backend active. Progress updates every few combinations."
+          : combinations.length > SWEEP_DEFAULT_COMBINATIONS
+            ? "Large sweep, may take longer. Advanced capacity is required above 200 combinations."
+            : "";
       return {
         cap,
         count: combinations.length,
         error: "",
         hardCap,
         needsAdvanced: combinations.length > SWEEP_DEFAULT_COMBINATIONS && !sweepForm.sweepAdvancedCapacity,
-        warning: combinations.length > SWEEP_DEFAULT_COMBINATIONS
-          ? `This sweep has ${combinations.length} combinations. Above ${SWEEP_DEFAULT_COMBINATIONS}, use Advanced capacity and keep the browser focused until it finishes.`
-          : "",
+        planned: Math.min(combinations.length, cap),
+        warning,
         tooMany: combinations.length > cap,
       };
     } catch (error) {
@@ -1224,6 +1588,33 @@ export default function ControlCenter({
       setBacktestResult(activeBacktestSession.result);
     }
   }, [activeBacktestSession?.id, activeBacktestSession?.result]);
+
+  useEffect(() => {
+    writeRecentSweeps(recentSweeps);
+  }, [recentSweeps]);
+
+  useEffect(() => {
+    writeActiveSweepId(activeSweepId);
+  }, [activeSweepId]);
+
+  useEffect(() => {
+    if (restoredActiveSweepRef.current) return;
+    restoredActiveSweepRef.current = true;
+
+    const snapshot = recentSweeps.find((item) => item.id === activeSweepId) ?? recentSweeps[0];
+    if (!snapshot?.results?.length) return;
+
+    setSweepForm((current) => ({ ...current, ...(snapshot.form ?? {}) }));
+    setSweepResults(snapshot.results ?? []);
+    setSweepProgress({
+      completed: snapshot.executedCombinations ?? snapshot.results?.length ?? 0,
+      message: `Reopened ${snapshot.name ?? "recent sweep"}`,
+      running: false,
+      total: snapshot.plannedCombinations ?? snapshot.results?.length ?? 0,
+    });
+    setActiveSweepId(snapshot.id);
+    setBacktestMode("sweep");
+  }, [activeSweepId, recentSweeps]);
 
   useEffect(() => {
     if (activePanel !== "Livestream") return undefined;
@@ -1490,6 +1881,12 @@ export default function ControlCenter({
         onExitBacktestAnalysis();
       }
       setActivePanel("Backtests");
+      setBacktestMode("single");
+      return;
+    }
+
+    if (favorite.category === "Sweep Results") {
+      openSweepSet(favorite.snapshot);
     }
   }
 
@@ -1579,6 +1976,8 @@ export default function ControlCenter({
     });
     const analysisRange = rangeFromBacktestCandles(candles);
     const analysisSettings = strategyToSettings(deck, settings);
+    const rrr = resultRrr(result);
+    const avgR = resultAvgR(result);
     const named = compactBacktestResult({
       ...result,
       analysisRange,
@@ -1592,6 +1991,10 @@ export default function ControlCenter({
       chartCandlesRendered: rawCandles.length,
       dataDiagnostics: dataset.diagnostics ?? null,
       provider: dataset.diagnostics?.provider ?? form.provider ?? "binance-futures",
+      avgR: avgR.value,
+      avgRSource: avgR.source,
+      rrr: rrr.value,
+      rrrSource: rrr.source,
       sweepParams: overrides.sweepParams ?? null,
       strategyDeckId: deck.id,
       strategyDeckName: deck.name,
@@ -1835,8 +2238,89 @@ export default function ControlCenter({
     return combinations;
   }
 
+  function rememberSweep(snapshot) {
+    if (!snapshot?.id) return snapshot;
+    setRecentSweeps((current) => {
+      const next = [snapshot, ...current.filter((item) => item.id !== snapshot.id)].slice(0, RECENT_SWEEP_LIMIT);
+      return next;
+    });
+    setActiveSweepId(snapshot.id);
+    return snapshot;
+  }
+
+  function makeSweepSnapshot({ form, ranked, status = "completed", total = null }) {
+    const first = ranked[0] ?? {};
+    return {
+      analysisRange: first.analysisRange ?? null,
+      createdAt: new Date().toISOString(),
+      executedCombinations: ranked.length,
+      form,
+      id: `sweep-set-${Date.now()}`,
+      name: `Sweep ${form.manualSymbol ?? "SOLUSDT"} ${form.manualTimeframe ?? ""} ${new Date().toLocaleString()}`,
+      plannedCombinations: total ?? ranked.length,
+      provider: first.dataDiagnostics?.provider ?? "binance-futures",
+      results: ranked.slice(0, 50),
+      status,
+      symbol: form.manualSymbol ?? "SOLUSDT",
+      timeframe: form.manualTimeframe ?? "15m",
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  function openSweepSet(snapshot) {
+    if (!snapshot?.results?.length) {
+      throw new Error("This sweep set does not include stored results.");
+    }
+    setSweepForm((current) => ({ ...current, ...(snapshot.form ?? {}) }));
+    setSweepResults(snapshot.results ?? []);
+    setSweepProgress({
+      completed: snapshot.executedCombinations ?? snapshot.results?.length ?? 0,
+      message: `Reopened ${snapshot.name ?? "saved sweep"}`,
+      running: false,
+      total: snapshot.plannedCombinations ?? snapshot.results?.length ?? 0,
+    });
+    setActiveSweepId(snapshot.id);
+    setBacktestMode("sweep");
+    setActivePanel("Backtests");
+  }
+
+  async function saveCurrentSweep() {
+    if (!sweepResults.length) throw new Error("Run or reopen a sweep before saving it.");
+    const existing = recentSweeps.find((item) => item.id === activeSweepId);
+    const snapshot = existing ?? makeSweepSnapshot({ form: sweepForm, ranked: sweepResults, status: "saved" });
+    const name = window.prompt("Sweep favorite name", snapshot.name ?? "Manual Sweep");
+    if (!name?.trim()) return null;
+    const favorite = {
+      category: "Sweep Results",
+      createdAt: new Date().toISOString(),
+      id: `fav-sweep-${snapshot.id}`,
+      itemId: snapshot.id,
+      name: name.trim(),
+      shortDescription: `${snapshot.symbol ?? "SOLUSDT"} ${snapshot.timeframe ?? ""} · ${snapshot.results?.length ?? 0} ranked`,
+      snapshot: {
+        ...snapshot,
+        name: name.trim(),
+        status: "saved",
+      },
+    };
+    const saved = await saveCollectionItem("favorites", favorite, false);
+    rememberSweep(favorite.snapshot);
+    await refreshAll();
+    return saved;
+  }
+
+  function clearCurrentSweep() {
+    setSweepResults([]);
+    setSweepProgress({ completed: 0, message: "Sweep cleared", running: false, total: 0 });
+    setRecentSweeps((current) => activeSweepId ? current.filter((item) => item.id !== activeSweepId) : current);
+    setActiveSweepId("");
+  }
+
   async function runSweepBacktest() {
     const manualSweepForm = { ...sweepForm, mode: "manual" };
+    if (manualSweepForm.manualRangeMode === "explicit" && !String(manualSweepForm.manualFrom ?? "").trim()) {
+      throw new Error("Explicit historical range needs a From date/time.");
+    }
     const form = normalizeBacktestForm({
       ...sweepRangeForm(backtestForm, manualSweepForm),
       provider: "binance-futures",
@@ -1892,6 +2376,8 @@ export default function ControlCenter({
         settings: strategyToSettings(combination.strategyDeck, settings),
       });
       const metrics = result.metrics;
+      const rrr = resultRrr(result);
+      const avgR = resultAvgR(result);
       const row = {
         ...combination,
         analysisRange,
@@ -1914,6 +2400,10 @@ export default function ControlCenter({
           : 0,
         profitFactor: metrics.profitFactor,
         rangeForm: form,
+        avgR: avgR.value,
+        avgRSource: avgR.source,
+        rrr: rrr.value,
+        rrrSource: rrr.source,
         score: sweepScore(metrics, Number(form.startingBalance)),
         shortResult: sidePnl(result.trades, "SHORT"),
         totalTrades: metrics.totalTrades,
@@ -1937,6 +2427,12 @@ export default function ControlCenter({
 
     const ranked = rankSweepRows(rows);
     setSweepResults(ranked.slice(0, 50));
+    rememberSweep(makeSweepSnapshot({
+      form: manualSweepForm,
+      ranked,
+      status: sweepCancelRef.current ? "cancelled" : "completed",
+      total: combinations.length,
+    }));
     setSweepProgress({
       completed: rows.length,
       message: sweepCancelRef.current ? `Cancelled at ${rows.length} / ${combinations.length}` : `Completed ${rows.length} combinations`,
@@ -2113,15 +2609,18 @@ export default function ControlCenter({
 
       {panel === "Backtests" && (
         <BacktestsPanel
+          activeSweepId={activeSweepId}
           analysisActive={backtestAnalysisActive}
           analysisSession={activeBacktestSession}
           chartDiagnostics={chartDiagnostics}
           favorites={favorites}
           form={backtestForm}
           mmDecks={mmDecks}
+          mode={backtestMode}
           result={backtestResult}
           savedBacktests={savedBacktests}
           setForm={setBacktestForm}
+          setMode={setBacktestMode}
           strategyDecks={strategyDecks}
           sweepForm={sweepForm}
           sweepPreview={sweepPreview}
@@ -2129,6 +2628,7 @@ export default function ControlCenter({
           sweepResults={sweepResults}
           setSweepForm={setSweepForm}
           onCancelSweep={() => runAction("cancel-sweep", "Cancel sweep", async () => cancelSweepBacktest())}
+          onClearSweep={() => runAction("clear-sweep", "Clear sweep", async () => clearCurrentSweep())}
           onDelete={(item) => runAction(`delete-backtest-${item.id}`, "Delete backtest", () => deleteCollectionItem("backtests", item))}
           onFavorite={(item) => runAction(`fav-backtest-${item.id}`, "Add favorite", () => addFavorite("Backtests", item))}
           onHide={(item) => runAction(`hide-backtest-${item.id}`, "Hide backtest", () => saveCollectionItem("backtests", { ...item, hidden: true }))}
@@ -2140,11 +2640,15 @@ export default function ControlCenter({
           onExitAnalysis={() => runAction("exit-backtest-analysis", "Exit analysis", async () => {
             onExitBacktestAnalysis();
           })}
+          onResetChartView={onResetChartView}
           onViewTrade={(trade) => runAction("view-backtest-trade", "View trade on chart", () => analyzeCurrentBacktest(trade))}
           onOpenSweepResult={(row) => runAction(`open-sweep-${row.id}`, "Open sweep result", async () => openSweepResult(row))}
+          onOpenSweepSet={(snapshot) => runAction(`open-sweep-set-${snapshot.id}`, "Open sweep", async () => openSweepSet(snapshot))}
           onRun={() => runAction("run-backtest", "Run backtest", async () => runBrowserBacktest())}
           onRunSweep={() => runAction("run-sweep", "Run sweep", async () => runSweepBacktest())}
           onSave={() => runAction("save-backtest", "Save backtest", () => saveBacktest())}
+          onSaveSweep={() => runAction("save-sweep", "Save sweep", () => saveCurrentSweep())}
+          recentSweeps={recentSweeps}
         />
       )}
 
@@ -2852,26 +3356,34 @@ function StrategyDecksPanel({ decks, favorites, form, onApplyChart, onDelete, on
 }
 
 function BacktestsPanel({
+  activeSweepId,
   analysisActive,
   analysisSession,
   favorites,
   form,
   mmDecks,
+  mode,
   onAnalyze,
   onCancelSweep,
+  onClearSweep,
   onClear,
   onDelete,
   onExitAnalysis,
   onFavorite,
   onHide,
   onOpenSweepResult,
+  onOpenSweepSet,
   onRun,
   onRunSweep,
   onSave,
+  onSaveSweep,
+  onResetChartView,
   onViewTrade,
+  recentSweeps,
   result,
   savedBacktests,
   setForm,
+  setMode,
   setSweepForm,
   strategyDecks,
   sweepForm,
@@ -2879,7 +3391,6 @@ function BacktestsPanel({
   sweepProgress,
   sweepResults,
 }) {
-  const [mode, setMode] = useState("single");
   const favoriteBacktests = favorites
     .filter((favorite) => favorite.category === "Backtests")
     .map((favorite) => savedBacktests.find((item) => item.id === favorite.itemId))
@@ -2953,27 +3464,33 @@ function BacktestsPanel({
               </div>
               <div className="hubert-lab__actions">
                 <button type="button" onClick={onAnalyze}>Analyze on Chart</button>
+                <button title="Center chart on current backtest range and restore default zoom." type="button" onClick={onResetChartView}>Center Chart</button>
                 <button type="button" onClick={onExitAnalysis}>Exit Analysis</button>
                 <button type="button" onClick={onClear}>Clear Result</button>
               </div>
             </div>
           )}
-          <BacktestResult result={result} onViewTrade={onViewTrade} />
+          <BacktestResult result={result} onResetChartView={onResetChartView} onViewTrade={onViewTrade} />
         </>
       ) : (
         <BacktestSweepPanel
+          activeSweepId={activeSweepId}
           progress={sweepProgress}
           preview={sweepPreview}
+          recentSweeps={recentSweeps}
           results={sweepResults}
           form={sweepForm}
           setForm={setSweepForm}
           onCancel={onCancelSweep}
+          onClear={onClearSweep}
           onOpenResult={(row) => {
             const result = onOpenSweepResult(row);
             setMode("single");
             return result;
           }}
+          onOpenSweepSet={onOpenSweepSet}
           onRun={onRunSweep}
+          onSaveSweep={onSaveSweep}
         />
       )}
       {favoriteBacktests.length > 0 && (
@@ -2992,16 +3509,23 @@ function BacktestsPanel({
 }
 
 function BacktestSweepPanel({
+  activeSweepId,
   form,
   onCancel,
+  onClear,
   onOpenResult,
+  onOpenSweepSet,
   onRun,
+  onSaveSweep,
   preview,
   progress,
+  recentSweeps = [],
   results,
   setForm,
 }) {
   const previewTone = preview?.error || preview?.tooMany ? "bad" : "neutral";
+  const rangeMode = form.manualRangeMode ?? (form.manualFrom || form.manualTo ? "explicit" : "rolling");
+  const explicitRange = rangeMode === "explicit";
 
   return (
     <section className="hubert-lab__section">
@@ -3011,18 +3535,60 @@ function BacktestSweepPanel({
       <MiniStatus>Manual Sweep ignores saved Strategy/MM Deck values. It fetches its own Binance Futures historical range and never draws chart overlays during the sweep.</MiniStatus>
       <MiniStatus tone="good">Active sizing source: Manual Sweep. Strategy/MM Decks do not override this sweep.</MiniStatus>
       <div className="hubert-lab__subhead"><strong>Historical Range Sweep</strong><span>independent data</span></div>
+      <div className="hubert-range-mode">
+        <button
+          data-active={!explicitRange}
+          type="button"
+          onClick={() => setForm({ ...form, manualFrom: "", manualRangeMode: "rolling", manualTo: "" })}
+        >
+          Rolling range
+        </button>
+        <button
+          data-active={explicitRange}
+          type="button"
+          onClick={() => setForm({ ...form, manualRangeMode: "explicit" })}
+        >
+          Explicit historical range
+        </button>
+        <span>
+          Active mode: {explicitRange
+            ? "From/To dates; Last X days disabled"
+            : "Last X days; explicit dates ignored"}
+        </span>
+      </div>
       <div className="hubert-lab__grid">
         <TextField label="Symbol" value={form.manualSymbol} onChange={(value) => setForm({ ...form, manualSymbol: value })} />
         <SelectField label="Timeframe" value={form.manualTimeframe} onChange={(value) => setForm({ ...form, manualTimeframe: value })} options={TIMEFRAMES.map((item) => [item.interval, item.label])} />
-        <NumberField label="Last X days" min="1" value={form.manualLastDays} onChange={(value) => setForm({ ...form, manualLastDays: value })} />
+        <NumberField
+          disabled={explicitRange}
+          label="Last X days"
+          min="1"
+          value={form.manualLastDays}
+          onChange={(value) => setForm({ ...form, manualFrom: "", manualLastDays: value, manualRangeMode: "rolling", manualTo: "" })}
+        />
         <NumberField label="Starting balance" min="1" value={form.manualStartingBalance} onChange={(value) => setForm({ ...form, manualStartingBalance: value })} />
         <SelectField label="Backtest Fill Mode" value={form.manualFillMode ?? "legacy"} onChange={(value) => setForm({ ...form, manualFillMode: value })} options={[
           ["legacy", "Current / Legacy"],
           ["conservative", "Conservative"],
         ]} />
-        <TextField label="From date/time" value={form.manualFrom} onChange={(value) => setForm({ ...form, manualFrom: value })} />
-        <TextField label="To date/time" value={form.manualTo} onChange={(value) => setForm({ ...form, manualTo: value })} />
+        <TextField
+          disabled={!explicitRange}
+          label="From date/time"
+          value={form.manualFrom}
+          onChange={(value) => setForm({ ...form, manualFrom: value, manualRangeMode: "explicit" })}
+        />
+        <TextField
+          disabled={!explicitRange}
+          label="To date/time"
+          value={form.manualTo}
+          onChange={(value) => setForm({ ...form, manualRangeMode: "explicit", manualTo: value })}
+        />
       </div>
+      <MiniStatus>
+        {explicitRange
+          ? "Explicit historical range is active. Rolling Last X days is ignored for this sweep."
+          : "Rolling range is active. Filling Last X days clears explicit From/To dates."}
+      </MiniStatus>
       <MiniStatus>
         Fill mode: {fillModeLabel(form.manualFillMode)}. Legacy preserves existing results. Conservative assumes worst-case ordering when OHLC cannot prove intrabar sequence.
       </MiniStatus>
@@ -3090,15 +3656,59 @@ function BacktestSweepPanel({
       <MiniStatus tone={previewTone}>
         {preview?.error
           ? preview.error
-          : `Combinations ready: ${preview?.count ?? 0} / ${preview?.cap ?? SWEEP_DEFAULT_COMBINATIONS}${preview?.tooMany ? ". Narrow ranges or raise the Advanced cap." : "."}`}
+          : `Generated combinations: ${preview?.count ?? 0}. Planned: ${preview?.tooMany ? 0 : preview?.count ?? 0}. Cap: ${preview?.cap ?? SWEEP_DEFAULT_COMBINATIONS}.${preview?.tooMany ? " Narrow ranges or raise the Advanced cap." : ""}`}
       </MiniStatus>
       {preview?.warning && <MiniStatus tone={preview?.tooMany ? "bad" : "neutral"}>{preview.warning}</MiniStatus>}
       <div className="hubert-lab__actions">
         <button disabled={progress.running || preview?.tooMany || Boolean(preview?.error)} type="button" onClick={onRun}>Run Sweep</button>
         <button disabled={!progress.running} type="button" onClick={onCancel}>Cancel</button>
-        <span>{progress.message || "Ready"} {progress.total ? `· ${progress.completed}/${progress.total}` : ""}</span>
+        <button disabled={!results.length || progress.running} type="button" onClick={onSaveSweep}>Save Sweep</button>
+        <button disabled={!results.length || progress.running} type="button" onClick={onClear}>Clear Sweep</button>
+        <span>{progress.message || "Ready"} {progress.total ? `· executed ${progress.completed}/${progress.total}` : ""}</span>
       </div>
       <SweepResultTable onOpenResult={onOpenResult} results={results} />
+      <RecentSweeps
+        activeSweepId={activeSweepId}
+        onOpenResult={onOpenResult}
+        onOpenSweepSet={onOpenSweepSet}
+        recentSweeps={recentSweeps}
+      />
+    </section>
+  );
+}
+
+function RecentSweeps({ activeSweepId, onOpenResult, onOpenSweepSet, recentSweeps = [] }) {
+  if (!recentSweeps.length) {
+    return <MiniStatus>No recent sweeps yet. Completed sweeps stay here until you clear or overwrite local storage.</MiniStatus>;
+  }
+
+  return (
+    <section className="hubert-lab__section">
+      <div className="hubert-lab__subhead"><strong>Recent Sweeps</strong><span>{recentSweeps.length}</span></div>
+      <div className="hubert-lab__table">
+        <table>
+          <thead>
+            <tr><th>Name</th><th>Range</th><th>Ranked</th><th>Status</th><th>Updated</th><th>Actions</th></tr>
+          </thead>
+          <tbody>
+            {recentSweeps.map((sweep) => (
+              <tr key={sweep.id} className={sweep.id === activeSweepId ? "hubert-sweep-row--top" : ""}>
+                <td>{sweep.name ?? sweep.id}</td>
+                <td>{sweep.analysisRange ? `${dateText(sweep.analysisRange.from)} → ${dateText(sweep.analysisRange.to)}` : `${sweep.symbol ?? "SOLUSDT"} ${sweep.timeframe ?? ""}`}</td>
+                <td>{sweep.results?.length ?? 0} / {sweep.executedCombinations ?? "--"}</td>
+                <td>{sweep.status ?? "completed"}</td>
+                <td>{dateText(sweep.updatedAt ?? sweep.createdAt)}</td>
+                <td>
+                  <div className="hubert-lab__actions">
+                    <button type="button" onClick={() => onOpenSweepSet(sweep)}>Reopen</button>
+                    <button disabled={!sweep.results?.[0]} type="button" onClick={() => onOpenResult(sweep.results[0])}>Open top</button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }
@@ -3130,7 +3740,7 @@ function sweepSizingShortText(row) {
 function sweepParamDetails(row) {
   const params = row.params ?? {};
   const symbol = `${params.symbol ?? "SOLUSDT"} ${params.timeframe ?? ""}`.trim();
-  return `${symbol} · source ${params.source ?? "default"} · fill ${fillModeLabel(params.fillMode ?? row.fillMode)} · ATR length ${params.atrLength ?? "--"} · ${params.sizeLabel ?? "Sizing"} ${params.sizeValue ?? "--"} · mode ${params.sizingMode ?? "--"}`;
+  return `${symbol} · source ${params.source ?? "default"} · fill ${fillModeLabel(params.fillMode ?? row.fillMode)} · ATR length ${params.atrLength ?? "--"} · ATR multiplier ${params.atrMultiplier ?? "--"} · NWE ${params.envelopeMultiplier ?? "--"} · BW ${params.bandwidth ?? "--"} · max failures ${params.maxSameSideFailures ?? "--"} · ${params.sizeLabel ?? "Sizing"} ${params.sizeValue ?? "--"} · mode ${params.sizingMode ?? "--"}`;
 }
 
 function sweepHeaderSizingText(row) {
@@ -3141,10 +3751,29 @@ function sweepHeaderSizingText(row) {
 }
 
 function SweepResultTable({ onOpenResult, results }) {
+  const [sortMode, setSortMode] = useState("overall");
+  const sortedResults = useMemo(() => {
+    const source = results ?? [];
+    const sorters = {
+      dd: (left, right) => Number(left.maxDrawdown ?? Infinity) - Number(right.maxDrawdown ?? Infinity),
+      net: (left, right) => Number(right.netProfit ?? -Infinity) - Number(left.netProfit ?? -Infinity),
+      overall: (left, right) => Number(left.rank ?? Infinity) - Number(right.rank ?? Infinity),
+      pf: (left, right) => Number(right.profitFactor ?? -Infinity) - Number(left.profitFactor ?? -Infinity),
+      win: (left, right) => Number(right.winRate ?? -Infinity) - Number(left.winRate ?? -Infinity),
+    };
+    return source.slice().sort(sorters[sortMode] ?? sorters.overall);
+  }, [results, sortMode]);
+
   if (!results?.length) {
     return <MiniStatus>No sweep results yet. Run a sweep to rank parameter sets.</MiniStatus>;
   }
   const firstResult = results[0];
+  const leaders = {
+    dd: results.slice().sort((left, right) => Number(left.maxDrawdown ?? Infinity) - Number(right.maxDrawdown ?? Infinity))[0]?.id,
+    net: results.slice().sort((left, right) => Number(right.netProfit ?? -Infinity) - Number(left.netProfit ?? -Infinity))[0]?.id,
+    pf: results.slice().sort((left, right) => Number(right.profitFactor ?? -Infinity) - Number(left.profitFactor ?? -Infinity))[0]?.id,
+    win: results.slice().sort((left, right) => Number(right.winRate ?? -Infinity) - Number(left.winRate ?? -Infinity))[0]?.id,
+  };
 
   return (
     <div className="hubert-lab__section">
@@ -3156,6 +3785,13 @@ function SweepResultTable({ onOpenResult, results }) {
         Fill Mode: {fillModeLabel(firstResult.fillMode ?? firstResult.params?.fillMode)} · ambiguous candles: {firstResult.ambiguousCandlesCount ?? firstResult.ambiguity?.ambiguousCandlesCount ?? 0} · conservative-adjusted trades: {firstResult.conservativeAdjustedTrades ?? firstResult.ambiguity?.conservativeAdjustedTrades ?? 0} · skipped entries: {firstResult.conservativeSkippedEntries ?? firstResult.ambiguity?.conservativeSkippedEntries ?? 0}
       </MiniStatus>
       <MiniStatus>{sweepHeaderSizingText(firstResult)}</MiniStatus>
+      <div className="hubert-lab__actions hubert-sweep-filters">
+        <button data-active={sortMode === "overall"} type="button" onClick={() => setSortMode("overall")}>Overall</button>
+        <button data-active={sortMode === "pf"} type="button" onClick={() => setSortMode("pf")}>Best PF</button>
+        <button data-active={sortMode === "win"} type="button" onClick={() => setSortMode("win")}>Best win%</button>
+        <button data-active={sortMode === "net"} type="button" onClick={() => setSortMode("net")}>Best net</button>
+        <button data-active={sortMode === "dd"} type="button" onClick={() => setSortMode("dd")}>Best low DD</button>
+      </div>
       <div className="hubert-lab__table hubert-lab__table--sweep">
         <table>
           <thead>
@@ -3166,7 +3802,10 @@ function SweepResultTable({ onOpenResult, results }) {
               <th>Max DD</th>
               <th>PF</th>
               <th>Win rate</th>
+              <th>RRR</th>
+              <th>Avg R</th>
               <th>Trades</th>
+              <th>ATR len</th>
               <th>Max failures</th>
               <th>ATR mult</th>
               <th>NWE</th>
@@ -3176,23 +3815,44 @@ function SweepResultTable({ onOpenResult, results }) {
             </tr>
           </thead>
           <tbody>
-            {results.slice(0, 30).map((row) => (
-              <tr key={row.id}>
-                <td>{row.rank}</td>
-                <td>{fmt(row.score)}</td>
-                <td>{fmt(row.netProfit)}</td>
-                <td>{fmt(row.maxDrawdown)}%</td>
-                <td>{fmt(row.profitFactor)}</td>
-                <td>{fmt(row.winRate)}%</td>
-                <td>{row.totalTrades}</td>
-                <td>{row.params?.maxSameSideFailures ?? "--"}</td>
-                <td>{fmt(row.params?.atrMultiplier, 2)}</td>
-                <td>{fmt(row.params?.envelopeMultiplier, 2)}</td>
-                <td>{fmt(row.params?.bandwidth, 2)}</td>
-                <td className="hubert-sweep-params" title={sweepParamDetails(row)}>{sweepSizingShortText(row)}</td>
-                <td><button className="hubert-sweep-open" type="button" onClick={() => onOpenResult(row)}>Open</button></td>
-              </tr>
-            ))}
+            {sortedResults.slice(0, 30).map((row, index) => {
+              const badges = [
+                leaders.pf === row.id ? "PF" : "",
+                leaders.win === row.id ? "Win" : "",
+                leaders.net === row.id ? "Net" : "",
+                leaders.dd === row.id ? "DD" : "",
+              ].filter(Boolean);
+              return (
+                <Fragment key={row.id}>
+                  <tr className={index < 3 ? "hubert-sweep-row--top" : ""} key={row.id}>
+                    <td>{row.rank}</td>
+                    <td title={badges.length ? `Category leader: ${badges.join(", ")}` : ""}>{fmt(row.score)}</td>
+                    <td>{fmt(row.netProfit)}</td>
+                    <td>{fmt(row.maxDrawdown)}%</td>
+                    <td>{fmt(row.profitFactor)}</td>
+                    <td>{fmt(row.winRate)}%</td>
+                    <td title="RRR = average winning trade divided by absolute average losing trade.">{Number.isFinite(row.rrr) ? fmt(row.rrr) : "unavailable"}</td>
+                    <td title="Avg R / trade = average trade result in risk units.">{Number.isFinite(row.avgR) ? fmt(row.avgR) : "unavailable"}</td>
+                    <td>{row.totalTrades}</td>
+                    <td>{row.params?.atrLength ?? "--"}</td>
+                    <td>{row.params?.maxSameSideFailures ?? "--"}</td>
+                    <td>{fmt(row.params?.atrMultiplier, 2)}</td>
+                    <td>{fmt(row.params?.envelopeMultiplier, 2)}</td>
+                    <td>{fmt(row.params?.bandwidth, 2)}</td>
+                    <td className="hubert-sweep-params" title={sweepParamDetails(row)}>{sweepSizingShortText(row)}</td>
+                    <td><button className="hubert-sweep-open" type="button" onClick={() => onOpenResult(row)}>Open</button></td>
+                  </tr>
+                  <tr className="hubert-sweep-detail-row" key={`${row.id}-details`}>
+                    <td colSpan={16}>
+                      <details>
+                        <summary>Full config {badges.length ? `· best ${badges.join(" / ")}` : ""}</summary>
+                        <span>{sweepParamDetails(row)} · RRR {Number.isFinite(row.rrr) ? fmt(row.rrr) : "unavailable"} · Avg R / trade {Number.isFinite(row.avgR) ? fmt(row.avgR) : "unavailable"} · expectancy {fmt(row.expectancy)} · avg trade {fmt(row.averageTrade)}.</span>
+                      </details>
+                    </td>
+                  </tr>
+                </Fragment>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -3240,25 +3900,43 @@ function BacktestComparePanel({ compareIds, favorites, savedBacktests, setCompar
       ) : (
         <>
           <MiniStatus>{explanation}</MiniStatus>
+          <MiniStatus>
+            Difference vs baseline ({selected[0]?.name}): net, PF, win rate, RRR, and DD are calculated against the first selected backtest.
+          </MiniStatus>
+          <div className="hubert-lab__metrics">
+            <Metric label="Best net" value={[...selected].sort((a, b) => Number(b.metrics?.netProfit ?? 0) - Number(a.metrics?.netProfit ?? 0))[0]?.name ?? "--"} />
+            <Metric label="Best PF" value={[...selected].sort((a, b) => Number(b.metrics?.profitFactor ?? 0) - Number(a.metrics?.profitFactor ?? 0))[0]?.name ?? "--"} />
+            <Metric label="Best win%" value={[...selected].sort((a, b) => Number(b.metrics?.winRate ?? 0) - Number(a.metrics?.winRate ?? 0))[0]?.name ?? "--"} />
+            <Metric label="Lowest DD" value={[...selected].sort((a, b) => Number(a.metrics?.maxDrawdown ?? Infinity) - Number(b.metrics?.maxDrawdown ?? Infinity))[0]?.name ?? "--"} />
+          </div>
           <MultiCurveChart title="Equity Curves" results={selected} curveKey="equity" />
-          <MultiCurveChart title="Drawdown Curves" results={selected} curveKey="drawdown" />
+          <details className="hubert-advanced">
+            <summary>Drawdown Curves</summary>
+            <MultiCurveChart title="Drawdown Curves" results={selected} curveKey="drawdown" />
+          </details>
           <div className="hubert-lab__table">
             <table>
               <thead>
-                <tr><th>Backtest</th><th>Net</th><th>Net %</th><th>DD</th><th>PF</th><th>Win</th><th>Trades</th><th>Avg</th><th>Best</th><th>Worst</th></tr>
+                <tr><th>Backtest</th><th>Net</th><th>Δ Net</th><th>Net %</th><th>DD</th><th>PF</th><th>Win</th><th>RRR</th><th>Avg R</th><th>Trades</th><th>Avg</th><th>Best</th><th>Worst</th></tr>
               </thead>
               <tbody>
                 {selected.map((test) => {
                   const metrics = test.metrics ?? {};
+                  const baselineMetrics = selected[0]?.metrics ?? {};
+                  const baselineNet = Number(baselineMetrics.netProfit ?? 0);
+                  const net = Number(metrics.netProfit ?? 0);
                   const netPercent = metrics.startingBalance ? metrics.netProfit / metrics.startingBalance * 100 : (metrics.netProfit / (test.config?.startingBalance ?? 10000)) * 100;
                   return (
                     <tr key={test.id}>
                       <td>{test.name}</td>
-                      <td>{fmt(metrics.netProfit)}</td>
+                      <td>{fmt(net)}</td>
+                      <td>{test.id === selected[0]?.id ? "baseline" : fmt(net - baselineNet)}</td>
                       <td>{fmt(netPercent)}%</td>
                       <td>{fmt(metrics.maxDrawdown)}%</td>
                       <td>{fmt(metrics.profitFactor)}</td>
                       <td>{fmt(metrics.winRate)}%</td>
+                      <td title="RRR = average winner / absolute average loser">{Number.isFinite(resultRrr(test).value) ? fmt(resultRrr(test).value) : "unavailable"}</td>
+                      <td title="Average trade result in risk units">{Number.isFinite(resultAvgR(test).value) ? fmt(resultAvgR(test).value) : "unavailable"}</td>
                       <td>{metrics.totalTrades ?? 0}</td>
                       <td>{fmt(metrics.averageTrade)}</td>
                       <td>{fmt(metrics.largestWin)}</td>
@@ -3279,7 +3957,9 @@ function compareExplanation(results) {
   if (results.length < 2) return "Select backtests to compare.";
   const byProfit = [...results].sort((a, b) => Number(b.metrics?.netProfit ?? 0) - Number(a.metrics?.netProfit ?? 0));
   const byDrawdown = [...results].sort((a, b) => Number(a.metrics?.maxDrawdown ?? Infinity) - Number(b.metrics?.maxDrawdown ?? Infinity));
-  return `${byProfit[0].name} earns more, while ${byDrawdown[0].name} has the lower drawdown. Use both numbers together, not one alone.`;
+  const byPf = [...results].sort((a, b) => Number(b.metrics?.profitFactor ?? 0) - Number(a.metrics?.profitFactor ?? 0));
+  const byWin = [...results].sort((a, b) => Number(b.metrics?.winRate ?? 0) - Number(a.metrics?.winRate ?? 0));
+  return `${byProfit[0].name} leads net, ${byPf[0].name} leads PF, ${byWin[0].name} leads win rate, and ${byDrawdown[0].name} has the lower drawdown. Use the difference-vs-baseline row before trusting a single winner.`;
 }
 
 function MultiCurveChart({ curveKey, results, title }) {
@@ -4069,7 +4749,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
   async function confirmPendingAhOperation() {
     if (!pendingAhOperation) return null;
     return runAction("ah-confirm-operation", "Confirm AH operation", async () => {
-      if (pendingAhOperation.type !== "research-job") {
+      if (!["research-job", "agent-os-research-package"].includes(pendingAhOperation.type)) {
         throw new Error("This pending operation is not wired for execution yet.");
       }
       if (pendingAhOperation.status && pendingAhOperation.status !== "ready_to_confirm") {
@@ -4171,7 +4851,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
         body: { format },
         method: "POST",
       });
-      downloadText(payload.fileName, payload.content, payload.mime);
+      downloadPayload(payload.fileName, payload.content, payload.mime, payload.encoding);
     });
   }
 
@@ -4579,6 +5259,8 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
           <span>PF <b>{metricText(verifiedFrom.profitFactor)}</b></span>
           <span>Net <b>{metricText(verifiedFrom.net, 2, " USDT")}</b></span>
           <span>DD <b>{metricText(verifiedFrom.drawdown)}</b></span>
+          <span title="RRR = average winner / absolute average loser">RRR <b>{row ? rrrText(row) : "RRR unavailable"}</b></span>
+          <span title="Avg R / trade = average result in risk units">Avg R <b>{row ? avgRText(row) : "Avg R unavailable"}</b></span>
           <span>Integrity <b>{verifiedFrom.integrityScore ?? "--"} · {verifiedFrom.integrityStatus ?? "unknown"}</b></span>
         </div>
         {verifiedFrom.integrityWarnings?.length > 0 && (
@@ -4793,6 +5475,8 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
                 <Metric label="Symbol" value={pendingAhOperation.plan?.symbol ?? "--"} />
                 <Metric label="TF" value={pendingAhOperation.plan?.timeframe ?? "--"} />
                 <Metric label="Missing" value={pendingAhOperation.plan?.planningSession?.missingFields?.join(", ") || "none"} />
+                <Metric label="Artifacts" value={pendingAhOperation.plan?.artifactFormats?.join(", ") || Object.entries(pendingAhOperation.plan?.artifacts ?? {}).filter(([, enabled]) => enabled).map(([key]) => key).join(", ") || "--"} />
+                <Metric label="Tools" value={(pendingAhOperation.tools ?? pendingAhOperation.plan?.toolsPlanned ?? []).slice(0, 4).join(", ") || "--"} />
               </div>
               <details className="hubert-advanced">
                 <summary>Edit pending parameters</summary>
@@ -5000,6 +5684,8 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
                         <Metric label="Robustness" value={fmt(activeResult.research?.robustnessScore ?? activeResult.score)} />
                         <Metric label="Net" value={metricText(activeResult.canonical?.metrics?.netPnl ?? activeResult.metrics?.netProfit ?? activeResult.netProfit, 2, " USDT")} />
                         <Metric label="PF" value={metricText(activeResult.canonical?.metrics?.profitFactor ?? activeResult.metrics?.profitFactor ?? activeResult.profitFactor)} />
+                        <Metric help="RRR = average winning trade divided by absolute average losing trade." label="RRR" value={rrrText(activeResult)} />
+                        <Metric help="Avg R / trade = average result in risk units when available." label="Avg R / trade" value={avgRText(activeResult)} />
                         <Metric label="Trades" value={activeResult.canonical?.metrics?.trades ?? activeResult.metrics?.totalTrades ?? activeResult.totalTrades ?? 0} />
                       </div>
                       {renderVerifiedFrom(verifiedFromFor(activeResult), activeResult)}
@@ -5060,6 +5746,8 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
               <button type="button" onClick={() => exportRun(activeRun.id, "md")}>Export Markdown</button>
               <button type="button" onClick={() => exportRun(activeRun.id, "json")}>Export JSON</button>
               <button type="button" onClick={() => exportRun(activeRun.id, "csv")}>Export CSV</button>
+              {activeRun.artifacts?.some((artifact) => artifact.format === "docx") && <button type="button" onClick={() => exportRun(activeRun.id, "docx")}>Export Word</button>}
+              {activeRun.artifacts?.some((artifact) => artifact.format === "xlsx") && <button type="button" onClick={() => exportRun(activeRun.id, "xlsx")}>Export Excel</button>}
             </div>
           )}
           </article>
@@ -5217,7 +5905,7 @@ function AiPanel({
         body: { format, reportId: report.id },
         method: "POST",
       });
-      downloadText(payload.fileName, payload.content, payload.mime);
+      downloadPayload(payload.fileName, payload.content, payload.mime, payload.encoding);
     });
   }
 
@@ -5406,7 +6094,7 @@ function AiPanel({
 }
 
 function FavoritesPanel({ favorites, onDelete, onHide, onOpen, onRename }) {
-  const groups = ["Strategy Decks", "MM Decks", "Battle Decks", "Backtests", "Analytics Reports"];
+  const groups = ["Strategy Decks", "MM Decks", "Battle Decks", "Backtests", "Sweep Results", "Analytics Reports"];
   const visibleFavorites = favorites.filter((item) => !item.hidden);
 
   return (
@@ -5493,12 +6181,11 @@ function DeckList({ decks, deleteLabel = "Delete", extra, onDelete, onDuplicate,
   );
 }
 
-function BacktestResult({ onViewTrade, result }) {
+function BacktestResult({ onResetChartView, onViewTrade, result }) {
   const audit = useMemo(() => sizingAudit(result?.trades ?? []), [result?.trades]);
   const displayEquityCurve = useMemo(() => equityCurveForResult(result), [result]);
   const curveStats = useMemo(() => equityStats(displayEquityCurve), [displayEquityCurve]);
-  const equityPoints = useMemo(() => equityPolyline(displayEquityCurve), [displayEquityCurve]);
-  const drawdownPoints = useMemo(() => drawdownPolyline(displayEquityCurve), [displayEquityCurve]);
+  const analytics = useMemo(() => derivedBacktestAnalytics(result ?? {}, displayEquityCurve), [displayEquityCurve, result]);
   const hasEndTrade = Boolean(result?.trades?.some((trade) => trade.exitReason === "END" || trade.reason === "END"));
 
   if (!result) return <MiniStatus>Run a backtest to see equity, trades, and analysis.</MiniStatus>;
@@ -5516,10 +6203,18 @@ function BacktestResult({ onViewTrade, result }) {
         <Metric label="Ambiguous candles" value={result.ambiguousCandlesCount ?? result.ambiguity?.ambiguousCandlesCount ?? 0} />
         <Metric label="Conservative adjusted" value={result.conservativeAdjustedTrades ?? result.ambiguity?.conservativeAdjustedTrades ?? 0} />
         <Metric label="Skipped entries" value={result.conservativeSkippedEntries ?? result.ambiguity?.conservativeSkippedEntries ?? 0} />
-        <Metric label="Expectancy" value={fmt(metrics.expectancy)} />
-        <Metric label="Average trade" value={fmt(metrics.averageTrade)} />
+        <Metric label="Expectancy" value={fmt(analytics.expectancy)} />
+        <Metric help="RRR = average winning trade divided by absolute average losing trade." label="RRR" value={Number.isFinite(analytics.rrr.value) ? fmt(analytics.rrr.value) : "RRR unavailable"} />
+        <Metric help="Avg R / trade = average trade result in risk units when trade risk is available." label="Avg R / trade" value={Number.isFinite(analytics.avgR.value) ? fmt(analytics.avgR.value) : "Avg R unavailable"} />
+        <Metric label="Average trade" value={fmt(analytics.averageTrade)} />
+        <Metric label="Median trade" value={analytics.medianTrade === null ? "--" : fmt(analytics.medianTrade)} />
         <Metric label="Best trade" value={fmt(metrics.largestWin)} />
         <Metric label="Worst trade" value={fmt(metrics.largestLoss)} />
+        <Metric label="Max wins streak" value={analytics.maxConsecutiveWins} />
+        <Metric label="Max losses streak" value={analytics.maxConsecutiveLosses} />
+        <Metric label="DD recovery" value={durationText(analytics.recoverySeconds)} />
+        <Metric label="Profit concentration" value={analytics.profitConcentration === null ? "Unavailable" : `${fmt(analytics.profitConcentration)}% top wins`} />
+        <Metric label="Monthly consistency" value={analytics.monthlyConsistency} />
       </div>
       <div className="hubert-lab__metrics">
         <Metric label="Starting capital" value={`${fmt(curveStats.start)} USDT`} />
@@ -5551,18 +6246,22 @@ function BacktestResult({ onViewTrade, result }) {
       <SingleCurveChart
         title="Equity Curve"
         caption={`Account equity over time. Start ${fmt(curveStats.start)} USDT, final ${fmt(curveStats.end)} USDT, high-water ${fmt(curveStats.highWater)} USDT.`}
+        curve={displayEquityCurve}
         footer={`${dateText(curveStats.from)} → ${dateText(curveStats.to)} · y-axis ${fmt(curveStats.min)} to ${fmt(curveStats.highWater)} USDT`}
+        onResetChartView={onResetChartView}
         yLabel="Account equity (USDT)"
-        points={equityPoints}
       />
-      <SingleCurveChart
-        title="Drawdown Curve"
-        caption={`Drawdown from high-water mark. Max preview drawdown ${fmt(curveStats.maxDrawdownPercent)}%.`}
-        footer={`${dateText(curveStats.from)} → ${dateText(curveStats.to)} · y-axis 0% to ${fmt(curveStats.maxDrawdownPercent)}%`}
-        yLabel="Drawdown (%)"
-        points={drawdownPoints}
-        drawdown
-      />
+      <details className="hubert-advanced">
+        <summary>Drawdown curve</summary>
+        <SingleCurveChart
+          title="Drawdown Curve"
+          caption={`Drawdown from high-water mark. Max preview drawdown ${fmt(curveStats.maxDrawdownPercent)}%.`}
+          curve={displayEquityCurve}
+          footer={`${dateText(curveStats.from)} → ${dateText(curveStats.to)} · y-axis 0% to ${fmt(curveStats.maxDrawdownPercent)}%`}
+          yLabel="Drawdown (%)"
+          drawdown
+        />
+      </details>
       <MiniStatus>{analyzeBacktest(result)}</MiniStatus>
       {hasEndTrade && (
         <MiniStatus>END means the trade was still open when the selected test range ended. It is not a live open position.</MiniStatus>
@@ -5580,8 +6279,9 @@ function BacktestResult({ onViewTrade, result }) {
       </div>
       <MiniStatus>{audit.note}</MiniStatus>
       <div className="hubert-lab__actions">
-        <button type="button" onClick={() => exportJson(`${result.name ?? "backtest"}.json`, result)}>Export JSON</button>
-        <button type="button" onClick={() => exportCsv(`${result.name ?? "backtest"}-trades.csv`, result.trades)}>Export CSV</button>
+        <button title="Center chart on current backtest range and restore default zoom." type="button" onClick={onResetChartView}>Center Chart</button>
+        <button type="button" onClick={() => exportJson(`${result.name ?? "backtest"}.json`, exportableBacktestResult(result))}>Export JSON</button>
+        <button type="button" onClick={() => exportBacktestCsv(`${result.name ?? "backtest"}-trades.csv`, result)}>Export CSV</button>
       </div>
       <SideBreakdown trades={result.trades} />
       <TradeTable onViewTrade={onViewTrade} trades={result.trades} />
@@ -5675,18 +6375,160 @@ function BacktestDebugSection({ result }) {
   );
 }
 
-function SingleCurveChart({ caption, drawdown = false, footer = "", points, title, yLabel = "Value" }) {
+function curvePointsForChart(curve = [], drawdown = false) {
+  const sampled = sampleCurve(curve, 650);
+  if (!drawdown) {
+    return sampled
+      .map((point) => ({
+        time: Number(point.time ?? 0),
+        value: Number(point.equity ?? 0),
+      }))
+      .filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value));
+  }
+
+  let peak = Number(sampled[0]?.equity ?? 0);
+  return sampled
+    .map((point) => {
+      const equity = Number(point.equity ?? 0);
+      peak = Math.max(peak, equity);
+      return {
+        time: Number(point.time ?? 0),
+        value: peak > 0 ? ((peak - equity) / peak) * 100 : 0,
+      };
+    })
+    .filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value));
+}
+
+function curvePath(points = [], viewport) {
+  const visible = points.slice(viewport.start, viewport.end + 1);
+  if (!visible.length) {
+    return {
+      max: 0,
+      min: 0,
+      path: "",
+      visible,
+    };
+  }
+  const minTime = visible[0].time;
+  const maxTime = visible.at(-1).time;
+  const values = visible.map((point) => point.value);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min || 1;
+  const timeSpan = maxTime - minTime || 1;
+  return {
+    max,
+    min,
+    path: visible
+      .map((point) => {
+        const x = ((point.time - minTime) / timeSpan) * 100;
+        const y = 100 - ((point.value - min) / span) * 100;
+        return `${x.toFixed(2)},${y.toFixed(2)}`;
+      })
+      .join(" "),
+    visible,
+  };
+}
+
+function SingleCurveChart({ caption, curve = [], drawdown = false, footer = "", onResetChartView, title, yLabel = "Value" }) {
+  const points = useMemo(() => curvePointsForChart(curve, drawdown), [curve, drawdown]);
+  const [viewport, setViewport] = useState({ end: 0, start: 0 });
+  const [hover, setHover] = useState(null);
+  const dragRef = useRef(null);
+
+  useEffect(() => {
+    setViewport({ end: Math.max(0, points.length - 1), start: 0 });
+    setHover(null);
+  }, [points.length, title, drawdown]);
+
+  const safeViewport = useMemo(() => {
+    const end = Math.min(Math.max(viewport.end, viewport.start), Math.max(0, points.length - 1));
+    const start = Math.max(0, Math.min(viewport.start, end));
+    return { end, start };
+  }, [points.length, viewport]);
+  const series = useMemo(() => curvePath(points, safeViewport), [points, safeViewport]);
+  const firstVisible = series.visible[0];
+  const lastVisible = series.visible.at(-1);
+  const hoverPoint = hover === null ? null : series.visible[hover] ?? null;
+
+  function resetLocalView() {
+    setViewport({ end: Math.max(0, points.length - 1), start: 0 });
+    setHover(null);
+    onResetChartView?.();
+  }
+
+  function zoomChart(event) {
+    if (points.length < 3) return;
+    event.preventDefault();
+    const windowSize = safeViewport.end - safeViewport.start + 1;
+    const direction = event.deltaY > 0 ? 1 : -1;
+    const nextSize = Math.max(8, Math.min(points.length, Math.round(windowSize * (direction > 0 ? 1.18 : 0.82))));
+    const anchor = (event.nativeEvent.offsetX ?? 0) / Math.max(1, event.currentTarget.clientWidth);
+    const anchorIndex = safeViewport.start + Math.round(windowSize * anchor);
+    const nextStart = Math.max(0, Math.min(points.length - nextSize, anchorIndex - Math.round(nextSize * anchor)));
+    setViewport({ end: nextStart + nextSize - 1, start: nextStart });
+  }
+
+  function hoverChart(event) {
+    if (!series.visible.length) return;
+    const ratio = (event.nativeEvent.offsetX ?? 0) / Math.max(1, event.currentTarget.clientWidth);
+    const index = Math.max(0, Math.min(series.visible.length - 1, Math.round(ratio * (series.visible.length - 1))));
+    setHover(index);
+    if (dragRef.current !== null) {
+      const delta = Math.round((dragRef.current - (event.clientX ?? 0)) / 8);
+      const windowSize = safeViewport.end - safeViewport.start + 1;
+      const nextStart = Math.max(0, Math.min(points.length - windowSize, safeViewport.start + delta));
+      setViewport({ end: nextStart + windowSize - 1, start: nextStart });
+      dragRef.current = event.clientX ?? dragRef.current;
+    }
+  }
+
   return (
-    <div className="hubert-chart-box">
-      <strong>{title}</strong>
+    <div className="hubert-chart-box hubert-chart-box--analytics">
+      <div className="hubert-lab__subhead">
+        <strong>{title}</strong>
+        <button title="Center chart on current backtest range and restore default zoom." type="button" onClick={resetLocalView}>Reset View</button>
+      </div>
       <span>{caption}</span>
       <div className="hubert-chart-axis">
-        <span>Y: {yLabel}</span>
-        <span>X: date/time</span>
+        <span>Y: {yLabel} · {fmt(series.min)} to {fmt(series.max)}</span>
+        <span>X: {dateText(firstVisible?.time)} → {dateText(lastVisible?.time)}</span>
       </div>
-      <svg className={`hubert-lab__equity${drawdown ? " hubert-lab__equity--drawdown" : ""}`} viewBox="0 0 100 100" preserveAspectRatio="none">
-        <polyline points={points} />
-      </svg>
+      <div
+        className="hubert-equity-interactive"
+        onMouseDown={(event) => {
+          dragRef.current = event.clientX;
+        }}
+        onMouseLeave={() => {
+          dragRef.current = null;
+          setHover(null);
+        }}
+        onMouseMove={hoverChart}
+        onMouseUp={() => {
+          dragRef.current = null;
+        }}
+        onWheel={zoomChart}
+        role="presentation"
+      >
+        <svg className={`hubert-lab__equity${drawdown ? " hubert-lab__equity--drawdown" : ""}`} viewBox="0 0 100 100" preserveAspectRatio="none">
+          <polyline points={series.path} />
+          {hoverPoint && (
+            <line
+              className="hubert-equity-hover-line"
+              x1={(hover / Math.max(1, series.visible.length - 1)) * 100}
+              x2={(hover / Math.max(1, series.visible.length - 1)) * 100}
+              y1="0"
+              y2="100"
+            />
+          )}
+        </svg>
+        {hoverPoint && (
+          <div className="hubert-equity-tooltip">
+            <strong>{dateText(hoverPoint.time)}</strong>
+            <span>{drawdown ? "Drawdown" : "Equity"}: {fmt(hoverPoint.value)}{drawdown ? "%" : " USDT"}</span>
+          </div>
+        )}
+      </div>
       {footer && <span>{footer}</span>}
     </div>
   );
@@ -5738,7 +6580,7 @@ function TradeTable({ onViewTrade, trades }) {
       <div className="hubert-lab__table">
         <table>
           <thead>
-            <tr><th>Time</th><th>Side</th><th>Sizing</th><th>Fill</th><th>Ambiguity</th><th>Capital</th><th>Size</th><th>Lev</th><th>SL dist</th><th>SL loss</th><th>Cap</th><th>PnL</th><th>Chart</th></tr>
+            <tr><th>Time</th><th>Side</th><th>Sizing</th><th>Fill</th><th>Ambiguity</th><th>Capital</th><th>Size</th><th>Lev</th><th>SL dist</th><th>SL loss</th><th>R</th><th>Cap</th><th>PnL</th><th>Chart</th></tr>
           </thead>
           <tbody>
             {visibleTrades.map((trade, index) => (
@@ -5755,6 +6597,7 @@ function TradeTable({ onViewTrade, trades }) {
                 <td>{trade.assumedLeverage ? `${fmt(trade.assumedLeverage, 1)}x` : "--"}</td>
                 <td>{trade.slDistancePercent ? `${fmt(trade.slDistancePercent * 100)}%` : "--"}</td>
                 <td title={`Configured risk: ${fmt(trade.configuredRiskPercent)}% · raw notional ${fmt(trade.rawNotional)}`}>{fmt(trade.expectedSlLossAmount ?? trade.riskAmount)}</td>
+                <td>{Number.isFinite(rMultipleForTrade(trade)) ? fmt(rMultipleForTrade(trade)) : "--"}</td>
                 <td title={trade.sizingClampReason || "No sizing clamp"}>{trade.sizingClampReason ? "clamped" : "ok"}</td>
                 <td>{fmt(trade.netPnl ?? trade.pnl)}</td>
                 <td>
@@ -5815,10 +6658,10 @@ function LogList({ logs }) {
   );
 }
 
-function Metric({ label, value }) {
+function Metric({ help, label, value }) {
   return (
-    <div>
-      <span>{label}</span>
+    <div title={help ?? ""}>
+      <span>{label} {help && <Help text={help} />}</span>
       <strong>{value}</strong>
     </div>
   );
@@ -5837,7 +6680,7 @@ function ToggleGrid({ items, onChange, values }) {
   );
 }
 
-function NumberField({ commitEmpty = true, help, label, max, min, onChange, step = "1", value }) {
+function NumberField({ commitEmpty = true, disabled = false, help, label, max, min, onChange, step = "1", value }) {
   const [draft, setDraft] = useState(value ?? "");
 
   useEffect(() => {
@@ -5849,6 +6692,7 @@ function NumberField({ commitEmpty = true, help, label, max, min, onChange, step
       <span>{label} {help && <Help text={help} />}</span>
       <input
         inputMode="decimal"
+        disabled={disabled}
         min={min}
         max={max}
         step={step}
@@ -5872,11 +6716,11 @@ function NumberField({ commitEmpty = true, help, label, max, min, onChange, step
   );
 }
 
-function TextField({ label, onChange, value }) {
+function TextField({ disabled = false, label, onChange, value }) {
   return (
     <label>
       <span>{label}</span>
-      <input value={value ?? ""} onChange={(event) => onChange(event.target.value)} />
+      <input disabled={disabled} value={value ?? ""} onChange={(event) => onChange(event.target.value)} />
     </label>
   );
 }

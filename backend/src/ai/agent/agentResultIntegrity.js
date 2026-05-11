@@ -82,6 +82,12 @@ export function normalizeResearchResult(row = {}, { index = 0, output = {}, plan
   const profitFactor = pickMetric(row, "profitFactor");
   const expectancy = pickMetric(row, "expectancy", ["averageTrade"]);
   const maxDrawdown = pickMetric(row, "maxDrawdown", ["drawdown"]);
+  const pickedRrr = pickMetric(row, "rrr", ["rewardRiskRatio"]);
+  const rrrSourceText = String(row.rrrSource ?? row.metrics?.rrrSource ?? "").toLowerCase();
+  const rrr = rrrSourceText.includes("r multiple")
+    ? { origin: null, present: false, value: null }
+    : pickedRrr;
+  const avgR = pickMetric(row, "avgR", ["averageR", "avgRPerTrade"]);
   const winRate = pickMetric(row, "winRate");
   const trades = pickMetric(row, "totalTrades", ["trades"]);
   const candlesUsed = pickMetric(row, "candlesUsed");
@@ -113,6 +119,8 @@ export function normalizeResearchResult(row = {}, { index = 0, output = {}, plan
       maxDrawdown: maxDrawdown.value,
       netPnl: net.value,
       profitFactor: profitFactor.value,
+      rrr: rrr.value,
+      avgR: avgR.value,
       trades: trades.value,
       winRate: winRate.value,
     },
@@ -124,6 +132,8 @@ export function normalizeResearchResult(row = {}, { index = 0, output = {}, plan
       maxDrawdown: maxDrawdown.origin,
       netPnl: net.origin,
       profitFactor: profitFactor.origin,
+      rrr: rrr.origin,
+      avgR: avgR.origin,
       trades: trades.origin,
       winRate: winRate.origin,
     },
@@ -242,4 +252,3 @@ export function metricDiff(left = {}, right = {}) {
     }];
   }));
 }
-

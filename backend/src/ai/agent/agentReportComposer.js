@@ -11,6 +11,8 @@ function metricValue(row, key) {
   if (key === "maxDrawdown") return row?.canonical?.metrics?.maxDrawdown ?? row?.metrics?.maxDrawdown ?? row?.maxDrawdown ?? "";
   if (key === "profitFactor") return row?.canonical?.metrics?.profitFactor ?? row?.metrics?.profitFactor ?? row?.profitFactor ?? "";
   if (key === "winRate") return row?.canonical?.metrics?.winRate ?? row?.metrics?.winRate ?? row?.winRate ?? "";
+  if (key === "rrr") return row?.canonical?.metrics?.rrr ?? row?.metrics?.rrr ?? row?.rrr ?? "";
+  if (key === "avgR") return row?.canonical?.metrics?.avgR ?? row?.metrics?.avgR ?? row?.avgR ?? row?.averageR ?? "";
   return row?.metrics?.[key] ?? row?.canonical?.metrics?.[key] ?? row?.[key] ?? "";
 }
 
@@ -24,6 +26,8 @@ export function rowsToCsv(rows = []) {
     conservativeNetProfit: row.conservative?.metrics?.netProfit,
     envelopeMultiplier: row.params?.envelopeMultiplier,
     fillMode: row.params?.fillMode ?? row.fillMode,
+    rangeFrom: row.provenance?.from ?? row.canonical?.range?.from,
+    rangeTo: row.provenance?.to ?? row.canonical?.range?.to,
     legacyNetProfit: row.legacy?.metrics?.netProfit,
     maxDrawdown: metricValue(row, "maxDrawdown"),
     maxSameSideFailures: row.params?.maxSameSideFailures,
@@ -36,6 +40,10 @@ export function rowsToCsv(rows = []) {
     robustnessScore: row.research?.robustnessScore,
     score: row.score,
     sizingMode: row.params?.sizingMode,
+    rrr: metricValue(row, "rrr") || "RRR unavailable",
+    rrrSource: row.rrrSource ?? row.metrics?.rrrSource,
+    avgRPerTrade: metricValue(row, "avgR") || "Avg R unavailable",
+    avgRSource: row.avgRSource ?? row.metrics?.avgRSource,
     symbol: row.symbol,
     timeframe: row.timeframe,
     totalTrades: metricValue(row, "totalTrades"),
@@ -133,13 +141,13 @@ export function composeAgentMarkdown({ output = {}, plan = {}, run = {} }) {
   ];
 
   if (topRows.length) {
-    lines.push("| Rank | Score | Net PnL | PF | Win % | Trades | Params |");
-    lines.push("| ---: | ---: | ---: | ---: | ---: | ---: | --- |");
+    lines.push("| Rank | Score | Net PnL | PF | Win % | RRR | Avg R / trade | Trades | Params |");
+    lines.push("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |");
     topRows.slice(0, 5).forEach((row, index) => {
       const params = row.params
         ? `BW ${row.params.bandwidth}, NWE ${row.params.envelopeMultiplier}, ATR ${row.params.atrLength}/${row.params.atrMultiplier}, max ${row.params.maxSameSideFailures}, ${row.params.sizingMode ?? ""}`
         : row.timeframe ?? row.label ?? "result";
-      lines.push(`| ${row.rank ?? index + 1} | ${number(row.score)} | ${number(metricValue(row, "netProfit"))} | ${number(metricValue(row, "profitFactor"))} | ${number(metricValue(row, "winRate"))} | ${metricValue(row, "totalTrades") ?? 0} | ${params} |`);
+      lines.push(`| ${row.rank ?? index + 1} | ${number(row.score)} | ${number(metricValue(row, "netProfit"))} | ${number(metricValue(row, "profitFactor"))} | ${number(metricValue(row, "winRate"))} | ${metricValue(row, "rrr") || "RRR unavailable"} | ${metricValue(row, "avgR") || "Avg R unavailable"} | ${metricValue(row, "totalTrades") ?? 0} | ${params} |`);
     });
   } else {
     lines.push("No ranked rows were produced.");
@@ -156,7 +164,7 @@ export function composeAgentMarkdown({ output = {}, plan = {}, run = {} }) {
     ...(topRows.slice(0, 5).map((row) => {
       const label = row.research?.label ?? "research candidate";
       const overfit = row.research?.overfit?.label ?? "not evaluated";
-      return `- Rank ${row.rank ?? "?"}: ${label}. It scored ${number(row.research?.robustnessScore ?? row.score)} with net ${number(metricValue(row, "netProfit"))}, PF ${number(metricValue(row, "profitFactor"))}, drawdown ${number(metricValue(row, "maxDrawdown"))}, ${metricValue(row, "totalTrades") ?? 0} trades, and ${overfit} overfit risk.`;
+      return `- Rank ${row.rank ?? "?"}: ${label}. It scored ${number(row.research?.robustnessScore ?? row.score)} with net ${number(metricValue(row, "netProfit"))}, PF ${number(metricValue(row, "profitFactor"))}, RRR ${metricValue(row, "rrr") || "unavailable"}, Avg R/trade ${metricValue(row, "avgR") || "unavailable"}, drawdown ${number(metricValue(row, "maxDrawdown"))}, ${metricValue(row, "totalTrades") ?? 0} trades, and ${overfit} overfit risk.`;
     })),
     "",
     `## ${label.methodology}`,

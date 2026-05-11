@@ -2316,6 +2316,11 @@ const server = http.createServer(async (request, response) => {
 	      return;
 	    }
 
+	    if (request.method === "GET" && pathname === "/ai/agent-os/tools") {
+	      sendJson(response, 200, aiAgent.agentOSToolCatalog());
+	      return;
+	    }
+
 	    if (request.method === "GET" && pathname === "/ai/agent/runs") {
 	      sendJson(response, 200, aiAgent.listRuns());
 	      return;

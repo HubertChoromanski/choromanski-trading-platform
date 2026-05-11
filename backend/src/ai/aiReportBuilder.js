@@ -4,11 +4,21 @@ function fmt(value, digits = 2) {
 }
 
 function metricRows(metrics = {}) {
+  const rrr = Number(metrics.rrr ?? metrics.rewardRiskRatio);
+  const averageWin = Number(metrics.averageWin);
+  const averageLoss = Number(metrics.averageLoss);
+  const trueRrr = Number.isFinite(rrr)
+    ? rrr
+    : averageWin > 0 && averageLoss < 0
+      ? averageWin / Math.abs(averageLoss)
+      : null;
   return [
     ["netProfit", fmt(metrics.netProfit)],
     ["profitFactor", fmt(metrics.profitFactor)],
     ["winRate", fmt(metrics.winRate)],
     ["maxDrawdown", fmt(metrics.maxDrawdown)],
+    ["rrr", trueRrr === null ? "RRR unavailable" : fmt(trueRrr)],
+    ["avgRPerTrade", Number.isFinite(Number(metrics.avgR ?? metrics.averageR)) ? fmt(metrics.avgR ?? metrics.averageR) : "Avg R unavailable"],
     ["totalTrades", metrics.totalTrades ?? 0],
     ["expectancy", fmt(metrics.expectancy)],
     ["averageTrade", fmt(metrics.averageTrade)],
@@ -67,6 +77,8 @@ export function buildSweepReport(rows = []) {
       netProfit: row.netProfit,
       params: row.params,
       profitFactor: row.profitFactor,
+      rrr: row.rrr ?? "RRR unavailable",
+      avgRPerTrade: row.avgR ?? row.averageR ?? "Avg R unavailable",
       rank: row.rank,
       score: row.score,
       totalTrades: row.totalTrades,

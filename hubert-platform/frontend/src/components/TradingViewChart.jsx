@@ -1659,6 +1659,7 @@ export default function TradingViewChart() {
           onClearBacktest={exitBacktestAnalysis}
           onClose={() => setSettingsPanel(null)}
           onExitBacktestAnalysis={exitBacktestAnalysis}
+          onResetChartView={resetChartView}
           onViewBacktestTrade={viewBacktestTradeOnChart}
           chartDiagnostics={dataDiagnostics}
           fullHistoryDataset={fullHistoryDataset}
@@ -1693,7 +1694,13 @@ export default function TradingViewChart() {
         />
       )}
 
-      <div className="hubert-chart" onClick={handleChartClick} ref={chartContainerRef} />
+      <div
+        className="hubert-chart"
+        onClick={handleChartClick}
+        onDoubleClick={resetChartView}
+        ref={chartContainerRef}
+        title="Double-click to center chart on current range"
+      />
 
       <div className="hubert-window-panel" aria-label="Chart window controls">
         <strong>{dataDiagnostics.provider ?? "binance-futures"}</strong>
@@ -1731,8 +1738,9 @@ export default function TradingViewChart() {
         onClick={resetChartView}
         type="button"
         aria-label="Reset chart view"
+        title="Center chart on current backtest range and restore default zoom."
       >
-        R
+        Reset View
       </button>
 
       {(isLoading || error) && (

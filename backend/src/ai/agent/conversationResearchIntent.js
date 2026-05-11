@@ -69,8 +69,8 @@ function parseExplicitDateRange(text) {
   const source = String(text);
   const datePattern = String.raw`(\d{4}[.-]\d{1,2}[.-]\d{1,2})`;
   const match =
-    source.match(new RegExp(`(?:od|from)\\s+${datePattern}\\s+(?:do|to|until|-)\\s+${datePattern}`, "i")) ??
-    source.match(new RegExp(`${datePattern}\\s*(?:→|->|do|to|until|-)\\s*${datePattern}`, "i"));
+    source.match(new RegExp(`(?:od|from)\\s+${datePattern}\\s+(?:do|to|until|–|-)\\s+${datePattern}`, "i")) ??
+    source.match(new RegExp(`${datePattern}\\s*(?:→|->|do|to|until|–|-)\\s*${datePattern}`, "i"));
   if (!match) return null;
   const from = parseDate(match[1]);
   const to = parseDate(match[2]);
