@@ -6,6 +6,7 @@ import { createAiMemoryStore } from "./ai/aiMemoryStore.js";
 import { createAiService } from "./ai/aiService.js";
 import { createAiTools } from "./ai/aiTools.js";
 import { createAgentOrchestrator } from "./ai/agent/agentOrchestrator.js";
+import { createCopilotMemoryStore } from "./ai/copilotMemory/copilotMemoryStore.js";
 import { reportToCsv } from "./ai/aiReportBuilder.js";
 import { createBotRunner } from "./botRunner.js";
 import { createBingxClient } from "./exchanges/bingxClient.js";
@@ -1932,6 +1933,7 @@ async function sendTelegramTest(settings) {
 }
 
 const aiMemory = createAiMemoryStore({ store });
+const copilotMemory = createCopilotMemoryStore({ store });
 const aiBuildContext = createAiContextBuilder({
   buildLivestreamPayload,
   calculateAnalytics,
@@ -1944,6 +1946,7 @@ const aiTools = createAiTools({
   buildAiContext: aiBuildContext,
   buildLivestreamPayload,
   calculateAnalytics,
+  copilotMemory,
   dataAvailability,
   memory: aiMemory,
   publicApiProfiles,
@@ -1957,6 +1960,7 @@ const aiService = createAiService({
   tools: aiTools,
 });
 const aiAgent = createAgentOrchestrator({
+  copilotMemory,
   store,
   tools: aiTools,
 });
@@ -2267,6 +2271,22 @@ const server = http.createServer(async (request, response) => {
 	    if (request.method === "POST" && pathname === "/ai/platform/state") {
 	      const body = await readBody(request);
 	      sendJson(response, 200, await aiTools.getRuntimeState(body));
+	      return;
+	    }
+
+	    if (request.method === "GET" && pathname === "/ai/copilot/memory") {
+	      sendJson(response, 200, { memory: copilotMemory.getMemory(), ok: true });
+	      return;
+	    }
+
+	    if (request.method === "DELETE" && pathname === "/ai/copilot/memory") {
+	      sendJson(response, 200, { memory: await copilotMemory.clearMemory(), ok: true });
+	      return;
+	    }
+
+	    if (request.method === "POST" && pathname === "/ai/copilot/workspace") {
+	      const body = await readBody(request);
+	      sendJson(response, 200, await aiTools.getCurrentWorkspaceState(body));
 	      return;
 	    }
 

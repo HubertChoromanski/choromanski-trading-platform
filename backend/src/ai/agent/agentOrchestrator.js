@@ -16,7 +16,7 @@ function isPolishQuestion(value = "") {
   return /(^|\s)(co|czemu|dlaczego|jak|gdzie|porownaj|wynik|dziala|nadal|robi|robia|ustawienia|blad|gorszy|lepszy)(\s|$)/u.test(normalized);
 }
 
-export function createAgentOrchestrator({ store, tools }) {
+export function createAgentOrchestrator({ copilotMemory, store, tools }) {
   const runStore = createAgentRunStore({ store });
   const toolRegistry = createAgentToolRegistry({ tools });
   const executor = createAgentExecutor({ runStore, toolRegistry });
@@ -36,6 +36,8 @@ export function createAgentOrchestrator({ store, tools }) {
       };
     }
 
+    const memory = copilotMemory?.summary?.() ?? null;
+    const workspaceContext = body.workspaceContext ?? body.options?.workspaceContext ?? null;
     const plan = createAgentPlan({ options: body.options ?? {}, prompt });
     const safety = checkAgentPlanSafety(plan, body.options ?? {});
 
@@ -53,11 +55,21 @@ export function createAgentOrchestrator({ store, tools }) {
       prompt,
       warnings: safety.warnings,
     });
+    await runStore.update(run.id, {
+      copilotMemory: memory,
+      workspaceContext,
+    });
+    await copilotMemory?.rememberInteraction?.({
+      message: prompt,
+      response: { answer: "Research job queued." },
+      run: { ...run, plan, prompt, status: "queued" },
+      workspaceContext,
+    });
     jobQueue.enqueue(run.id);
 
     return {
       ok: true,
-      run,
+      run: runStore.get(run.id) ? runStore.publicRun(runStore.get(run.id)) : run,
     };
   }
 
@@ -240,6 +252,13 @@ export function createAgentOrchestrator({ store, tools }) {
       }
     }
     return "";
+  }
+
+  function inferBaselineName(message = "", memory = null) {
+    const explicit = extractBaselineName(message);
+    if (explicit) return explicit;
+    if (!/(baseline|hubert|porownaj|porównaj|compare|gorszy|worse|lepszy|better)/i.test(String(message))) return "";
+    return memory?.baselines?.[0]?.name ?? "";
   }
 
   function comparableValue(value) {
@@ -487,6 +506,8 @@ export function createAgentOrchestrator({ store, tools }) {
     }
     const mode = String(body.mode ?? body.copilotMode ?? "research").toLowerCase();
     const run = body.runId ? runStore.get(body.runId) : runStore.list().find((item) => item.status === "completed");
+    const memory = copilotMemory?.summary?.() ?? null;
+    const workspaceContext = body.workspaceContext ?? null;
     const wantsPlatformEvidence = (
       mode === "platform-diagnosis" ||
       mode === "code-evidence" ||
@@ -499,6 +520,7 @@ export function createAgentOrchestrator({ store, tools }) {
         mode,
         question: message,
         runId: run?.id ?? null,
+        workspaceContext,
       });
       const confidenceLabel = platformEvidence.confidence ?? "medium";
       const response = {
@@ -534,6 +556,7 @@ export function createAgentOrchestrator({ store, tools }) {
           },
         ],
         platformEvidence,
+        memory,
         runId: run?.id ?? null,
       };
 
@@ -558,6 +581,12 @@ export function createAgentOrchestrator({ store, tools }) {
           ].slice(-40),
         });
       }
+      await copilotMemory?.rememberInteraction?.({
+        message,
+        response,
+        run,
+        workspaceContext,
+      });
 
       return {
         ok: true,
@@ -597,7 +626,7 @@ export function createAgentOrchestrator({ store, tools }) {
       })
       : null;
     const reasoning = buildReasoningResponse({ question: message, row: normalizedRow, rows: normalizedRows, run });
-    const baselineName = extractBaselineName(message);
+    const baselineName = inferBaselineName(message, memory);
     const baselineComparison = baselineName
       ? await compareAgentResultToBacktest(run.id, { backtestNameOrId: baselineName, rowId: row?.id, rowIndex })
       : null;
@@ -606,6 +635,8 @@ export function createAgentOrchestrator({ store, tools }) {
       `Intent: ${run.parsedIntent}`,
       `Range: ${run.plan?.range?.from} to ${run.plan?.range?.to}`,
       `Provider: ${run.plan?.provider}`,
+      ...(memory?.preferences?.metrics?.length ? [`Remembered preferred metrics: ${memory.preferences.metrics.join(", ")}`] : []),
+      ...(memory?.baselines?.length ? [`Remembered baseline: ${memory.baselines[0].name}`] : []),
       normalizedRow ? `Selected row: rank ${normalizedRow.rank ?? rowIndex + 1}` : "No ranked row available.",
       ...(baselineComparison?.ok ? [
         `Compared with saved backtest: ${baselineComparison.baseline?.name}`,
@@ -641,6 +672,14 @@ export function createAgentOrchestrator({ store, tools }) {
       : reasoning.answer ?? run.resultSummary?.message ?? "This run completed, but no compact summary is available.";
     const responseRow = compactRow(reasoning.row ?? normalizedRow);
     const responseVerifiedFrom = verifiedFrom(run, reasoning.row ?? normalizedRow);
+    if (baselineComparison?.ok) {
+      await copilotMemory?.rememberBaseline?.({
+        id: baselineComparison.baseline?.id,
+        name: baselineComparison.baseline?.name ?? baselineName,
+        source: "saved-backtest",
+        summary: baselineComparison.explanation,
+      });
+    }
 
     const nextMessages = [
       ...(run.messages ?? []),
@@ -648,6 +687,7 @@ export function createAgentOrchestrator({ store, tools }) {
         context: {
           rowId: row?.id ?? null,
           rowRank: normalizedRow?.rank ?? null,
+          workspaceContext,
         },
         role: "user",
         text: message,
@@ -665,9 +705,20 @@ export function createAgentOrchestrator({ store, tools }) {
         baselineComparison: baselineComparison?.ok ? baselineComparison : null,
         row: responseRow,
         verifiedFrom: responseVerifiedFrom,
+        memory,
       },
     ].slice(-40);
     await runStore.update(run.id, { messages: nextMessages });
+    await copilotMemory?.rememberInteraction?.({
+      message,
+      response: {
+        answer,
+        runId: run.id,
+      },
+      row: reasoning.row ?? normalizedRow,
+      run,
+      workspaceContext,
+    });
 
     return {
       ok: true,
@@ -685,6 +736,7 @@ export function createAgentOrchestrator({ store, tools }) {
         sections: reasoning.sections,
         baselineComparison: baselineComparison?.ok ? baselineComparison : null,
         verifiedFrom: responseVerifiedFrom,
+        memory: copilotMemory?.summary?.() ?? memory,
       },
     };
   }

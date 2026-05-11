@@ -107,6 +107,21 @@ const defaultExecutionConfig = {
 const collectionDefaults = {
   aiAlertDrafts: [],
   aiAgentRuns: [],
+  aiCopilotMemory: {
+    conversationSummary: [],
+    discussedWeaknesses: [],
+    favoriteBaselines: [],
+    preferences: {
+      language: "auto",
+      metrics: [],
+      style: "direct",
+    },
+    previousConclusions: [],
+    recentRuns: [],
+    rejectedConfigs: [],
+    recentWorkspace: null,
+    version: 1,
+  },
   aiReports: [],
   aiSessions: [],
   analytics: [],
@@ -182,6 +197,7 @@ export async function createStateStore() {
 	  const store = {
 	    aiAlertDrafts: await readJson("ai-alert-drafts.json", collectionDefaults.aiAlertDrafts),
 	    aiAgentRuns: await readJson("ai-agent-runs.json", collectionDefaults.aiAgentRuns),
+	    aiCopilotMemory: await readJson("ai-copilot-memory.json", collectionDefaults.aiCopilotMemory),
 	    aiReports: await readJson("ai-reports.json", collectionDefaults.aiReports),
 	    aiSessions: await readJson("ai-sessions.json", collectionDefaults.aiSessions),
 	    analytics: await readJson("analytics.json", collectionDefaults.analytics),
@@ -224,6 +240,7 @@ export async function createStateStore() {
     const fileNames = {
       aiAlertDrafts: "ai-alert-drafts.json",
       aiAgentRuns: "ai-agent-runs.json",
+      aiCopilotMemory: "ai-copilot-memory.json",
       aiReports: "ai-reports.json",
       aiSessions: "ai-sessions.json",
       battleDecks: "battle-decks.json",

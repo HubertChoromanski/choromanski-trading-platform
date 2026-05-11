@@ -445,6 +445,15 @@ export function createAiPlatformAccess({
         "explainDataFlow",
         "traceAction",
         "getRuntimeState",
+        "getCurrentWorkspaceState",
+        "getOpenBacktestState",
+        "getChartContext",
+        "getSelectedTrade",
+        "getLoadedDecks",
+        "getFavoriteBaselines",
+        "getExecutionState",
+        "getLivestreamHealth",
+        "getCurrentManualPositionState",
         "answerFromPlatformEvidence",
         "resolveLibraryItem",
         "getLibraryItemDetail",
@@ -601,6 +610,46 @@ export function createAiPlatformAccess({
       suggestedVerification = polish
         ? ["Kliknij Force Sync na karcie pozycji.", "Rozwiń Last exchange response po Move SL i sprawdź endpoint, payload, raw response oraz verification.source.", "W BingX app sprawdź aktywne conditional/open orders dla tej pozycji."]
         : ["Click Force Sync on the position card.", "Expand Last exchange response after Move SL and inspect endpoint, payload, raw response, and verification.source.", "Check active conditional/open orders in the BingX app."];
+    } else if (normalized.includes("currently loaded") || normalized.includes("current strategy") || normalized.includes("what strategy") || normalized.includes("jaka strategia") || normalized.includes("zaladowan")) {
+      const runtime = await getRuntimeState({ includeAvailability: false, logLimit: 4 });
+      const frontend = input.workspaceContext ?? {};
+      const strategy = frontend.selectedDecks?.strategyDeck ?? runtime.collections?.strategyDecks?.at(-1) ?? null;
+      const battle = frontend.selectedDecks?.battleDeck ?? runtime.collections?.battleDecks?.at(-1) ?? null;
+      inspected.push("frontend workspaceContext selectedDecks", "backend/src/ai/aiPlatformAccess.js getRuntimeState", "backend state store strategyDecks/battleDecks");
+      evidence.push(
+        `Active panel: ${frontend.activePanel ?? "unknown"}`,
+        `Chart: ${frontend.chart?.symbol ?? "unknown"} ${frontend.chart?.timeframe ?? "unknown"}`,
+        strategy ? `Strategy deck: ${strategy.name ?? strategy.id} ${strategy.symbol ?? ""} ${strategy.timeframe ?? ""}` : "No selected strategy deck in workspace context.",
+        battle ? `Battle deck: ${battle.name ?? battle.id}` : "No active battle deck in workspace context.",
+      );
+      answer = polish
+        ? strategy
+          ? `Aktualnie widzę strategię „${strategy.name ?? strategy.id}” dla ${strategy.symbol ?? frontend.chart?.symbol ?? "symbolu"} ${strategy.timeframe ?? frontend.chart?.timeframe ?? ""}. Biorę to z aktywnego kontekstu workspace, a nie zgaduję z tekstu.`
+          : "W bieżącym kontekście workspace nie widzę konkretnego Strategy Decka. Widzę tylko panel/wykres; otwórz deck albo Battle Deck, wtedy Copilot będzie mógł wskazać dokładną konfigurację."
+        : strategy
+          ? `The currently visible Strategy Deck appears to be “${strategy.name ?? strategy.id}” for ${strategy.symbol ?? frontend.chart?.symbol ?? "symbol"} ${strategy.timeframe ?? frontend.chart?.timeframe ?? ""}. I am reading this from the active workspace context, not guessing.`
+          : "I do not see a concrete selected Strategy Deck in the current workspace context. Open a deck or Battle Deck and ask again for exact configuration.";
+      confidence = strategy ? "high" : "medium";
+      suggestedVerification = ["Check the Run Context header in AI Copilot.", "Open Strategy Decks or Battle Decks if you need exact deck parameters."];
+    } else if (normalized.includes("chart lag") || normalized.includes("chart slow") || normalized.includes("freez") || normalized.includes("wykres") && (normalized.includes("lag") || normalized.includes("woln"))) {
+      const frontend = input.workspaceContext ?? {};
+      inspected.push("frontend workspaceContext chart diagnostics", "hubert-platform/frontend/src/components/TradingViewChart.jsx chart render budgets");
+      evidence.push(
+        `Rendered candles: ${frontend.chart?.renderedCandles ?? "unknown"}`,
+        `Full candles: ${frontend.chart?.fullCandles ?? "unknown"}`,
+        `Provider/source: ${frontend.chart?.provider ?? "unknown"}`,
+        `Analysis mode: ${frontend.chart?.analysisMode ? "yes" : "no"}`,
+      );
+      const rendered = Number(frontend.chart?.renderedCandles ?? 0);
+      answer = polish
+        ? rendered > 3000
+          ? `Najbardziej prawdopodobna przyczyna laga to zbyt duża liczba renderowanych świec: widzę ${rendered}. Chart powinien pracować na lekkim oknie, a pełna historia powinna zostać tylko dla backtestu.`
+          : `Nie widzę oczywistego przekroczenia budżetu świec w kontekście workspace: renderowane świece ${rendered || "unknown"}. Jeśli lag nadal występuje, trzeba sprawdzić liczbę markerów/SL/TP/debug overlays i console performance.`
+        : rendered > 3000
+          ? `The likely chart lag cause is too many rendered candles: I see ${rendered}. The chart should stay on a lightweight window while full history remains for backtests.`
+          : `I do not see an obvious candle-budget breach from workspace context: rendered candles ${rendered || "unknown"}. If it still lags, inspect markers/SL/TP/debug overlays and console performance.`;
+      confidence = rendered ? "medium" : "low";
+      suggestedVerification = ["Open chart diagnostics.", "Turn debug overlays off.", "Jump to a smaller chart window and compare responsiveness."];
     } else if ((normalized.includes("verify integrity") || normalized.includes("integrity")) && (normalized.includes("rerun exact") || normalized.includes("re run exact") || normalized.includes("re-run exact"))) {
       inspected.push(
         "AiAgentPanel.verifyIntegrity in hubert-platform/frontend/src/components/ControlCenter.jsx",

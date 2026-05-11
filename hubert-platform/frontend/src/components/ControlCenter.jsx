@@ -334,6 +334,56 @@ function positionIdentifier(position) {
   );
 }
 
+function positionCardKey(position) {
+  return [
+    compact(position?.apiProfile ?? "main"),
+    compact(position?.symbol ?? "symbol"),
+    compact(position?.positionSide ?? position?.side ?? "side"),
+    positionIdentifier(position) ?? compact(position?.quantity ?? "no-id"),
+  ].join(":");
+}
+
+function manualActionLabel(action) {
+  return {
+    CANCEL_ATTACHED_ORDERS: "Cancel Protection/Orders",
+    CLOSE_POSITION: "Close Position",
+    MOVE_SL: "Move SL",
+    MOVE_TP: "Move TP",
+  }[action] ?? "Send manual action";
+}
+
+function protectionOrder(position, kind) {
+  const orders = position?.attachedOrders ?? [];
+  const wantsTp = kind === "TP";
+
+  return orders.find((order) => {
+    const type = String(order.type ?? order.orderType ?? order.origType ?? "").toUpperCase();
+    const purpose = String(order.protectionType ?? order.protectionKind ?? order.tpslType ?? "").toUpperCase();
+    const hasTpText = type.includes("TAKE") || purpose.includes("TAKE") || purpose.includes("TP");
+    const hasSlText = type.includes("STOP") || purpose.includes("STOP") || purpose.includes("SL");
+
+    if (wantsTp) return hasTpText;
+    return hasSlText && !hasTpText;
+  });
+}
+
+function protectionSourceText(position, kind) {
+  const order = protectionOrder(position, kind);
+  const source = kind === "TP"
+    ? position?.takeProfitSource
+    : position?.stopLossSource;
+  const price = kind === "TP" ? position?.takeProfit : position?.stopLoss;
+  const orderId = order?.orderId ?? order?.orderID ?? order?.id;
+  const orderPrice = order?.stopPrice ?? order?.price ?? order?.triggerPrice;
+
+  if (source || order) {
+    return `${source ?? "open order"}${orderId ? ` · order ${orderId}` : ""}${orderPrice ? ` · ${fmt(orderPrice)}` : ""}`;
+  }
+
+  if (Number(price) > 0) return `position field · ${fmt(price)}`;
+  return "not found";
+}
+
 function humanProfileStatus(profile = {}) {
   const status = String(profile.status ?? "").toLowerCase();
   if (profile.configured === false || status.includes("missing")) return "Missing";
@@ -973,6 +1023,7 @@ export default function ControlCenter({
   const [executionDeckId, setExecutionDeckId] = useState("");
   const [manualActionResult, setManualActionResult] = useState(null);
   const [manualMessage, setManualMessage] = useState("");
+  const [positionActionState, setPositionActionState] = useState({});
   const [manualForm, setManualForm] = useState({
     positionId: "",
     positionSide: "",
@@ -994,6 +1045,73 @@ export default function ControlCenter({
   const selectedStrategy = strategyDecks.find((deck) => deck.id === decision.strategyDeckId);
   const selectedMm = mmDecks.find((deck) => deck.id === decision.mmDeckId);
   const selectedBattleDeck = battleDecks.find((deck) => deck.id === executionDeckId) ?? battleDecks[0];
+  const aiWorkspaceContext = useMemo(() => ({
+    activeBacktest: backtestResult
+      ? {
+          id: backtestResult.id,
+          metrics: backtestResult.metrics,
+          name: backtestResult.name,
+          range: backtestResult.analysisRange ?? backtestResult.range,
+          symbol: backtestResult.symbol,
+          timeframe: backtestResult.timeframe,
+          trades: backtestResult.trades?.length ?? backtestResult.metrics?.totalTrades ?? 0,
+        }
+      : null,
+    activePanel,
+    chart: {
+      analysisMode: Boolean(backtestAnalysisActive),
+      fullCandles: fullHistoryDataset?.length ?? 0,
+      provider: chartDiagnostics?.provider ?? chartDiagnostics?.source ?? "unknown",
+      renderedCandles: rawCandles?.length ?? 0,
+      selectedHistoricalWindow,
+      symbol: settings.symbol ?? selectedBattleDeck?.symbol ?? selectedStrategy?.symbol ?? "SOLUSDT",
+      timeframe: selectedInterval,
+    },
+    execution: {
+      activeBattleDeckId: executionDeckId,
+      botStatus: system?.state?.botStatus,
+      crisisMode: system?.state?.stopNewEntries,
+    },
+    live: {
+      lastSyncAt: livestream?.accountSummary?.lastBingxSyncAt ?? livestream?.accountSummary?.lastRefreshAt,
+      openPositions: livestream?.positions?.length ?? 0,
+      positions: (livestream?.positions ?? []).slice(0, 5).map((position) => ({
+        apiProfile: position.apiProfile,
+        currentPrice: position.currentPrice,
+        positionId: positionIdentifier(position),
+        positionSide: position.positionSide ?? position.side,
+        quantity: position.quantity,
+        stopLoss: position.stopLoss,
+        symbol: position.symbol,
+        takeProfit: position.takeProfit,
+        unrealizedPnl: position.unrealizedPnl,
+      })),
+      source: livestream?.accountSummary?.source ?? livestream?.source,
+    },
+    selectedDecks: {
+      battleDeck: selectedBattleDeck ? { id: selectedBattleDeck.id, name: selectedBattleDeck.name, symbol: selectedBattleDeck.symbol, timeframe: selectedBattleDeck.timeframe } : null,
+      mmDeck: selectedMm ? { id: selectedMm.id, mode: selectedMm.mode, name: selectedMm.name, oneSlPercent: selectedMm.oneSlPercent, positionPercent: selectedMm.positionPercent } : null,
+      strategyDeck: selectedStrategy ? { id: selectedStrategy.id, name: selectedStrategy.name, symbol: selectedStrategy.symbol, timeframe: selectedStrategy.timeframe, sizingMode: selectedStrategy.sizingMode } : null,
+    },
+  }), [
+    activeBacktestSession?.id,
+    activePanel,
+    backtestAnalysisActive,
+    backtestResult,
+    chartDiagnostics,
+    executionDeckId,
+    fullHistoryDataset?.length,
+    livestream,
+    rawCandles?.length,
+    selectedBattleDeck,
+    selectedHistoricalWindow,
+    selectedInterval,
+    selectedMm,
+    selectedStrategy,
+    settings.symbol,
+    system?.state?.botStatus,
+    system?.state?.stopNewEntries,
+  ]);
   const futuresBalance = hasKnownProfileBalance(accountProfiles)
     ? totalProfileBalance(accountProfiles)
     : Number(system?.state?.bingx?.activeExecutionBalance ?? 0);
@@ -1186,6 +1304,7 @@ export default function ControlCenter({
 
   function prepareCrisisAction(position, action, values = {}) {
     const current = manualForm;
+    const cardKey = positionCardKey(position);
     const nextForm = {
       ...current,
       apiProfile: position.apiProfile ?? "main",
@@ -1200,16 +1319,31 @@ export default function ControlCenter({
     setManualForm(nextForm);
 
     if (values.direct && action) {
-      return runAction(`position-card-${action}`, action === "MOVE_SL" ? "Move SL" : action === "MOVE_TP" ? "Move TP" : "Send manual action", async () => {
+      const label = manualActionLabel(action);
+
+      return runAction(`position-card-${cardKey}-${action}`, label, async () => {
         if (values.confirm && !window.confirm(values.confirmMessage ?? "Send this manual action for the displayed BingX position?")) {
           throw new Error("Manual action cancelled.");
         }
-        await apiFetch("/execution/crisis/on", { method: "POST" });
-        setManualActionResult(null);
-        setManualMessage("Request sent to BingX...");
-        let response;
 
         try {
+          setPositionActionState((state) => ({
+            ...state,
+            [cardKey]: {
+              action,
+              diagnostics: null,
+              loading: true,
+              message: "Request sent. Waiting for fresh BingX verification...",
+              ok: null,
+              result: null,
+              updatedAt: new Date().toISOString(),
+            },
+          }));
+          await apiFetch("/execution/crisis/on", { method: "POST" });
+          setManualActionResult(null);
+          setManualMessage("Request sent to BingX...");
+
+          let response;
           response = await apiFetchDetailed("/manual/action", {
             body: {
               ...nextForm,
@@ -1219,28 +1353,55 @@ export default function ControlCenter({
             },
             method: "POST",
           });
+
+          const { ok, payload, status } = response;
+          const actionOk = ok && payload?.ok !== false;
+          const message = payload?.message || (actionOk ? "Exchange accepted request. Fresh sync completed." : "BingX rejected the manual action.");
+
+          setManualActionResult(payload);
+          if (payload?.livestream) {
+            setLivestream(payload.livestream);
+          }
+          setManualMessage(message);
+          setPositionActionState((state) => ({
+            ...state,
+            [cardKey]: {
+              action,
+              diagnostics: payload?.diagnostics ?? null,
+              loading: false,
+              message,
+              ok: actionOk,
+              result: payload,
+              updatedAt: new Date().toISOString(),
+            },
+          }));
+
+          if (!actionOk) {
+            const error = new Error(message);
+            error.status = status;
+            throw error;
+          }
+
+          setPendingManualAction(null);
+          await refreshLiveStatus({ fresh: true });
+          return payload;
         } catch (error) {
-          setManualMessage(humanError(error));
-          setManualActionResult({ ok: false, message: humanError(error) });
+          const message = humanError(error);
+          setManualMessage(message);
+          setManualActionResult((currentResult) => currentResult ?? { ok: false, message });
+          setPositionActionState((state) => ({
+            ...state,
+            [cardKey]: {
+              ...(state[cardKey] ?? {}),
+              action,
+              loading: false,
+              message,
+              ok: false,
+              updatedAt: new Date().toISOString(),
+            },
+          }));
           throw error;
         }
-
-        const { ok, payload, status } = response;
-        setManualActionResult(payload);
-        if (payload.livestream) {
-          setLivestream(payload.livestream);
-        }
-        setManualMessage(payload.message || (ok ? "Exchange accepted request. Fresh sync completed." : "BingX rejected the manual action."));
-
-        if (!ok || payload.ok === false) {
-          const error = new Error(payload.message || "BingX rejected the manual action.");
-          error.status = status;
-          throw error;
-        }
-
-        setPendingManualAction(null);
-        await refreshLiveStatus({ fresh: true });
-        return payload;
       });
     }
 
@@ -1252,6 +1413,52 @@ export default function ControlCenter({
         await refreshAll();
       });
     }
+  }
+
+  async function refreshPositionCard(position) {
+    const cardKey = positionCardKey(position);
+    return runAction(`position-card-${cardKey}-sync`, "Force Sync", async () => {
+      setPositionActionState((state) => ({
+        ...state,
+        [cardKey]: {
+          ...(state[cardKey] ?? {}),
+          action: "FORCE_SYNC",
+          loading: true,
+          message: "Refreshing this account from BingX...",
+          ok: null,
+          updatedAt: new Date().toISOString(),
+        },
+      }));
+
+      try {
+        await refreshLiveStatus({ fresh: true });
+        setPositionActionState((state) => ({
+          ...state,
+          [cardKey]: {
+            ...(state[cardKey] ?? {}),
+            action: "FORCE_SYNC",
+            loading: false,
+            message: "Fresh BingX sync completed.",
+            ok: true,
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+      } catch (error) {
+        const message = humanError(error);
+        setPositionActionState((state) => ({
+          ...state,
+          [cardKey]: {
+            ...(state[cardKey] ?? {}),
+            action: "FORCE_SYNC",
+            loading: false,
+            message,
+            ok: false,
+            updatedAt: new Date().toISOString(),
+          },
+        }));
+        throw error;
+      }
+    });
   }
 
   function openFavorite(favorite) {
@@ -1868,7 +2075,9 @@ export default function ControlCenter({
           livestream={livestream}
           manualMessage={manualMessage}
           manualResult={manualActionResult}
+          positionActionState={positionActionState}
           onRefresh={() => runAction("refresh-live", "Refresh live stream", () => refreshLiveStatus({ fresh: true }))}
+          onPositionRefresh={refreshPositionCard}
           onPositionAction={prepareCrisisAction}
         />
       )}
@@ -2080,6 +2289,7 @@ export default function ControlCenter({
 	          runAction={runAction}
 	          setActivePanel={setActivePanel}
 	          setStrategyForm={setStrategyForm}
+	          workspaceContext={aiWorkspaceContext}
 	        />
 	      )}
 
@@ -2284,7 +2494,16 @@ function SystemPanel({
   );
 }
 
-function LivestreamPanel({ accountProfiles = [], livestream, manualMessage, manualResult, onPositionAction, onRefresh }) {
+function LivestreamPanel({
+  accountProfiles = [],
+  livestream,
+  manualMessage,
+  manualResult,
+  onPositionAction,
+  onPositionRefresh,
+  onRefresh,
+  positionActionState = {},
+}) {
   const [positionControls, setPositionControls] = useState({});
   const summary = livestream?.accountSummary ?? {};
   const positions = livestream?.positions ?? [];
@@ -2330,12 +2549,12 @@ function LivestreamPanel({ accountProfiles = [], livestream, manualMessage, manu
           Data may be stale. Last successful sync: {ageText(lastSyncAt)}.
         </MiniStatus>
       )}
-      {manualMessage && (
+      {manualMessage && positions.length === 0 && (
         <MiniStatus tone={manualResult?.ok === false ? "bad" : manualResult?.ok === true ? "good" : "neutral"}>
           {manualMessage}
         </MiniStatus>
       )}
-      {manualResult && (
+      {manualResult && positions.length === 0 && (
         <details className="hubert-details">
           <summary>Last exchange response</summary>
           <pre>{JSON.stringify({
@@ -2371,8 +2590,12 @@ function LivestreamPanel({ accountProfiles = [], livestream, manualMessage, manu
       ) : (
         <div className="hubert-live-stack">
           {positions.map((position) => {
-            const key = `${position.symbol}-${position.side}-${position.apiProfile}-${position.positionId ?? ""}`;
+            const key = positionCardKey(position);
             const controls = positionControls[key] ?? {};
+            const cardState = positionActionState[key] ?? {};
+            const cardBusy = Boolean(cardState.loading);
+            const attachedOrders = position.attachedOrders ?? [];
+            const hasProtection = attachedOrders.length > 0 || Number(position.stopLoss) > 0 || Number(position.takeProfit) > 0;
             const slValue = controls.stopPrice ?? (position.stopLoss ? String(position.stopLoss) : "");
             const tpValue = controls.takeProfitPrice ?? (position.takeProfit ? String(position.takeProfit) : "");
 
@@ -2401,6 +2624,10 @@ function LivestreamPanel({ accountProfiles = [], livestream, manualMessage, manu
                 <Metric label="Priority" value={position.botPriority === "manual" ? "Manual" : "Bot"} />
                 <Metric label="Last action" value={position.lastAction ?? "--"} />
               </div>
+              <div className="hubert-position-sources">
+                <span><strong>Active SL</strong>{fmt(position.stopLoss)} · {protectionSourceText(position, "SL")}</span>
+                <span><strong>Active TP</strong>{fmt(position.takeProfit)} · {protectionSourceText(position, "TP")}</span>
+              </div>
               <OrderTable orders={position.attachedOrders ?? []} />
               <div className="hubert-position-controls">
                 <label>
@@ -2415,10 +2642,10 @@ function LivestreamPanel({ accountProfiles = [], livestream, manualMessage, manu
                 </label>
                 <button
                   type="button"
-                  disabled={!Number.isFinite(Number(slValue)) || Number(slValue) <= 0}
+                  disabled={cardBusy || !Number.isFinite(Number(slValue)) || Number(slValue) <= 0}
                   onClick={() => onPositionAction(position, "MOVE_SL", { direct: true, stopPrice: slValue })}
                 >
-                  Move SL
+                  {cardBusy && cardState.action === "MOVE_SL" ? "Moving..." : "Move SL"}
                 </button>
                 <label>
                   <span>TP</span>
@@ -2432,37 +2659,62 @@ function LivestreamPanel({ accountProfiles = [], livestream, manualMessage, manu
                 </label>
                 <button
                   type="button"
-                  disabled={!Number.isFinite(Number(tpValue)) || Number(tpValue) <= 0}
+                  disabled={cardBusy || !Number.isFinite(Number(tpValue)) || Number(tpValue) <= 0}
                   onClick={() => onPositionAction(position, "MOVE_TP", { direct: true, takeProfitPrice: tpValue })}
                 >
-                  Move TP
+                  {cardBusy && cardState.action === "MOVE_TP" ? "Moving..." : "Move TP"}
                 </button>
                 <button
                   type="button"
+                  disabled={cardBusy}
                   onClick={() => onPositionAction(position, "CLOSE_POSITION", {
                     confirm: true,
-                    confirmMessage: `Close ${position.symbol} ${position.side} position ${position.positionId ?? ""}?`,
+                    confirmMessage: `Close ${position.symbol} ${position.side} position ${positionIdentifier(position) ?? ""}?`,
                     direct: true,
                   })}
                 >
-                  Close Position
+                  {cardBusy && cardState.action === "CLOSE_POSITION" ? "Closing..." : "Close Position"}
                 </button>
-                <button type="button" onClick={onRefresh}>Force Sync</button>
-              </div>
-              <div className="hubert-lab__actions">
                 <button
                   type="button"
-                  disabled={(position.attachedOrders ?? []).length === 0}
+                  disabled={cardBusy || !hasProtection}
+                  title={!hasProtection ? "No attached protection/orders reported for this position." : "Cancel protection/orders attached to this exact position."}
                   onClick={() => onPositionAction(position, "CANCEL_ATTACHED_ORDERS", {
                     confirm: true,
                     confirmMessage: `Cancel attached protective/orders for ${position.symbol} ${position.side}?`,
                     direct: true,
                   })}
                 >
-                  Cancel Protection/Orders
+                  {cardBusy && cardState.action === "CANCEL_ATTACHED_ORDERS" ? "Cancelling..." : "Cancel Protection/Orders"}
                 </button>
-                <button type="button" onClick={() => onPositionAction(position, null)}>Crisis Control</button>
+                <button
+                  type="button"
+                  disabled={cardBusy}
+                  onClick={() => onPositionRefresh?.(position) ?? onRefresh?.()}
+                >
+                  {cardBusy && cardState.action === "FORCE_SYNC" ? "Syncing..." : "Force Sync"}
+                </button>
               </div>
+              <div className="hubert-lab__actions">
+                <button type="button" onClick={() => onPositionAction(position, null)}>Open Advanced Manual Action</button>
+              </div>
+              {cardState.message && (
+                <MiniStatus tone={cardState.ok === false ? "bad" : cardState.ok === true ? "good" : "neutral"}>
+                  {cardState.message} {cardState.updatedAt ? `· ${compactDateText(cardState.updatedAt)}` : ""}
+                </MiniStatus>
+              )}
+              {cardState.result && (
+                <details className="hubert-details">
+                  <summary>Position action diagnostics</summary>
+                  <pre>{JSON.stringify({
+                    action: cardState.action,
+                    diagnostics: cardState.result?.diagnostics ?? cardState.diagnostics ?? null,
+                    message: cardState.result?.message ?? cardState.message,
+                    ok: cardState.result?.ok ?? cardState.ok,
+                    result: cardState.result?.result ?? null,
+                  }, null, 2)}</pre>
+                </details>
+              )}
             </div>
             );
           })}
@@ -3303,47 +3555,50 @@ function CrisisPanel({
       <MiniStatus tone={dataFreshnessTone(summary.lastBingxSyncAt)}>
         Source: {summary.source ?? "syncing"}. Last BingX sync: {ageText(summary.lastBingxSyncAt)}. Data age: {summary.dataAgeSeconds ?? "--"}s.
       </MiniStatus>
-      <div className="hubert-lab__grid">
-        <TextField label="Symbol" value={form.symbol || symbol || "SOLUSDT"} onChange={(value) => setForm({ ...form, symbol: value.toUpperCase() })} />
-        <NumberField label="Quantity" value={form.quantity} step="0.001" onChange={(value) => setForm({ ...form, quantity: value })} />
-        <NumberField label="New SL price" value={form.stopPrice} step="0.01" onChange={(value) => setForm({ ...form, stopPrice: value })} />
-        <NumberField label="New TP price" value={form.takeProfitPrice} step="0.01" onChange={(value) => setForm({ ...form, takeProfitPrice: value })} />
-      </div>
-      <div className="hubert-manual-grid">
-        {actions.map(([action, label, help]) => (
-          <button
-            data-active={pendingAction === action}
-            disabled={!activePosition && positionOnlyActions.has(action)}
-            key={action}
-            title={help}
-            type="button"
-            onClick={() => chooseAction(action)}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-      {pendingAction && (
-        <div className="hubert-confirm-strip">
-          <span>
-            {actions.find(([action]) => action === pendingAction)?.[2]}
-            {activePosition ? ` Context: ${activePosition.symbol} ${activePosition.side}, SL ${fmt(activePosition.stopLoss)}, TP ${fmt(activePosition.takeProfit)}.` : " No open position context is attached."}
-          </span>
-          <button type="button" onClick={confirmAction}>Confirm Send</button>
-          <button type="button" onClick={() => setPendingAction(null)}>Cancel</button>
+      <details className="hubert-advanced">
+        <summary>Advanced manual action</summary>
+        <div className="hubert-lab__grid">
+          <TextField label="Symbol" value={form.symbol || symbol || "SOLUSDT"} onChange={(value) => setForm({ ...form, symbol: value.toUpperCase() })} />
+          <NumberField label="Quantity" value={form.quantity} step="0.001" onChange={(value) => setForm({ ...form, quantity: value })} />
+          <NumberField label="New SL price" value={form.stopPrice} step="0.01" onChange={(value) => setForm({ ...form, stopPrice: value })} />
+          <NumberField label="New TP price" value={form.takeProfitPrice} step="0.01" onChange={(value) => setForm({ ...form, takeProfitPrice: value })} />
         </div>
-      )}
-      {message && <MiniStatus>{message}</MiniStatus>}
-      {result && (
-        <details className="hubert-details">
-          <summary>Exchange response and payload</summary>
-          <pre>{JSON.stringify({
-            diagnostics: result.diagnostics ?? null,
-            rawExchangeResponse: result.rawExchangeResponse ?? null,
-            result: result.result ?? null,
-          }, null, 2)}</pre>
-        </details>
-      )}
+        <div className="hubert-manual-grid">
+          {actions.map(([action, label, help]) => (
+            <button
+              data-active={pendingAction === action}
+              disabled={!activePosition && positionOnlyActions.has(action)}
+              key={action}
+              title={help}
+              type="button"
+              onClick={() => chooseAction(action)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {pendingAction && (
+          <div className="hubert-confirm-strip">
+            <span>
+              {actions.find(([action]) => action === pendingAction)?.[2]}
+              {activePosition ? ` Context: ${activePosition.symbol} ${activePosition.side}, SL ${fmt(activePosition.stopLoss)}, TP ${fmt(activePosition.takeProfit)}.` : " No open position context is attached."}
+            </span>
+            <button type="button" onClick={confirmAction}>Confirm Send</button>
+            <button type="button" onClick={() => setPendingAction(null)}>Cancel</button>
+          </div>
+        )}
+        {message && <MiniStatus>{message}</MiniStatus>}
+        {result && (
+          <details className="hubert-details">
+            <summary>Exchange response and payload</summary>
+            <pre>{JSON.stringify({
+              diagnostics: result.diagnostics ?? null,
+              rawExchangeResponse: result.rawExchangeResponse ?? null,
+              result: result.result ?? null,
+            }, null, 2)}</pre>
+          </details>
+        )}
+      </details>
     </section>
   );
 }
@@ -3410,7 +3665,7 @@ function CommunicationPanel({ communication, onSave, onTest, setCommunication })
   );
 }
 
-function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest, runAction, setActivePanel, setStrategyForm }) {
+function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest, runAction, setActivePanel, setStrategyForm, workspaceContext }) {
   const [prompt, setPrompt] = useState("Run a 50 combination sweep for SOLUSDT 15m over the last 31 days and rank robust settings.");
   const [chatMessages, setChatMessages] = useState([]);
   const [followUpText, setFollowUpText] = useState("");
@@ -3428,6 +3683,8 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
   const [manualResult, setManualResult] = useState(null);
   const [baselineCompareName, setBaselineCompareName] = useState("hubert");
   const [baselineCompareResult, setBaselineCompareResult] = useState(null);
+  const [copilotMemory, setCopilotMemory] = useState(null);
+  const [copilotView, setCopilotView] = useState("chat");
   const [queueStatus, setQueueStatus] = useState(null);
   const [activeResultIndex, setActiveResultIndex] = useState(0);
   const [collapseAllChat, setCollapseAllChat] = useState(false);
@@ -3437,6 +3694,29 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
   const running = ["queued", "running"].includes(activeRun?.status);
   const activeRows = activeRun?.resultSummary?.topRows ?? [];
   const activeResult = activeRows[Math.min(activeResultIndex, Math.max(activeRows.length - 1, 0))] ?? activeRows[0] ?? null;
+  const activeWorkspaceContext = useMemo(() => ({
+    ...(workspaceContext ?? {}),
+    activeResult: activeResult
+      ? {
+          id: activeResult.id,
+          metrics: activeResult.metrics,
+          params: activeResult.params,
+          rank: activeResult.rank,
+          score: activeResult.score,
+          symbol: activeResult.symbol,
+          timeframe: activeResult.timeframe,
+        }
+      : null,
+    activeRun: activeRun
+      ? {
+          id: activeRun.id,
+          intent: activeRun.parsedIntent,
+          plan: activeRun.plan,
+          status: activeRun.status,
+        }
+      : null,
+    copilotMode,
+  }), [activeResult, activeRun?.id, activeRun?.parsedIntent, activeRun?.plan, activeRun?.status, copilotMode, workspaceContext]);
   const visibleChatMessages = useMemo(() => {
     const persisted = activeRun?.messages ?? [];
     const local = chatMessages.filter((message) => !activeRun?.id || !message.runId || message.runId === activeRun.id);
@@ -3471,6 +3751,12 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
     return payload;
   }
 
+  async function loadCopilotMemory() {
+    const payload = await apiRequest("/ai/copilot/memory");
+    setCopilotMemory(payload.memory ?? null);
+    return payload;
+  }
+
   async function startRun() {
     return runAction("ai-agent-run", "Start agent", async () => {
       if (!prompt.trim()) throw new Error("Tell the agent what to analyze first.");
@@ -3490,6 +3776,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
           body: {
             message: prompt.trim(),
             mode: copilotMode,
+            workspaceContext: activeWorkspaceContext,
             ...(activeRun?.id ? { runId: activeRun.id } : {}),
           },
           method: "POST",
@@ -3524,12 +3811,15 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
             includeLiveData: options.includeLiveData,
             maxCombinations: options.maxCombinations,
             objective: options.objective,
+            workspaceContext: activeWorkspaceContext,
           },
           prompt,
+          workspaceContext: activeWorkspaceContext,
         },
         method: "POST",
       });
       await loadRuns();
+      await loadCopilotMemory();
       if (payload.run?.id) setActiveRunId(payload.run.id);
       setChatMessages((current) => [
         ...current,
@@ -3671,6 +3961,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
             mode: copilotMode,
             rowId: contextRow?.id,
             rowIndex: contextRow?.rank ? Number(contextRow.rank) - 1 : undefined,
+            workspaceContext: activeWorkspaceContext,
             ...(activeRun?.id ? { runId: activeRun.id } : {}),
           },
           method: "POST",
@@ -3699,6 +3990,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
         setFollowUpText("");
         if (activeRun?.id) {
           await loadRuns();
+          await loadCopilotMemory();
           setChatMessages((current) => current.filter((item) => item.runId !== runId || item.localOnly));
         }
         setFollowUpState({ message: "Follow-up answered.", state: "completed" });
@@ -3846,7 +4138,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
   async function callManualTool(toolName, input = {}) {
     return runAction(`ai-manual-${toolName}`, toolName, async () => {
       const payload = await apiRequest("/ai/tool", {
-        body: { input, toolName },
+        body: { input: { workspaceContext: activeWorkspaceContext, ...input }, toolName },
         method: "POST",
       });
       setManualResult(payload);
@@ -3856,6 +4148,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
 
   useEffect(() => {
     loadRuns().catch(() => {});
+    loadCopilotMemory().catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -4019,7 +4312,25 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
           ? "Research mode starts queued analysis jobs."
           : "Evidence mode answers from source files, routes, runtime state, and saved platform data. It is read-only."}
       </MiniStatus>
+      <div className="hubert-ai-context-header">
+        <span><b>Chart</b>{activeWorkspaceContext.chart?.symbol ?? "SOLUSDT"} · {activeWorkspaceContext.chart?.timeframe ?? "--"} · {activeWorkspaceContext.chart?.renderedCandles ?? 0} candles</span>
+        <span><b>Panel</b>{activeWorkspaceContext.activePanel ?? "AI"}</span>
+        <span><b>Live</b>{activeWorkspaceContext.live?.openPositions ?? 0} positions · {activeWorkspaceContext.live?.source ?? "syncing"}</span>
+        <span><b>Baseline</b>{copilotMemory?.favoriteBaselines?.[0]?.name ?? "none remembered"}</span>
+      </div>
+      <div className="hubert-lab__actions hubert-ai-tabs">
+        {[
+          ["chat", "Chat"],
+          ["research", "Research"],
+          ["diagnostics", "Diagnostics"],
+          ["memory", "Memory"],
+          ["history", "History"],
+        ].map(([view, label]) => (
+          <button data-active={copilotView === view} key={view} type="button" onClick={() => setCopilotView(view)}>{label}</button>
+        ))}
+      </div>
 
+      {copilotView === "chat" && (
       <div className="hubert-copilot-grid">
         <div>
           <div className="hubert-lab__actions hubert-chat-toolbar">
@@ -4063,6 +4374,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
                 {copilotMode === "research" ? "Ask About Current Result" : "Ask with Evidence"}
               </button>
               <button type="button" disabled={(copilotMode === "research" && !activeRun?.id) || ["thinking", "responding"].includes(followUpState.state)} onClick={() => askFollowUp(copilotMode === "research" ? "Give me a deep analysis of the current result: strengths, weaknesses, overfit risk, confidence, and exact next tests." : "Answer from platform evidence: inspect files, routes, runtime state, unknowns, and verification steps.", activeResult)}>Deep Analysis</button>
+              <button type="button" disabled={(copilotMode === "research" && !activeRun?.id) || ["thinking", "responding"].includes(followUpState.state)} onClick={() => askFollowUp("Explain how you reached this conclusion. Show the evidence chain, rejected alternatives, uncertainty, and what would invalidate it.", activeResult)}>Explain Reasoning</button>
               <button type="button" onClick={startNewChat}>Start New Chat</button>
             </div>
           </div>
@@ -4098,7 +4410,9 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
           <ReadOnly label="Fill" value={activeRun?.plan?.fillMode ?? "legacy"} />
         </aside>
       </div>
+      )}
 
+      {(copilotView === "chat" || copilotView === "research") && (
       <details className="hubert-advanced">
         <summary>Examples and advanced limits</summary>
         <div className="hubert-ai-examples">
@@ -4121,8 +4435,9 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
         />
         <MiniStatus>Runs above 1000 combinations require the long-running option. The agent stores compact summaries, not full trade lists for every row.</MiniStatus>
       </details>
+      )}
 
-      {activeRun && (
+      {activeRun && (copilotView === "chat" || copilotView === "research") && (
         <article className="hubert-live-card">
           <div className="hubert-lab__subhead">
             <strong>{activeRun.status.toUpperCase()}</strong>
@@ -4251,7 +4566,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
         </article>
       )}
 
-      {showRunHistory && (
+      {(showRunHistory || copilotView === "history") && (
         <>
           <div className="hubert-lab__subhead"><strong>Run history</strong><span>{runs.length}</span></div>
           <div className="hubert-list-compact">
@@ -4269,9 +4584,37 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
         </>
       )}
 
-      <details className="hubert-advanced">
+      {copilotView === "memory" && (
+        <article className="hubert-live-card">
+          <div className="hubert-lab__subhead"><strong>Copilot Memory</strong><span>{copilotMemory?.updatedAt ? dateText(copilotMemory.updatedAt) : "fresh"}</span></div>
+          <MiniStatus>
+            The copilot uses this to remember baselines, preferences, previous conclusions, and recent workspace context. It stays read-only for trading.
+          </MiniStatus>
+          <div className="hubert-lab__metrics">
+            <Metric label="Language" value={copilotMemory?.preferences?.language ?? "auto"} />
+            <Metric label="Preferred metrics" value={copilotMemory?.preferences?.metrics?.join(", ") || "not learned yet"} />
+            <Metric label="Baselines" value={copilotMemory?.favoriteBaselines?.length ?? 0} />
+            <Metric label="Conclusions" value={copilotMemory?.previousConclusions?.length ?? 0} />
+          </div>
+          <div className="hubert-lab__actions">
+            <button type="button" onClick={() => runAction("ai-load-copilot-memory", "Load copilot memory", loadCopilotMemory)}>Refresh memory</button>
+            <button type="button" onClick={() => runAction("ai-clear-copilot-memory", "Clear copilot memory", async () => {
+              const payload = await apiRequest("/ai/copilot/memory", { method: "DELETE" });
+              setCopilotMemory(payload.memory ?? null);
+            })}>Clear memory</button>
+          </div>
+          <details className="hubert-advanced" open>
+            <summary>Memory details</summary>
+            <pre className="hubert-ai-json">{JSON.stringify(copilotMemory ?? {}, null, 2).slice(0, 12000)}</pre>
+          </details>
+        </article>
+      )}
+
+      {copilotView === "diagnostics" && (
+      <details className="hubert-advanced" open>
         <summary>Manual backend tools</summary>
         <div className="hubert-ai-actions">
+          <button type="button" onClick={() => callManualTool("getCurrentWorkspaceState", {}, "Current workspace state")}>Current workspace state</button>
           <button type="button" onClick={() => callManualTool("explainCurrentSetup")}>Explain current setup</button>
           <button type="button" onClick={() => callManualTool("getPlatformStatus")}>Platform status</button>
           <button type="button" onClick={() => callManualTool("summarizeBacktest")}>Latest backtest</button>
@@ -4279,6 +4622,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
         </div>
         {manualResult && <pre className="hubert-ai-json">{JSON.stringify(manualResult, null, 2).slice(0, 12000)}</pre>}
       </details>
+      )}
     </section>
   );
 }

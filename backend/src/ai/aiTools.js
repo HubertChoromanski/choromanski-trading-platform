@@ -1,5 +1,6 @@
 import { runBacktest } from "../../../hubert-platform/frontend/src/backtest/backtestEngine.js";
 import { fetchCandles } from "../strategy/strategyRunner.js";
+import { sanitizeForAi } from "./aiContextBuilder.js";
 import { createAiLibraryTools } from "./aiLibraryTools.js";
 import { createAiPlatformAccess } from "./aiPlatformAccess.js";
 import { backtestConclusion, buildBacktestSummaryReport, buildSweepReport } from "./aiReportBuilder.js";
@@ -129,6 +130,7 @@ export function createAiTools({
   buildAiContext,
   buildLivestreamPayload,
   calculateAnalytics,
+  copilotMemory,
   dataAvailability,
   memory,
   publicApiProfiles,
@@ -288,6 +290,64 @@ export function createAiTools({
     };
   }
 
+  async function workspaceState(input = {}) {
+    const runtime = await platformTools.getRuntimeState({
+      fresh: input.fresh === true,
+      includeAvailability: input.includeAvailability,
+      logLimit: input.logLimit ?? 12,
+    });
+    const latestBacktest = (store.getCollection("backtests") ?? []).at(-1) ?? null;
+    const executionConfig = store.getExecutionConfig();
+    const battleDecks = store.getCollection("battleDecks") ?? [];
+    const activeBattleDeck =
+      battleDecks.find((deck) => deck.id === executionConfig.activeBattleDeckId) ??
+      battleDecks.find((deck) => deck.status === "active") ??
+      battleDecks.at(-1) ??
+      null;
+    const frontend = input.frontendContext ?? input.workspaceContext ?? {};
+
+    return sanitizeForAi({
+      activeBacktest: frontend.activeBacktest ?? (latestBacktest
+        ? {
+            id: latestBacktest.id,
+            metrics: latestBacktest.metrics,
+            name: latestBacktest.name,
+            range: latestBacktest.analysisRange ?? latestBacktest.range,
+            symbol: latestBacktest.symbol,
+            timeframe: latestBacktest.timeframe,
+            trades: latestBacktest.trades?.length ?? latestBacktest.metrics?.totalTrades ?? 0,
+          }
+        : null),
+      activeResult: frontend.activeResult ?? null,
+      chart: frontend.chart ?? runtime.chart ?? null,
+      decks: {
+        activeBattleDeck: activeBattleDeck
+          ? {
+              apiProfile: activeBattleDeck.apiProfile,
+              id: activeBattleDeck.id,
+              mmDeckId: activeBattleDeck.mmDeckId,
+              name: activeBattleDeck.name,
+              status: activeBattleDeck.status,
+              strategyDeckId: activeBattleDeck.strategyDeckId,
+              symbol: activeBattleDeck.symbol,
+              timeframe: activeBattleDeck.timeframe,
+            }
+          : null,
+        loaded: runtime.collections,
+      },
+      execution: {
+        botStatus: runtime.status?.state?.botStatus,
+        crisisMode: runtime.status?.state?.stopNewEntries,
+        executionConfig,
+      },
+      frontend,
+      live: runtime.live,
+      memory: copilotMemory?.summary?.() ?? null,
+      recentErrors: runtime.logs,
+      runtime,
+    });
+  }
+
   return {
     async analyzePeriods(input = {}) {
       const periods = input.periods?.length
@@ -426,6 +486,83 @@ export function createAiTools({
         status: publicStatusPayload(),
       };
     },
+
+    getChartContext: async (input = {}) => {
+      const workspace = await workspaceState(input);
+      return {
+        chart: workspace.chart ?? workspace.frontend?.chart ?? null,
+        ok: true,
+      };
+    },
+
+    getCurrentManualPositionState: async (input = {}) => {
+      const workspace = await workspaceState({ ...input, fresh: true, includeAvailability: false });
+      return {
+        ok: true,
+        positions: workspace.live?.positions ?? [],
+        summary: workspace.live?.accountSummary ?? null,
+      };
+    },
+
+    getCurrentWorkspaceState: async (input = {}) => ({
+      ok: true,
+      workspace: await workspaceState(input),
+    }),
+
+    getExecutionState: async (input = {}) => {
+      const workspace = await workspaceState(input);
+      return {
+        execution: workspace.execution,
+        live: workspace.live,
+        ok: true,
+      };
+    },
+
+    getFavoriteBaselines: async () => ({
+      baselines: copilotMemory?.summary?.()?.baselines ?? [],
+      ok: true,
+    }),
+
+    getLivestreamHealth: async (input = {}) => {
+      const workspace = await workspaceState({ ...input, fresh: input.fresh === true, includeAvailability: false });
+      return {
+        ageSeconds: workspace.live?.accountSummary?.dataAgeSeconds ?? null,
+        lastSyncAt: workspace.live?.accountSummary?.lastBingxSyncAt ?? null,
+        ok: true,
+        positions: workspace.live?.positions?.length ?? 0,
+        source: workspace.live?.accountSummary?.source ?? workspace.live?.source ?? "unknown",
+        stale: Number(workspace.live?.accountSummary?.dataAgeSeconds ?? 9999) > 120,
+      };
+    },
+
+    getLoadedDecks: async () => ({
+      battleDecks: (store.getCollection("battleDecks") ?? []).map((deck) => sanitizeForAi({
+        apiProfile: deck.apiProfile,
+        id: deck.id,
+        mmDeckId: deck.mmDeckId,
+        name: deck.name,
+        status: deck.status,
+        strategyDeckId: deck.strategyDeckId,
+        symbol: deck.symbol,
+        timeframe: deck.timeframe,
+      })),
+      mmDecks: (store.getCollection("mmDecks") ?? []).map((deck) => sanitizeForAi(deck)),
+      ok: true,
+      strategyDecks: (store.getCollection("strategyDecks") ?? []).map((deck) => sanitizeForAi(deck)),
+    }),
+
+    getOpenBacktestState: async (input = {}) => {
+      const workspace = await workspaceState(input);
+      return {
+        backtest: workspace.activeBacktest,
+        ok: true,
+      };
+    },
+
+    getSelectedTrade: async (input = {}) => ({
+      ok: true,
+      selectedTrade: input.frontendContext?.selectedTrade ?? input.workspaceContext?.selectedTrade ?? null,
+    }),
 
     getBacktestDetail: libraryTools.getBacktestDetail,
     getLibraryItemDetail: libraryTools.getLibraryItemDetail,
