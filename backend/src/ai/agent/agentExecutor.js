@@ -133,6 +133,12 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
         result.failedCombinationsCount
           ? `${result.failedCombinationsCount} combinations failed or timed out and were skipped.`
           : "",
+        result.constraintSummary?.active && result.constraintSummary.passed === 0
+          ? "No tested configuration passed all user constraints; ranked rows are closest candidates only."
+          : "",
+        result.constraintSummary?.active && result.constraintSummary.passed > 0
+          ? `${result.constraintSummary.passed}/${result.constraintSummary.total} configurations passed the user constraints.`
+          : "",
       ].filter(Boolean),
     };
 

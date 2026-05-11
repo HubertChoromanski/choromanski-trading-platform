@@ -24,7 +24,7 @@ function parseMaxCombinations(text, fallback) {
   const direct =
     String(text).match(/\b(\d{1,5})\s*(?:sweep\s*)?(?:combination|combinations|combos|tests|runs)\b/i) ??
     String(text).match(/\b(\d{1,5})\s*(?:kombinacji|kombinacje|testow|testów|uruchomien|uruchomień)\b/i) ??
-    String(text).match(/\b(?:sweep|test|run|przetestuj|uruchom)\s*(\d{1,5})\s*(?:combination|combinations|combos|tests|runs|kombinacji|testow|testów)?\b/i);
+    String(text).match(/\b(?:sweep|test|run|przetestuj|uruchom|odpal|zrob|zrób)\s*(\d{1,5})\s*(?:combination|combinations|combos|tests|runs|kombinacji|testow|testów)?\b/i);
   if (direct) {
     return {
       explicit: true,
@@ -61,6 +61,7 @@ function parseExplicitDateRange(text) {
   const datePattern = String.raw`(\d{4}[.-]\d{1,2}[.-]\d{1,2})`;
   const range =
     source.match(new RegExp(`from\\s+${datePattern}\\s+(?:to|until|through|-)\\s+${datePattern}`, "i")) ??
+    source.match(new RegExp(`od\\s+${datePattern}\\s+(?:do|-)\\s+${datePattern}`, "i")) ??
     source.match(new RegExp(`${datePattern}\\s*(?:→|->|to|until|through|-)\\s*${datePattern}`, "i"));
 
   if (range) {
@@ -212,7 +213,9 @@ export function createAgentPlan({ options = {}, prompt = "" }) {
   const sizingModeExplicit = Boolean(options.sizingMode || /fixed risk|risk per|fixed risk per trade|ryzyko na/i.test(prompt));
   const sizingMode = options.sizingMode ?? (sizingModeExplicit ? "fixed-risk" : "position-percent");
   const fallbackCombinations = Number(options.maxCombinations) || (kind === "research" ? 100 : 1000);
-  const combinationRequest = parseMaxCombinations(prompt, fallbackCombinations);
+  const combinationRequest = options.maxCombinationsFromIntent
+    ? { explicit: Boolean(options.maxCombinationsExplicit), requested: fallbackCombinations }
+    : parseMaxCombinations(prompt, fallbackCombinations);
   const requestedCombinations = Math.max(1, combinationRequest.requested);
   const maxCombinations = Math.max(1, Math.min(requestedCombinations, 5000));
   const startingBalance = parseStartingBalance(prompt, options.startingBalance ?? 10000);
@@ -221,6 +224,7 @@ export function createAgentPlan({ options = {}, prompt = "" }) {
     artifacts: requestedArtifacts(prompt),
     baselineQuery: parseBaselineQuery(prompt, options),
     fillMode,
+    focusConfigRank: options.focusConfigRank ?? null,
     kind,
     language: inferLanguage(prompt, options),
     maxCombinations,
@@ -237,8 +241,11 @@ export function createAgentPlan({ options = {}, prompt = "" }) {
       maxSameSideFailuresValues: options.maxSameSideFailuresValues,
       sizingValues: options.sizingValues,
     },
+    constraints: options.constraints ?? {},
+    methodology: options.methodology ?? "grid search",
     provider: options.provider ?? "binance-futures",
     range: parseRange(prompt, options),
+    researchIntent: options.researchIntent ?? null,
     reportStyle: /presentation|slides/i.test(prompt) ? "presentation" : "operator",
     sizingMode,
     sizingModeExplicit,

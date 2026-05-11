@@ -2259,11 +2259,12 @@ export default function ControlCenter({
                 throw error;
               }
 
-              setPendingManualAction(null);
-              await refreshLiveStatus({ fresh: true });
-            })
-          }
-        />
+	              setPendingManualAction(null);
+	              await refreshLiveStatus({ fresh: true });
+	              return payload;
+	            })
+	          }
+	        />
       )}
 
       {panel === "Analytics" && <AnalyticsPanel analytics={analytics} />}
@@ -3484,6 +3485,8 @@ function CrisisPanel({
   setPendingAction,
   symbol,
 }) {
+  const [positionControls, setPositionControls] = useState({});
+  const [positionCardActions, setPositionCardActions] = useState({});
   const positions = livestream?.positions ?? [];
   const summary = livestream?.accountSummary ?? {};
   const activePosition = positions.find((position) => compact(position.symbol) === compact(form.symbol || symbol)) ?? positions[0];
@@ -3497,6 +3500,16 @@ function CrisisPanel({
     ["CANCEL_ALL", "Cancel All Orders", "Cancels open orders for this symbol."],
   ];
   const positionOnlyActions = new Set(["MOVE_SL", "MOVE_TP", "CLOSE_POSITION", "CLOSE_PARTIAL", "CANCEL_ALL"]);
+
+  function updatePositionControl(key, field, value) {
+    setPositionControls((current) => ({
+      ...current,
+      [key]: {
+        ...(current[key] ?? {}),
+        [field]: value,
+      },
+    }));
+  }
 
   function chooseAction(action) {
     setMessage("");
@@ -3523,26 +3536,197 @@ function CrisisPanel({
     });
   }
 
+  function cardPayload(position, action, values = {}) {
+    return {
+      action,
+      apiProfile: position.apiProfile ?? form.apiProfile ?? "main",
+      positionId: positionIdentifier(position) || undefined,
+      positionSide: position.positionSide || position.side || undefined,
+      quantity: Number(values.quantity ?? position.quantity),
+      stopPrice: Number(values.stopPrice ?? position.stopLoss),
+      symbol: position.symbol || form.symbol || symbol || "SOLUSDT",
+      takeProfitPrice: Number(values.takeProfitPrice ?? position.takeProfit),
+    };
+  }
+
+  async function runPositionCardAction(position, action, values = {}, options = {}) {
+    const key = positionCardKey(position);
+    if (options.confirm && !window.confirm(options.confirmMessage ?? "Send this action for this exact position?")) return;
+
+    setPositionCardActions((current) => ({
+      ...current,
+      [key]: {
+        action,
+        loading: true,
+        message: `${manualActionLabel(action)} sent for this card...`,
+        ok: null,
+        result: null,
+        updatedAt: new Date().toISOString(),
+      },
+    }));
+
+    const payload = await onManualAction(cardPayload(position, action, values));
+    const ok = Boolean(payload && payload.ok !== false);
+    setPositionCardActions((current) => ({
+      ...current,
+      [key]: {
+        action,
+        loading: false,
+        message: payload?.message ?? (ok ? `${manualActionLabel(action)} completed.` : `${manualActionLabel(action)} failed. Check exchange response.`),
+        ok,
+        result: payload ?? null,
+        updatedAt: new Date().toISOString(),
+      },
+    }));
+  }
+
+  async function runPositionForceSync(position) {
+    const key = positionCardKey(position);
+    setPositionCardActions((current) => ({
+      ...current,
+      [key]: {
+        action: "FORCE_SYNC",
+        loading: true,
+        message: "Refreshing this position from BingX...",
+        ok: null,
+        result: null,
+        updatedAt: new Date().toISOString(),
+      },
+    }));
+    const payload = await onForceSync();
+    const ok = payload !== null;
+    setPositionCardActions((current) => ({
+      ...current,
+      [key]: {
+        action: "FORCE_SYNC",
+        loading: false,
+        message: ok ? "Fresh BingX sync completed." : "Fresh sync failed. Check the top action message.",
+        ok,
+        result: null,
+        updatedAt: new Date().toISOString(),
+      },
+    }));
+  }
+
+  function renderPositionCard(position) {
+    const key = positionCardKey(position);
+    const controls = positionControls[key] ?? {};
+    const cardAction = positionCardActions[key] ?? {};
+    const cardBusy = Boolean(cardAction.loading);
+    const attachedOrders = position.attachedOrders ?? [];
+    const hasProtection = attachedOrders.length > 0 || Number(position.stopLoss) > 0 || Number(position.takeProfit) > 0;
+    const slValue = controls.stopPrice ?? (position.stopLoss ? String(position.stopLoss) : "");
+    const tpValue = controls.takeProfitPrice ?? (position.takeProfit ? String(position.takeProfit) : "");
+
+    return (
+      <div className="hubert-live-card" key={key}>
+        <div className="hubert-live-card__head">
+          <strong>{position.symbol} {position.side}</strong>
+          <span>{position.battleDeckName ?? "Exchange position"} · {position.apiProfile}</span>
+        </div>
+        <MiniStatus tone="good">Position card controls v2</MiniStatus>
+        <div className="hubert-lab__metrics">
+          <Metric label="Entry" value={fmt(position.entryPrice)} />
+          <Metric label="Mark" value={fmt(position.currentPrice)} />
+          <Metric label="Quantity" value={fmt(position.quantity, 3)} />
+          <Metric label="Position ID" value={positionIdentifier(position) ?? "BingX did not provide one"} />
+          <Metric label="Position side" value={position.positionSide ?? position.side ?? "--"} />
+          <Metric label="PnL" value={fmt(position.unrealizedPnl)} />
+          <Metric label="SL" value={fmt(position.stopLoss)} />
+          <Metric label="TP" value={fmt(position.takeProfit)} />
+        </div>
+        <div className="hubert-position-sources">
+          <span><strong>Active SL</strong>{fmt(position.stopLoss)} · {protectionSourceText(position, "SL")}</span>
+          <span><strong>Active TP</strong>{fmt(position.takeProfit)} · {protectionSourceText(position, "TP")}</span>
+        </div>
+        <OrderTable orders={attachedOrders} />
+        <div className="hubert-position-controls">
+          <label>
+            <span>SL</span>
+            <input
+              inputMode="decimal"
+              placeholder="Stop price"
+              type="number"
+              value={slValue}
+              onChange={(event) => updatePositionControl(key, "stopPrice", event.target.value)}
+            />
+          </label>
+          <button
+            disabled={cardBusy || !Number.isFinite(Number(slValue)) || Number(slValue) <= 0}
+            type="button"
+            onClick={() => runPositionCardAction(position, "MOVE_SL", { stopPrice: slValue })}
+          >
+            {cardBusy && cardAction.action === "MOVE_SL" ? "Moving..." : "Move SL"}
+          </button>
+          <label>
+            <span>TP</span>
+            <input
+              inputMode="decimal"
+              placeholder="Take profit"
+              type="number"
+              value={tpValue}
+              onChange={(event) => updatePositionControl(key, "takeProfitPrice", event.target.value)}
+            />
+          </label>
+          <button
+            disabled={cardBusy || !Number.isFinite(Number(tpValue)) || Number(tpValue) <= 0}
+            type="button"
+            onClick={() => runPositionCardAction(position, "MOVE_TP", { takeProfitPrice: tpValue })}
+          >
+            {cardBusy && cardAction.action === "MOVE_TP" ? "Moving..." : "Move TP"}
+          </button>
+          <button
+            disabled={cardBusy}
+            type="button"
+            onClick={() => runPositionCardAction(position, "CLOSE_POSITION", {}, {
+              confirm: true,
+              confirmMessage: `Close ${position.symbol} ${position.side} position ${positionIdentifier(position) ?? ""}?`,
+            })}
+          >
+            {cardBusy && cardAction.action === "CLOSE_POSITION" ? "Closing..." : "Close Position"}
+          </button>
+          <button
+            disabled={cardBusy || !hasProtection}
+            title={!hasProtection ? "No attached protection/orders reported for this position." : "Cancel protection/orders attached to this exact position."}
+            type="button"
+            onClick={() => runPositionCardAction(position, "CANCEL_ATTACHED_ORDERS", {}, {
+              confirm: true,
+              confirmMessage: `Cancel attached protective/orders for ${position.symbol} ${position.side}?`,
+            })}
+          >
+            {cardBusy && cardAction.action === "CANCEL_ATTACHED_ORDERS" ? "Cancelling..." : "Cancel Protection/Orders"}
+          </button>
+          <button disabled={cardBusy} type="button" onClick={() => runPositionForceSync(position)}>
+            {cardBusy && cardAction.action === "FORCE_SYNC" ? "Syncing..." : "Force Sync"}
+          </button>
+        </div>
+        {cardAction.message && (
+          <MiniStatus tone={cardAction.ok === false ? "bad" : cardAction.ok === true ? "good" : "neutral"}>
+            {cardAction.message}
+          </MiniStatus>
+        )}
+        {cardAction.result && (
+          <details className="hubert-details">
+            <summary>Position card diagnostics</summary>
+            <pre>{JSON.stringify({
+              action: cardAction.action,
+              diagnostics: cardAction.result?.diagnostics ?? null,
+              message: cardAction.result?.message ?? cardAction.message,
+              ok: cardAction.result?.ok ?? cardAction.ok,
+              result: cardAction.result?.result ?? null,
+            }, null, 2)}</pre>
+          </details>
+        )}
+      </div>
+    );
+  }
+
   return (
     <section className="hubert-lab__section">
       <MiniStatus>Crisis Management ON gives manual control priority. New bot entries stay blocked while you act.</MiniStatus>
-      {activePosition ? (
-        <div className="hubert-live-card">
-          <div className="hubert-live-card__head">
-            <strong>{activePosition.symbol} {activePosition.side}</strong>
-            <span>{activePosition.battleDeckName ?? "Exchange position"} · {activePosition.apiProfile}</span>
-          </div>
-          <div className="hubert-lab__metrics">
-            <Metric label="Entry" value={fmt(activePosition.entryPrice)} />
-            <Metric label="Mark" value={fmt(activePosition.currentPrice)} />
-            <Metric label="Quantity" value={fmt(activePosition.quantity, 3)} />
-            <Metric label="Position ID" value={positionIdentifier(activePosition) ?? "BingX did not provide one"} />
-            <Metric label="Position side" value={activePosition.positionSide ?? activePosition.side ?? "--"} />
-            <Metric label="PnL" value={fmt(activePosition.unrealizedPnl)} />
-            <Metric label="SL" value={fmt(activePosition.stopLoss)} />
-            <Metric label="TP" value={fmt(activePosition.takeProfit)} />
-          </div>
-          <OrderTable orders={activePosition.attachedOrders ?? []} />
+      {positions.length ? (
+        <div className="hubert-live-stack">
+          {positions.map(renderPositionCard)}
         </div>
       ) : (
         <MiniStatus>No live position context is currently reported. Position actions stay disabled until the backend sees an open position. Market open actions still require symbol and quantity.</MiniStatus>
@@ -3667,9 +3851,18 @@ function CommunicationPanel({ communication, onSave, onTest, setCommunication })
 
 function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest, runAction, setActivePanel, setStrategyForm, workspaceContext }) {
   const [prompt, setPrompt] = useState("Run a 50 combination sweep for SOLUSDT 15m over the last 31 days and rank robust settings.");
-  const [chatMessages, setChatMessages] = useState([]);
+  const [chatMessages, setChatMessages] = useState(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem("hubert-ah-chat-v2") ?? "[]");
+      return Array.isArray(parsed) ? parsed.slice(-80) : [];
+    } catch {
+      return [];
+    }
+  });
   const [followUpText, setFollowUpText] = useState("");
   const [followUpState, setFollowUpState] = useState({ message: "", state: "idle" });
+  const [lastAhDiagnostics, setLastAhDiagnostics] = useState(null);
   const [options, setOptions] = useState({
     allowLongRunningJobs: false,
     includeCodeContext: false,
@@ -3690,6 +3883,11 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
   const [collapseAllChat, setCollapseAllChat] = useState(false);
   const [clearedChatAtByRun, setClearedChatAtByRun] = useState({});
   const [showRunHistory, setShowRunHistory] = useState(false);
+  const [ahExpanded, setAhExpanded] = useState(false);
+  const [showAhContext, setShowAhContext] = useState(true);
+  const [pendingAhOperation, setPendingAhOperation] = useState(null);
+  const [pendingAhName, setPendingAhName] = useState("");
+  const chatEndRef = useRef(null);
   const activeRun = runs.find((run) => run.id === activeRunId) ?? runs[0] ?? null;
   const running = ["queued", "running"].includes(activeRun?.status);
   const activeRows = activeRun?.resultSummary?.topRows ?? [];
@@ -3720,20 +3918,27 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
   const visibleChatMessages = useMemo(() => {
     const persisted = activeRun?.messages ?? [];
     const local = chatMessages.filter((message) => !activeRun?.id || !message.runId || message.runId === activeRun.id);
-    const seen = new Set();
+    const seenIds = new Set();
+    const recentContent = new Map();
     const clearedAt = activeRun?.id ? Date.parse(clearedChatAtByRun[activeRun.id] ?? 0) : 0;
-    return [...persisted, ...local]
+    return [...local, ...persisted]
       .filter((message) => !clearedAt || Date.parse(message.time ?? 0) > clearedAt)
       .filter((message) => {
-        const key = `${message.role}|${message.time}|${message.text}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
+        if (message.id) {
+          if (seenIds.has(message.id)) return false;
+          seenIds.add(message.id);
+        }
+        const contentKey = `${message.runId ?? activeRun?.id ?? "global"}|${message.role}|${String(message.text ?? "").slice(0, 500)}`;
+        const timeMs = Date.parse(message.time ?? 0) || 0;
+        const previousTime = recentContent.get(contentKey);
+        if (previousTime && Math.abs(timeMs - previousTime) < 10000) return false;
+        recentContent.set(contentKey, timeMs);
         return true;
       })
       .sort((left, right) => Date.parse(left.time ?? 0) - Date.parse(right.time ?? 0));
   }, [activeRun?.id, activeRun?.messages, chatMessages, clearedChatAtByRun]);
-  const olderChatMessages = visibleChatMessages.slice(0, Math.max(0, visibleChatMessages.length - 6));
-  const recentChatMessages = visibleChatMessages.slice(-6);
+  const olderChatMessages = visibleChatMessages.slice(0, Math.max(0, visibleChatMessages.length - 4));
+  const recentChatMessages = visibleChatMessages.slice(-4);
   const examples = [
     "Find robust SOLUSDT 15m settings for the last 2 years and reject overfit configs.",
     "Run 1000 sweep combinations for SOLUSDT 15m over the last 2 years and give me the 5 best robust settings.",
@@ -3742,6 +3947,19 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
     "Analyze why this strategy performs worse on 1H than 15m.",
     "Prepare a report and export it to CSV and JSON.",
   ];
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem("hubert-ah-chat-v2", JSON.stringify(chatMessages.slice(-80)));
+    } catch {
+      // Chat persistence is a convenience layer; never block the UI on storage.
+    }
+  }, [chatMessages]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView?.({ block: "end", behavior: "smooth" });
+  }, [visibleChatMessages.length, followUpState.state]);
 
   async function loadRuns() {
     const payload = await apiRequest("/ai/agent/runs");
@@ -3790,6 +4008,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
           {
             confidence: payload.response?.confidence,
             evidence: payload.response?.evidence ?? [],
+            intent: payload.response?.intent,
             localOnly: !activeRun?.id,
             platformEvidence: payload.response?.platformEvidence,
             risk: payload.response?.risk,
@@ -3844,6 +4063,75 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
         },
       ]);
       return payload;
+    });
+  }
+
+  async function confirmPendingAhOperation() {
+    if (!pendingAhOperation) return null;
+    return runAction("ah-confirm-operation", "Confirm AH operation", async () => {
+      if (pendingAhOperation.type !== "research-job") {
+        throw new Error("This pending operation is not wired for execution yet.");
+      }
+      const payload = await apiRequest("/ai/agent/run", {
+        body: {
+          ...(pendingAhOperation.params ?? {}),
+          name: pendingAhName || pendingAhOperation.name,
+          options: {
+            ...(pendingAhOperation.params?.options ?? {}),
+            operationName: pendingAhName || pendingAhOperation.name,
+            workspaceContext: activeWorkspaceContext,
+          },
+          workspaceContext: activeWorkspaceContext,
+        },
+        method: "POST",
+      });
+      await loadRuns();
+      await loadCopilotMemory();
+      if (payload.run?.id) setActiveRunId(payload.run.id);
+      setChatMessages((current) => [
+        ...current,
+        {
+          evidence: [
+            `Operation: ${pendingAhOperation.id}`,
+            `Run: ${payload.run?.id ?? "queued"}`,
+            `Name: ${pendingAhName || pendingAhOperation.name}`,
+            pendingAhOperation.summary,
+          ],
+          intent: "research-confirmed",
+          role: "assistant",
+          runId: payload.run?.id,
+          text: `AH queued the confirmed research job: ${pendingAhName || pendingAhOperation.name}.`,
+          time: new Date().toISOString(),
+        },
+      ]);
+      setPendingAhOperation(null);
+      setPendingAhName("");
+      return payload;
+    });
+  }
+
+  function updatePendingAhPlan(path, value) {
+    if (!pendingAhOperation) return;
+    const keys = path.split(".");
+    setPendingAhOperation((current) => {
+      const next = structuredClone(current);
+      let target = next.plan;
+      let optionsTarget = next.params.options;
+      keys.slice(0, -1).forEach((key) => {
+        target[key] = target[key] && typeof target[key] === "object" ? target[key] : {};
+        optionsTarget[key] = optionsTarget[key] && typeof optionsTarget[key] === "object" ? optionsTarget[key] : {};
+        target = target[key];
+        optionsTarget = optionsTarget[key];
+      });
+      const finalKey = keys.at(-1);
+      target[finalKey] = value;
+      optionsTarget[finalKey] = value;
+      if (path === "maxCombinations") {
+        next.plan.plannedCombinations = Number(value) || next.plan.plannedCombinations;
+        next.plan.requestedCombinations = Number(value) || next.plan.requestedCombinations;
+        next.params.options.maxCombinations = Number(value) || next.params.options.maxCombinations;
+      }
+      return next;
     });
   }
 
@@ -3928,7 +4216,24 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
     return `${fmt(value, digits)}${suffix}`;
   }
 
+  function humanIntentLabel(intent) {
+    const labels = {
+      "chart-backtest-question": "chart / backtest",
+      "code-platform-diagnosis": "code / platform diagnosis",
+      "current-research-result": "current result",
+      "general-platform-question": "general platform question",
+      "platform-diagnosis": "platform diagnosis",
+      "research-request": "research request",
+      "unsafe-live-action": "unsafe live action",
+    };
+    return labels[intent] ?? intent ?? "copilot answer";
+  }
+
   function clearVisibleChat() {
+    if (["thinking", "sending", "responding", "streaming"].includes(followUpState.state)) {
+      setFollowUpState({ message: "AH is still responding. Wait for the current answer or retry after it fails.", state: "failed" });
+      return;
+    }
     if (!activeRun?.id) {
       setChatMessages([]);
       return;
@@ -3939,6 +4244,10 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
   }
 
   function startNewChat() {
+    if (["thinking", "sending", "responding", "streaming"].includes(followUpState.state)) {
+      setFollowUpState({ message: "AH is still responding. I did not clear the active exchange.", state: "failed" });
+      return;
+    }
     clearVisibleChat();
     setPrompt("");
     setFollowUpText("");
@@ -3946,16 +4255,46 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
   }
 
   async function askFollowUp(message = followUpText, row = null) {
-    return runAction("ai-agent-follow-up", "Ask copilot", async () => {
+    return runAction("ai-agent-follow-up", "Ask AH", async () => {
       if (!message.trim()) throw new Error("Ask a follow-up first.");
-      if (!activeRun?.id && copilotMode === "research") throw new Error("Open an AI run before asking a follow-up.");
+      const requestId = `ah-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const startedAt = Date.now();
+      const route = "/ai/agent/chat";
       const runId = activeRun?.id ?? "platform-evidence";
       const contextRow = row ?? activeResult;
-      const userMessage = { role: "user", runId, text: message.trim(), time: new Date().toISOString() };
-      setFollowUpState({ message: "Thinking with the active run context...", state: "thinking" });
-      setChatMessages((current) => [...current, userMessage]);
+      const userMessage = {
+        id: `${requestId}:user`,
+        lifecycle: "queued",
+        requestId,
+        role: "user",
+        runId,
+        text: message.trim(),
+        time: new Date(startedAt).toISOString(),
+      };
+      const placeholder = {
+        diagnostics: {
+          requestId,
+          route,
+          startedAt: new Date(startedAt).toISOString(),
+          status: "pending",
+        },
+        id: `${requestId}:assistant`,
+        intent: "responding",
+        lifecycle: "responding",
+        requestId,
+        role: "assistant",
+        runId,
+        text: "AH is thinking...",
+        time: new Date(startedAt + 1).toISOString(),
+      };
+      setFollowUpState({ message: "Sending request to AH...", state: "sending" });
+      setLastAhDiagnostics({ requestId, route, startedAt: new Date(startedAt).toISOString(), status: "sending" });
+      setChatMessages((current) => [...current, userMessage, placeholder]);
       try {
-        const payload = await apiRequest("/ai/agent/chat", {
+        setChatMessages((current) => current.map((item) => (
+          item.id === userMessage.id ? { ...item, lifecycle: "sending" } : item
+        )));
+        const payload = await apiRequest(route, {
           body: {
             message: message.trim(),
             mode: copilotMode,
@@ -3966,32 +4305,47 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
           },
           method: "POST",
         });
+        const latencyMs = Date.now() - startedAt;
         if (!payload.ok) {
           throw new Error(payload.message ?? "The backend did not generate a follow-up response.");
         }
-        setFollowUpState({ message: "Rendering response...", state: "responding" });
-        setChatMessages((current) => [
-          ...current,
-          {
+        if (payload.response?.pendingOperation) {
+          setPendingAhOperation(payload.response.pendingOperation);
+          setPendingAhName(payload.response.pendingOperation.name ?? "AH research");
+        }
+        setFollowUpState({ message: "Rendering AH response...", state: "responding" });
+        const diagnostics = {
+          latencyMs,
+          requestId,
+          responseStatus: "ok",
+          route,
+          status: "completed",
+        };
+        setLastAhDiagnostics(diagnostics);
+        setChatMessages((current) => current.map((item) => {
+          if (item.id === userMessage.id) return { ...item, lifecycle: "completed" };
+          if (item.id !== placeholder.id) return item;
+          return {
+            ...item,
+            baselineComparison: payload.response?.baselineComparison,
             confidence: payload.response?.confidence,
             critique: payload.response?.critique,
+            diagnostics,
             evidence: payload.response?.evidence ?? [],
+            intent: payload.response?.intent,
+            lifecycle: "completed",
             platformEvidence: payload.response?.platformEvidence,
             risk: payload.response?.risk,
-            role: "assistant",
             row: payload.response?.row,
-            runId,
             sections: payload.response?.sections ?? [],
             text: payload.response?.answer ?? "No answer came back.",
-            time: new Date().toISOString(),
             verifiedFrom: payload.response?.verifiedFrom,
-          },
-        ]);
+          };
+        }));
         setFollowUpText("");
         if (activeRun?.id) {
           await loadRuns();
           await loadCopilotMemory();
-          setChatMessages((current) => current.filter((item) => item.runId !== runId || item.localOnly));
         }
         setFollowUpState({ message: "Follow-up answered.", state: "completed" });
         window.setTimeout(() => setFollowUpState((current) => (
@@ -4000,17 +4354,30 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
         return payload;
       } catch (error) {
         const messageText = humanError(error);
+        const latencyMs = Date.now() - startedAt;
+        const diagnostics = {
+          lastError: messageText,
+          latencyMs,
+          requestId,
+          responseStatus: "failed",
+          route,
+          status: "failed",
+        };
+        setLastAhDiagnostics(diagnostics);
         setFollowUpState({ message: messageText, state: "failed" });
-        setChatMessages((current) => [
-          ...current,
-          {
+        setChatMessages((current) => current.map((item) => {
+          if (item.id === userMessage.id) return { ...item, lifecycle: "completed" };
+          if (item.id !== placeholder.id) return item;
+          return {
+            ...item,
+            diagnostics,
             evidence: ["The backend did not return a usable follow-up response."],
-            role: "assistant",
-            runId,
+            intent: "failed",
+            lifecycle: "failed",
+            retryText: message.trim(),
             text: `Follow-up failed: ${messageText}`,
-            time: new Date().toISOString(),
-          },
-        ]);
+          };
+        }));
         throw error;
       }
     });
@@ -4223,7 +4590,13 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
     const row = message.row ?? null;
     const content = (
       <>
-        <strong>{message.role === "user" ? "You" : "Copilot"}</strong>
+        <strong>{message.role === "user" ? "You" : "AH"}</strong>
+        {message.lifecycle && (
+          <small className="hubert-ai-intent">State: {message.lifecycle}</small>
+        )}
+        {isAssistant && message.intent && (
+          <small className="hubert-ai-intent">Intent: {humanIntentLabel(message.intent)}</small>
+        )}
         <span>{message.text}</span>
         {isAssistant && (message.confidence || message.risk) && (
           <div className="hubert-ai-badges">
@@ -4272,13 +4645,30 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
             <small>{message.evidence.join(" · ")}</small>
           </details>
         )}
+        {message.diagnostics && (
+          <details className="hubert-ai-reasoning">
+            <summary>Request / response diagnostics</summary>
+            <div className="hubert-lab__metrics">
+              <Metric label="Request" value={message.diagnostics.requestId ?? "--"} />
+              <Metric label="Route" value={message.diagnostics.route ?? "--"} />
+              <Metric label="Status" value={message.diagnostics.responseStatus ?? message.diagnostics.status ?? "--"} />
+              <Metric label="Latency" value={message.diagnostics.latencyMs !== undefined ? `${message.diagnostics.latencyMs}ms` : "--"} />
+            </div>
+            {message.diagnostics.lastError && <MiniStatus tone="bad">{message.diagnostics.lastError}</MiniStatus>}
+          </details>
+        )}
+        {isAssistant && message.lifecycle === "failed" && message.retryText && (
+          <div className="hubert-lab__actions">
+            <button type="button" onClick={() => askFollowUp(message.retryText, row)}>Retry</button>
+          </div>
+        )}
       </>
     );
 
     if (shouldCollapse) {
       return (
         <details className="hubert-chat-message hubert-chat-message--collapsed" data-role={message.role} key={`${message.time}-${index}`}>
-          <summary>{message.role === "user" ? "You" : "Copilot"} · {String(message.text ?? "").slice(0, 110)}</summary>
+          <summary>{message.role === "user" ? "You" : "AH"} · {String(message.text ?? "").slice(0, 110)}</summary>
           {content}
         </details>
       );
@@ -4292,45 +4682,32 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
   }
 
   return (
-    <section className="hubert-lab__section">
-      <div className="hubert-lab__subhead"><strong>AI Copilot Workspace</strong><span>analysis only</span></div>
+    <section className={`hubert-lab__section hubert-ah-workspace${ahExpanded ? " hubert-ah-workspace--expanded" : ""}`}>
+      <div className="hubert-lab__subhead">
+        <strong>Artificial Hubert (AH)</strong>
+        <span>{running ? "working" : pendingAhOperation ? "needs confirmation" : "ready"}</span>
+      </div>
       <MiniStatus tone={aiStatus?.connected ? "good" : aiStatus?.lastError ? "bad" : "neutral"}>
-        {aiStatus?.message ?? "AI Agent runs through the backend. It cannot place orders."}
+        {aiStatus?.message ?? "AH runs through the backend. It cannot place orders without explicit confirmation."}
       </MiniStatus>
       <div className="hubert-lab__metrics">
         <Metric label="Provider" value={aiStatus?.provider ?? "mock"} />
         <Metric label="Model" value={aiStatus?.model ?? "not connected"} />
-        <Metric label="Trading" value="Blocked for AI" />
+        <Metric label="Execution" value="Confirmation required" />
       </div>
-      <div className="hubert-lab__actions hubert-ai-mode">
-        <button type="button" data-active={copilotMode === "research"} onClick={() => setCopilotMode("research")}>Research mode</button>
-        <button type="button" data-active={copilotMode === "platform-diagnosis"} onClick={() => setCopilotMode("platform-diagnosis")}>Platform diagnosis mode</button>
-        <button type="button" data-active={copilotMode === "code-evidence"} onClick={() => setCopilotMode("code-evidence")}>Code/data evidence mode</button>
-      </div>
-      <MiniStatus>
-        {copilotMode === "research"
-          ? "Research mode starts queued analysis jobs."
-          : "Evidence mode answers from source files, routes, runtime state, and saved platform data. It is read-only."}
-      </MiniStatus>
       <div className="hubert-ai-context-header">
         <span><b>Chart</b>{activeWorkspaceContext.chart?.symbol ?? "SOLUSDT"} · {activeWorkspaceContext.chart?.timeframe ?? "--"} · {activeWorkspaceContext.chart?.renderedCandles ?? 0} candles</span>
         <span><b>Panel</b>{activeWorkspaceContext.activePanel ?? "AI"}</span>
         <span><b>Live</b>{activeWorkspaceContext.live?.openPositions ?? 0} positions · {activeWorkspaceContext.live?.source ?? "syncing"}</span>
         <span><b>Baseline</b>{copilotMemory?.favoriteBaselines?.[0]?.name ?? "none remembered"}</span>
       </div>
-      <div className="hubert-lab__actions hubert-ai-tabs">
-        {[
-          ["chat", "Chat"],
-          ["research", "Research"],
-          ["diagnostics", "Diagnostics"],
-          ["memory", "Memory"],
-          ["history", "History"],
-        ].map(([view, label]) => (
-          <button data-active={copilotView === view} key={view} type="button" onClick={() => setCopilotView(view)}>{label}</button>
-        ))}
+      <div className="hubert-lab__actions hubert-chat-toolbar">
+        <button type="button" onClick={() => setAhExpanded((value) => !value)}>{ahExpanded ? "Compact AH" : "Expand AH"}</button>
+        <button type="button" onClick={() => setShowAhContext((value) => !value)}>{showAhContext ? "Hide Context" : "Show Context"}</button>
+        <button type="button" onClick={() => setShowRunHistory((value) => !value)}>{showRunHistory ? "Hide History" : "History"}</button>
+        <button type="button" onClick={startNewChat}>New Chat</button>
       </div>
 
-      {copilotView === "chat" && (
       <div className="hubert-copilot-grid">
         <div>
           <div className="hubert-lab__actions hubert-chat-toolbar">
@@ -4352,54 +4729,148 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
                 {recentChatMessages.map((message, index) => renderChatMessage(message, index, recentChatMessages.length))}
               </>
             )}
-            {["thinking", "responding"].includes(followUpState.state) && (
+            {["thinking", "sending", "responding", "streaming"].includes(followUpState.state) && (
               <div className="hubert-chat-message" data-role="assistant">
-                <strong>Copilot</strong>
-                <span>{followUpState.state === "thinking" ? "Thinking..." : "Responding..."}</span>
+                <strong>AH</strong>
+                <span>{followUpState.state === "sending" ? "Sending..." : followUpState.state === "thinking" ? "Thinking..." : "Responding..."}</span>
                 <small>{followUpState.message}</small>
               </div>
             )}
+            <span ref={chatEndRef} aria-hidden="true" />
           </div>
           <div className="hubert-chat-composer">
             <label>
-              <span>Ask about current result</span>
+              <span>Ask Artificial Hubert anything</span>
               <textarea
-                placeholder={activeRun?.id || copilotMode !== "research" ? "Ask a follow-up, for example: trace the Move SL button." : "Open or run research before asking about a result."}
+                data-testid="ah-chat-textarea"
+                placeholder="Ask about research, buttons, SL/TP, chart, code paths, errors, limits, or what AH should prepare next."
                 value={followUpText}
                 onChange={(event) => setFollowUpText(event.target.value)}
               />
             </label>
             <div className="hubert-lab__actions">
-              <button type="button" disabled={(copilotMode === "research" && !activeRun?.id) || ["thinking", "responding"].includes(followUpState.state)} onClick={() => askFollowUp(followUpText)}>
-                {copilotMode === "research" ? "Ask About Current Result" : "Ask with Evidence"}
+              <button type="button" data-testid="ah-chat-send" disabled={["thinking", "sending", "responding", "streaming"].includes(followUpState.state)} onClick={() => askFollowUp(followUpText)}>
+                Send
               </button>
-              <button type="button" disabled={(copilotMode === "research" && !activeRun?.id) || ["thinking", "responding"].includes(followUpState.state)} onClick={() => askFollowUp(copilotMode === "research" ? "Give me a deep analysis of the current result: strengths, weaknesses, overfit risk, confidence, and exact next tests." : "Answer from platform evidence: inspect files, routes, runtime state, unknowns, and verification steps.", activeResult)}>Deep Analysis</button>
-              <button type="button" disabled={(copilotMode === "research" && !activeRun?.id) || ["thinking", "responding"].includes(followUpState.state)} onClick={() => askFollowUp("Explain how you reached this conclusion. Show the evidence chain, rejected alternatives, uncertainty, and what would invalidate it.", activeResult)}>Explain Reasoning</button>
+              <button type="button" disabled={!activeRun?.id || ["thinking", "sending", "responding", "streaming"].includes(followUpState.state)} onClick={() => askFollowUp(copilotMode === "research" ? "Give me a deep analysis of the current result: strengths, weaknesses, overfit risk, confidence, and exact next tests." : "Answer from platform evidence: inspect files, routes, runtime state, unknowns, and verification steps.", activeResult)}>Deep Analysis</button>
+              <button type="button" disabled={!activeRun?.id || ["thinking", "sending", "responding", "streaming"].includes(followUpState.state)} onClick={() => askFollowUp("Explain how you reached this conclusion. Show the evidence chain, rejected alternatives, uncertainty, and what would invalidate it.", activeResult)}>Explain Reasoning</button>
               <button type="button" onClick={startNewChat}>Start New Chat</button>
             </div>
           </div>
+          {pendingAhOperation && (
+            <article className="hubert-ah-pending">
+              <div className="hubert-lab__subhead">
+                <strong>Pending AH operation</strong>
+                <span>{pendingAhOperation.type}</span>
+              </div>
+              <label>
+                <span>Research name</span>
+                <input value={pendingAhName} onChange={(event) => setPendingAhName(event.target.value)} />
+              </label>
+              <MiniStatus tone="warn">{pendingAhOperation.summary}</MiniStatus>
+              <div className="hubert-lab__metrics">
+                <Metric label="Objective" value={pendingAhOperation.plan?.objective ?? "--"} />
+                <Metric label="Method" value={pendingAhOperation.plan?.methodology ?? "--"} />
+                <Metric label="Combinations" value={pendingAhOperation.plan?.maxCombinations ?? "--"} />
+                <Metric label="Range" value={pendingAhOperation.plan?.range ? `${dateText(pendingAhOperation.plan.range.from)} → ${dateText(pendingAhOperation.plan.range.to)}` : "--"} />
+                <Metric label="ETA" value={pendingAhOperation.estimatedDuration ?? "--"} />
+                <Metric label="Baseline" value={pendingAhOperation.plan?.baselineQuery || "none"} />
+                <Metric label="Symbol" value={pendingAhOperation.plan?.symbol ?? "--"} />
+                <Metric label="TF" value={pendingAhOperation.plan?.timeframe ?? "--"} />
+              </div>
+              <details className="hubert-advanced">
+                <summary>Edit pending parameters</summary>
+                <div className="hubert-lab__grid hubert-lab__grid--two">
+                  <label>
+                    <span>Combinations</span>
+                    <input
+                      min="1"
+                      type="number"
+                      value={pendingAhOperation.plan?.maxCombinations ?? ""}
+                      onChange={(event) => updatePendingAhPlan("maxCombinations", Number(event.target.value))}
+                    />
+                  </label>
+                  <label>
+                    <span>PF minimum</span>
+                    <input
+                      inputMode="decimal"
+                      type="number"
+                      value={pendingAhOperation.plan?.constraints?.minProfitFactor ?? ""}
+                      onChange={(event) => updatePendingAhPlan("constraints.minProfitFactor", event.target.value === "" ? undefined : Number(event.target.value))}
+                    />
+                  </label>
+                  <label>
+                    <span>DD max</span>
+                    <input
+                      inputMode="decimal"
+                      type="number"
+                      value={pendingAhOperation.plan?.constraints?.maxDrawdown ?? ""}
+                      onChange={(event) => updatePendingAhPlan("constraints.maxDrawdown", event.target.value === "" ? undefined : Number(event.target.value))}
+                    />
+                  </label>
+                  <label>
+                    <span>Min trades</span>
+                    <input
+                      min="0"
+                      type="number"
+                      value={pendingAhOperation.plan?.constraints?.minTrades ?? ""}
+                      onChange={(event) => updatePendingAhPlan("constraints.minTrades", event.target.value === "" ? undefined : Number(event.target.value))}
+                    />
+                  </label>
+                </div>
+              </details>
+              <details className="hubert-advanced">
+                <summary>Safety notes / exact params</summary>
+                <ul>
+                  {(pendingAhOperation.riskNotes ?? []).map((note) => <li key={note}>{note}</li>)}
+                </ul>
+                <pre className="hubert-ai-json">{JSON.stringify(pendingAhOperation.plan, null, 2).slice(0, 7000)}</pre>
+              </details>
+              <div className="hubert-lab__actions">
+                <button type="button" onClick={confirmPendingAhOperation}>Confirm</button>
+                <button type="button" onClick={() => setPendingAhOperation(null)}>Cancel</button>
+              </div>
+            </article>
+          )}
           <details className="hubert-advanced">
-            <summary>Start new research job</summary>
+            <summary>Advanced / manual job queue</summary>
             <label>
             <span>New research command</span>
             <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} />
             </label>
+            <div className="hubert-lab__actions">
+              <button type="button" onClick={startRun}>{copilotMode === "research" ? "Run Research" : "Ask from Platform Evidence"}</button>
+              <button type="button" onClick={() => runAction("ai-agent-refresh", "Refresh agent runs", loadRuns)}>Refresh</button>
+              {running && <button type="button" onClick={() => cancelRun(activeRun.id)}>Cancel</button>}
+              {["interrupted", "stalled", "cancelled", "failed"].includes(activeRun?.status) && (
+                <button type="button" onClick={() => restartRun(activeRun.id)}>Restart Same Prompt</button>
+              )}
+            </div>
+            <div className="hubert-lab__actions hubert-ai-mode">
+              <button type="button" data-active={copilotMode === "research"} onClick={() => setCopilotMode("research")}>Research mode</button>
+              <button type="button" data-active={copilotMode === "platform-diagnosis"} onClick={() => setCopilotMode("platform-diagnosis")}>Platform diagnosis mode</button>
+              <button type="button" data-active={copilotMode === "code-evidence"} onClick={() => setCopilotMode("code-evidence")}>Code/data evidence mode</button>
+            </div>
           </details>
           {followUpState.state !== "idle" && (
             <MiniStatus tone={followUpState.state === "failed" ? "bad" : followUpState.state === "completed" ? "good" : "neutral"}>
               Follow-up: {followUpState.state}. {followUpState.message}
             </MiniStatus>
           )}
-          <div className="hubert-lab__actions">
-            <button type="button" onClick={startRun}>{copilotMode === "research" ? "Run Research" : "Ask from Platform Evidence"}</button>
-            <button type="button" onClick={() => runAction("ai-agent-refresh", "Refresh agent runs", loadRuns)}>Refresh</button>
-            {running && <button type="button" onClick={() => cancelRun(activeRun.id)}>Cancel</button>}
-            {["interrupted", "stalled", "cancelled", "failed"].includes(activeRun?.status) && (
-              <button type="button" onClick={() => restartRun(activeRun.id)}>Restart Same Prompt</button>
-            )}
-          </div>
+          {lastAhDiagnostics && (
+            <details className="hubert-advanced">
+              <summary>AH request diagnostics</summary>
+              <div className="hubert-lab__metrics">
+                <Metric label="Request" value={lastAhDiagnostics.requestId ?? "--"} />
+                <Metric label="Route" value={lastAhDiagnostics.route ?? "--"} />
+                <Metric label="Status" value={lastAhDiagnostics.responseStatus ?? lastAhDiagnostics.status ?? "--"} />
+                <Metric label="Latency" value={lastAhDiagnostics.latencyMs !== undefined ? `${lastAhDiagnostics.latencyMs}ms` : "--"} />
+              </div>
+              {lastAhDiagnostics.lastError && <MiniStatus tone="bad">{lastAhDiagnostics.lastError}</MiniStatus>}
+            </details>
+          )}
         </div>
-        <aside className="hubert-live-card">
+        {showAhContext && <aside className="hubert-live-card">
           <div className="hubert-lab__subhead"><strong>Run Context</strong><span>{activeRun?.id?.slice(-6) ?? "none"}</span></div>
           <ReadOnly label="Symbol" value={activeRun?.plan?.symbol ?? "SOLUSDT"} />
           <ReadOnly label="Timeframe" value={(activeRun?.plan?.timeframes ?? [activeRun?.plan?.timeframe ?? "15m"]).join(", ")} />
@@ -4408,13 +4879,23 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
           <ReadOnly label="Capital" value={`${fmt(activeRun?.plan?.startingBalance ?? 10000)} USDT`} />
           <ReadOnly label="Sizing" value={activeRun?.plan?.sizingMode ?? "position-percent"} />
           <ReadOnly label="Fill" value={activeRun?.plan?.fillMode ?? "legacy"} />
-        </aside>
+        </aside>}
       </div>
-      )}
 
       {(copilotView === "chat" || copilotView === "research") && (
       <details className="hubert-advanced">
         <summary>Examples and advanced limits</summary>
+        <div className="hubert-lab__actions hubert-ai-tabs">
+          {[
+            ["chat", "Chat"],
+            ["research", "Research details"],
+            ["diagnostics", "Evidence tools"],
+            ["memory", "Memory"],
+            ["history", "Run queue"],
+          ].map(([view, label]) => (
+            <button data-active={copilotView === view} key={view} type="button" onClick={() => setCopilotView(view)}>{label}</button>
+          ))}
+        </div>
         <div className="hubert-ai-examples">
           {examples.map((example) => (
             <button key={example} type="button" onClick={() => setPrompt(example)}>{example}</button>
@@ -4438,7 +4919,9 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
       )}
 
       {activeRun && (copilotView === "chat" || copilotView === "research") && (
-        <article className="hubert-live-card">
+        <details className="hubert-advanced hubert-ah-task" open={running}>
+          <summary>Current AH task · {activeRun.status} · {activeRun.currentStep ?? "waiting"}</summary>
+          <article className="hubert-live-card">
           <div className="hubert-lab__subhead">
             <strong>{activeRun.status.toUpperCase()}</strong>
             <span>{activeRun.currentStep ?? "waiting"}</span>
@@ -4563,7 +5046,8 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
               <button type="button" onClick={() => exportRun(activeRun.id, "csv")}>Export CSV</button>
             </div>
           )}
-        </article>
+          </article>
+        </details>
       )}
 
       {(showRunHistory || copilotView === "history") && (
@@ -4586,9 +5070,9 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
 
       {copilotView === "memory" && (
         <article className="hubert-live-card">
-          <div className="hubert-lab__subhead"><strong>Copilot Memory</strong><span>{copilotMemory?.updatedAt ? dateText(copilotMemory.updatedAt) : "fresh"}</span></div>
+          <div className="hubert-lab__subhead"><strong>AH Memory</strong><span>{copilotMemory?.updatedAt ? dateText(copilotMemory.updatedAt) : "fresh"}</span></div>
           <MiniStatus>
-            The copilot uses this to remember baselines, preferences, previous conclusions, and recent workspace context. It stays read-only for trading.
+            AH uses this to remember baselines, preferences, previous conclusions, and recent workspace context. It stays read-only for trading.
           </MiniStatus>
           <div className="hubert-lab__metrics">
             <Metric label="Language" value={copilotMemory?.preferences?.language ?? "auto"} />

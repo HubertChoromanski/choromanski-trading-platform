@@ -22,6 +22,41 @@ function scoreResult(metrics = {}, startingBalance = 10000) {
   return netPercent + profitFactor * 1.5 + tradeQuality - drawdown * 0.75;
 }
 
+function constraintStatus(row = {}, constraints = {}) {
+  const metrics = row.metrics ?? row;
+  const failures = [];
+  const pf = Number(metrics.profitFactor ?? row.profitFactor ?? 0);
+  const dd = Number(metrics.maxDrawdown ?? row.maxDrawdown ?? 0);
+  const trades = Number(metrics.totalTrades ?? row.totalTrades ?? 0);
+  if (constraints.minProfitFactor !== undefined && pf < Number(constraints.minProfitFactor)) {
+    failures.push(`PF ${pf} below minimum ${constraints.minProfitFactor}`);
+  }
+  if (constraints.maxDrawdown !== undefined && dd > Number(constraints.maxDrawdown)) {
+    failures.push(`DD ${dd} above maximum ${constraints.maxDrawdown}`);
+  }
+  if (constraints.minTrades !== undefined && trades < Number(constraints.minTrades)) {
+    failures.push(`Trades ${trades} below minimum ${constraints.minTrades}`);
+  }
+  return {
+    failures,
+    passed: failures.length === 0,
+  };
+}
+
+function constraintSummary(rows = [], constraints = {}) {
+  if (!constraints || !Object.keys(constraints).length) {
+    return { active: false, passed: rows.length, rejected: 0, total: rows.length };
+  }
+  const statuses = rows.map((row) => constraintStatus(row, constraints));
+  return {
+    active: true,
+    constraints,
+    passed: statuses.filter((status) => status.passed).length,
+    rejected: statuses.filter((status) => !status.passed).length,
+    total: rows.length,
+  };
+}
+
 function sideValue(result, side) {
   return side === "LONG" ? result.longResult ?? 0 : result.shortResult ?? 0;
 }
@@ -366,7 +401,7 @@ export function createAgentToolRegistry({ tools }) {
         completed,
         percent: Math.round((completed / Math.max(1, total)) * 100),
         remainingSeconds: Math.round((total - completed) / Math.max(rate, 0.1)),
-        topRows: rankSweepResults(rows).slice(0, 5),
+        topRows: rankSweepResults(rows, hydratedPlan).slice(0, 5),
         total,
         worker: {
           activePromiseCount,
@@ -617,7 +652,8 @@ export function createAgentToolRegistry({ tools }) {
           failedCombinations: failedCombinations.slice(-100),
           failedCombinationsCount: failedCombinations.length,
           generatedCombinations: allCombinations.length,
-          rankedResults: rankSweepResults(rows),
+          constraintSummary: constraintSummary(rows, hydratedPlan.constraints),
+          rankedResults: rankSweepResults(rows, hydratedPlan),
           baseline: hydratedPlan.baselineDetail ?? null,
           baselineWarning: hydratedPlan.baselineWarning,
           requestedCombinations: hydratedPlan.requestedCombinations ?? hydratedPlan.maxCombinations ?? total,
@@ -633,9 +669,10 @@ export function createAgentToolRegistry({ tools }) {
       failedCombinations: failedCombinations.slice(-100),
       failedCombinationsCount: failedCombinations.length,
       generatedCombinations: allCombinations.length,
-      rankedResults: rankSweepResults(rows),
+      constraintSummary: constraintSummary(rows, hydratedPlan.constraints),
+      rankedResults: rankSweepResults(rows, hydratedPlan),
       baseline: hydratedPlan.baselineDetail ?? null,
-      baselineComparison: hydratedPlan.baselineDetail ? rankSweepResults(rows).slice(0, 5).map((row) => ({
+      baselineComparison: hydratedPlan.baselineDetail ? rankSweepResults(rows, hydratedPlan).slice(0, 5).map((row) => ({
         aiConfigId: row.id,
         aiRank: row.rank,
         baselineBacktestId: hydratedPlan.baselineDetail.id,
@@ -653,10 +690,19 @@ export function createAgentToolRegistry({ tools }) {
     };
   }
 
-  function rankSweepResults(rows = []) {
+  function rankSweepResults(rows = [], plan = {}) {
+    const constraints = plan.constraints ?? {};
     return rows
-      .slice()
-      .sort((left, right) => Number(right.score ?? 0) - Number(left.score ?? 0))
+      .map((row) => ({
+        ...row,
+        constraintStatus: constraintStatus(row, constraints),
+      }))
+      .sort((left, right) => {
+        const leftPassed = left.constraintStatus?.passed ? 1 : 0;
+        const rightPassed = right.constraintStatus?.passed ? 1 : 0;
+        if (leftPassed !== rightPassed) return rightPassed - leftPassed;
+        return Number(right.score ?? 0) - Number(left.score ?? 0);
+      })
       .slice(0, 100)
       .map((row, index) => ({
         ...row,

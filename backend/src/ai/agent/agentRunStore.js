@@ -113,7 +113,7 @@ export function createAgentRunStore({ store }) {
       });
     },
 
-    async create({ plan, prompt, warnings = [] }) {
+    async create({ name = "", plan, prompt, warnings = [] }) {
       const now = new Date().toISOString();
       const run = {
         artifacts: [],
@@ -125,6 +125,7 @@ export function createAgentRunStore({ store }) {
         id: `agent-run-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         logs: [],
         messages: [],
+        name: name || plan?.operationName || null,
         parsedIntent: plan.kind,
         partialResults: [],
         plan,

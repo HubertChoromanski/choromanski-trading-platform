@@ -20,6 +20,7 @@ const DEFAULT_MEMORY = {
     style: "direct",
   },
   previousConclusions: [],
+  researchIntent: null,
   recentRuns: [],
   recentWorkspace: null,
   rejectedConfigs: [],
@@ -101,6 +102,7 @@ function normalizeMemory(memory = {}) {
       metrics: Array.isArray(memory.preferences?.metrics) ? memory.preferences.metrics : [],
     },
     previousConclusions: Array.isArray(memory.previousConclusions) ? memory.previousConclusions : [],
+    researchIntent: memory.researchIntent && typeof memory.researchIntent === "object" ? memory.researchIntent : null,
     recentRuns: Array.isArray(memory.recentRuns) ? memory.recentRuns : [],
     rejectedConfigs: Array.isArray(memory.rejectedConfigs) ? memory.rejectedConfigs : [],
     version: MEMORY_VERSION,
@@ -252,13 +254,27 @@ export function createCopilotMemoryStore({ store }) {
       });
     },
 
+    async rememberResearchIntent(intent = {}) {
+      if (!intent || typeof intent !== "object") return this.getMemory();
+      const current = getMemory();
+      return save({
+        ...current,
+        researchIntent: sanitizeForAi({
+          ...intent,
+          updatedAt: new Date().toISOString(),
+        }),
+      });
+    },
+
     summary() {
       const memory = getMemory();
       return sanitizeForAi({
         baselines: memory.favoriteBaselines.slice(0, 6),
+        conversationSummary: memory.conversationSummary.slice(0, 8),
         discussedWeaknesses: memory.discussedWeaknesses.slice(0, 8),
         preferences: memory.preferences,
         previousConclusions: memory.previousConclusions.slice(0, 5),
+        researchIntent: memory.researchIntent,
         recentRuns: memory.recentRuns.slice(0, 6),
         recentWorkspace: memory.recentWorkspace,
         updatedAt: memory.updatedAt,

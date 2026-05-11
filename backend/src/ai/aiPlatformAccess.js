@@ -296,7 +296,7 @@ function extractKeywords(question = "") {
 
 function isPolishQuestion(value = "") {
   const normalized = normalizeText(value);
-  return /(^|\s)(co|czemu|dlaczego|jak|gdzie|porownaj|porównaj|wynik|dziala|działa|nadal|robi|robia|robią|ustawienia|blad|błąd)(\s|$)/iu.test(String(value)) ||
+  return /(^|\s)(czy|co|czemu|dlaczego|jak|gdzie|ile|pokaż|pokaz|porownaj|porównaj|wynik|dziala|działa|nadal|robi|robia|robią|ustawienia|blad|błąd|optymalnie|analiz)(\s|$)/iu.test(String(value)) ||
     normalized.includes("czemu") ||
     normalized.includes("dlaczego") ||
     normalized.includes("porownaj") ||
@@ -610,6 +610,79 @@ export function createAiPlatformAccess({
       suggestedVerification = polish
         ? ["Kliknij Force Sync na karcie pozycji.", "Rozwiń Last exchange response po Move SL i sprawdź endpoint, payload, raw response oraz verification.source.", "W BingX app sprawdź aktywne conditional/open orders dla tej pozycji."]
         : ["Click Force Sync on the position card.", "Expand Last exchange response after Move SL and inspect endpoint, payload, raw response, and verification.source.", "Check active conditional/open orders in the BingX app."];
+    } else if ((normalized.includes("baseline") && normalized.includes("hubert")) && (normalized.includes("co to") || normalized.includes("czym jest") || normalized.includes("what is"))) {
+      inspected.push("backend state store favorites/backtests", "backend/src/ai/aiLibraryTools.js resolver");
+      evidence.push(
+        "A baseline is a saved/favorite backtest used as a comparison point.",
+        "hubert is resolved by name from saved backtests/favorites when available.",
+        "It is not a strategy function or platform module.",
+      );
+      answer = polish
+        ? "Baseline hubert to zapisany backtest albo favorite nazwany „hubert”, którego AH używa jako punktu odniesienia przy porównywaniu wyników. To nie jest funkcja platformy ani osobna strategia. Jeśli poprosisz „porównaj z hubert”, AH spróbuje znaleźć ten zapisany backtest i zestawić zakres, timeframe, parametry oraz metryki."
+        : "The Hubert baseline is a saved backtest or favorite named “hubert” that AH uses as a comparison point. It is not a platform function or strategy module. If you ask to compare with Hubert, AH resolves that saved item and compares range, timeframe, params, and metrics.";
+      confidence = "high";
+      suggestedVerification = polish
+        ? ["Otwórz Favorites/Backtests i sprawdź zapis o nazwie hubert.", "Użyj „porównaj config #1 z hubert”, aby wykonać porównanie metryk."]
+        : ["Open Favorites/Backtests and check the saved item named hubert.", "Ask “compare config #1 with hubert” to run metric comparison."];
+    } else if (normalized.includes("co teraz robisz") || normalized.includes("what are you doing") || normalized.includes("current job") || normalized.includes("status job") || normalized.includes("postep") || normalized.includes("progress")) {
+      const runtime = await getRuntimeState({ includeAvailability: false, logLimit: 4 });
+      const run = runtime.ai;
+      inspected.push("backend/src/ai/aiPlatformAccess.js getRuntimeState", "backend aiAgentRuns state");
+      evidence.push(...[
+        run ? `Run ${run.id}: ${run.status}` : "No active/recent AH run found.",
+        run ? `Step: ${run.currentStep ?? "unknown"}` : "",
+        run ? `Progress: ${run.progress?.completed ?? 0}/${run.progress?.total ?? 0} (${run.progress?.percent ?? 0}%)` : "",
+      ].filter(Boolean));
+      answer = polish
+        ? run
+          ? `Aktualnie AH ma run ${run.id} ze statusem ${run.status}. Etap: ${run.currentStep ?? "brak opisu"}. Postęp: ${run.progress?.completed ?? 0}/${run.progress?.total ?? 0}, czyli około ${run.progress?.percent ?? 0}%.`
+          : "Nie widzę teraz aktywnego zadania AH. Jeśli chcesz uruchomić research, AH najpierw przygotuje kartę potwierdzenia."
+        : run
+          ? `AH currently has run ${run.id} with status ${run.status}. Stage: ${run.currentStep ?? "unknown"}. Progress: ${run.progress?.completed ?? 0}/${run.progress?.total ?? 0}, about ${run.progress?.percent ?? 0}%.`
+          : "I do not see an active AH job right now. If you want research, AH will prepare a confirmation card first.";
+      confidence = run ? "high" : "medium";
+      suggestedVerification = polish
+        ? ["Sprawdź kartę Current AH task albo Run queue.", "Jeśli progress stoi, otwórz Details / worker diagnostics."]
+        : ["Check the Current AH task card or Run queue.", "If progress is stale, open Details / worker diagnostics."];
+    } else if (normalized.includes("przycisk") || normalized.includes("button") || normalized.includes("verify integrity") || normalized.includes("rerun exact") || normalized.includes("re-run")) {
+      inspected.push(
+        "hubert-platform/frontend/src/components/ControlCenter.jsx AiAgentPanel result actions",
+        "backend/src/ai/agent/agentOrchestrator.js verifyIntegrity/rerunExact",
+        "backend/src/index.js /ai/agent/runs/:id/verify and /rerun",
+      );
+      evidence.push(
+        "Verify integrity compares stored AI metrics against an exact rerun and reports mismatches.",
+        "Re-run exact reruns the exact selected config with saved range/provider/fill/sizing/params.",
+        "Open Backtest loads that config into the Backtests/chart workflow.",
+        "Compare to saved backtest resolves a saved baseline, for example hubert, and compares metrics/context.",
+        "Show metric diff is a parity/debug action for metric differences.",
+      );
+      answer = polish
+        ? "Te przyciski służą do sprawdzania wiarygodności wyniku AI. Verify integrity porównuje zapisany wynik AI z dokładnym ponownym uruchomieniem tej samej konfiguracji i pokazuje rozjazdy. Re-run exact odpala jeszcze raz dokładnie tę konfigurację: ten sam symbol, timeframe, zakres, provider, fill mode, sizing i parametry. Open Backtest otwiera wynik w normalnym panelu Backtests/wykresie. Compare to saved backtest porównuje wynik z zapisanym baseline, np. hubert. Show metric diff pokazuje różnice metryk. Żaden z tych przycisków nie handluje."
+        : "These buttons verify whether an AI result is trustworthy. Verify integrity compares the stored AI row against an exact rerun and reports mismatches. Re-run exact reruns the exact saved config. Open Backtest opens it in the normal chart/backtest workflow. Compare to saved backtest compares it to a named baseline such as hubert. Show metric diff displays metric differences. None of these buttons trade.";
+      confidence = "high";
+      suggestedVerification = polish
+        ? ["Kliknij Verify integrity na karcie wyniku.", "Sprawdź, czy PF/net/trades/candles zgadzają się z Re-run exact.", "Jeśli porównujesz hubert, użyj Compare to saved backtest."]
+        : ["Click Verify integrity on a result card.", "Check PF/net/trades/candles against Re-run exact.", "Use Compare to saved backtest for hubert."];
+    } else if (normalized.includes("czego ai") || normalized.includes("czego nie moze") || normalized.includes("czego nie może") || normalized.includes("what can") || normalized.includes("cannot") || normalized.includes("limitations")) {
+      inspected.push(
+        "backend/src/ai/agent/agentOrchestrator.js live execution guard",
+        "hubert-platform/frontend/src/components/ControlCenter.jsx AiAgentPanel",
+        "backend AI tools are read-only for execution",
+      );
+      evidence.push(
+        "AI cannot place orders automatically.",
+        "AI cannot move SL/TP or close positions from chat without a dedicated confirmation flow.",
+        "AI cannot edit strategy logic or backtest math.",
+        "AI can analyze, diagnose, compare, explain, rerun backtests, and prepare reports.",
+      );
+      answer = polish
+        ? "AI może analizować wyniki, porównywać konfiguracje, diagnozować platformę, tłumaczyć przyciski, sprawdzać kod/ścieżki i pomagać w raportach. Nie może jeszcze samodzielnie handlować, przesuwać SL/TP ani zamykać pozycji z czatu. Tego jeszcze nie ma podpiętego w platformie jako bezpieczny workflow z potwierdzeniem. Do live akcji używaj kart pozycji w Crisis."
+        : "AI can analyze results, compare configs, diagnose the platform, explain buttons, inspect code paths, and help with reports. It cannot place trades, move SL/TP, or close positions from chat yet. That capability is not wired into the platform as a safe confirmation workflow. Use Crisis position cards for live actions.";
+      confidence = "high";
+      suggestedVerification = polish
+        ? ["Do live akcji użyj Crisis -> karta pozycji.", "Do analizy użyj AI -> Send albo Run Research.", "Jeśli chcesz chat-to-pending-action, trzeba dodać osobny workflow potwierdzania."]
+        : ["Use Crisis -> position card for live actions.", "Use AI -> Send or Run Research for analysis.", "A separate confirmation workflow is needed for chat-to-pending-action."];
     } else if (normalized.includes("currently loaded") || normalized.includes("current strategy") || normalized.includes("what strategy") || normalized.includes("jaka strategia") || normalized.includes("zaladowan")) {
       const runtime = await getRuntimeState({ includeAvailability: false, logLimit: 4 });
       const frontend = input.workspaceContext ?? {};
@@ -650,6 +723,22 @@ export function createAiPlatformAccess({
           : `I do not see an obvious candle-budget breach from workspace context: rendered candles ${rendered || "unknown"}. If it still lags, inspect markers/SL/TP/debug overlays and console performance.`;
       confidence = rendered ? "medium" : "low";
       suggestedVerification = ["Open chart diagnostics.", "Turn debug overlays off.", "Jump to a smaller chart window and compare responsiveness."];
+    } else if (normalized.includes("czemu") || normalized.includes("dlaczego") || normalized.includes("why") || normalized.includes("nie dziala") || normalized.includes("nie działa") || normalized.includes("error") || normalized.includes("blad") || normalized.includes("błąd")) {
+      const runtime = await getRuntimeState({ fresh: true, includeAvailability: false, logLimit: 10 });
+      inspected.push("runtime fresh platform state", "backend logs through state store", "backend/src/ai/aiPlatformAccess.js getRuntimeState");
+      evidence.push(
+        `Live positions: ${runtime.live?.positions?.length ?? 0}`,
+        `Live source: ${runtime.live?.source ?? runtime.live?.accountSummary?.source ?? "unknown"}`,
+        `Recent logs: ${runtime.logs?.length ?? 0}`,
+        ...(runtime.logs ?? []).slice(-4).map((log) => `${log.time}: ${log.message}`),
+      );
+      answer = polish
+        ? "Potraktowałem to jako diagnozę platformy, nie pytanie o wynik researchu. Najpierw sprawdź świeżość danych, ostatni błąd backendu i konkretną akcję w panelu, która nie działa. Jeśli chodzi o live-control, najbezpieczniej kliknąć Force Sync i rozwinąć diagnostykę odpowiedzi przy danej karcie pozycji."
+        : "I treated this as platform diagnosis, not a research-result question. First check data freshness, the latest backend error, and the exact panel action that failed. For live control, click Force Sync and expand the action diagnostics on the position card.";
+      confidence = "medium";
+      suggestedVerification = polish
+        ? ["Kliknij Force Sync.", "Sprawdź System/Livestream last sync.", "Rozwiń diagnostykę ostatniej akcji.", "Podaj nazwę przycisku, jeśli chcesz dokładny trace."]
+        : ["Click Force Sync.", "Check System/Livestream last sync.", "Expand last action diagnostics.", "Name the button if you want an exact trace."];
     } else if ((normalized.includes("verify integrity") || normalized.includes("integrity")) && (normalized.includes("rerun exact") || normalized.includes("re run exact") || normalized.includes("re-run exact"))) {
       inspected.push(
         "AiAgentPanel.verifyIntegrity in hubert-platform/frontend/src/components/ControlCenter.jsx",
