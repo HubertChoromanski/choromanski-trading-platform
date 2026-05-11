@@ -3175,6 +3175,8 @@ function CommunicationPanel({ communication, onSave, onTest, setCommunication })
 function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest, runAction, setActivePanel, setStrategyForm }) {
   const [prompt, setPrompt] = useState("Run a 50 combination sweep for SOLUSDT 15m over the last 31 days and rank robust settings.");
   const [chatMessages, setChatMessages] = useState([]);
+  const [followUpText, setFollowUpText] = useState("");
+  const [followUpState, setFollowUpState] = useState({ message: "", state: "idle" });
   const [options, setOptions] = useState({
     allowLongRunningJobs: false,
     includeCodeContext: false,
@@ -3186,8 +3188,31 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
   const [activeRunId, setActiveRunId] = useState("");
   const [manualResult, setManualResult] = useState(null);
   const [queueStatus, setQueueStatus] = useState(null);
+  const [activeResultIndex, setActiveResultIndex] = useState(0);
+  const [collapseAllChat, setCollapseAllChat] = useState(false);
+  const [clearedChatAtByRun, setClearedChatAtByRun] = useState({});
+  const [showRunHistory, setShowRunHistory] = useState(false);
   const activeRun = runs.find((run) => run.id === activeRunId) ?? runs[0] ?? null;
   const running = ["queued", "running"].includes(activeRun?.status);
+  const activeRows = activeRun?.resultSummary?.topRows ?? [];
+  const activeResult = activeRows[Math.min(activeResultIndex, Math.max(activeRows.length - 1, 0))] ?? activeRows[0] ?? null;
+  const visibleChatMessages = useMemo(() => {
+    const persisted = activeRun?.messages ?? [];
+    const local = chatMessages.filter((message) => !activeRun?.id || !message.runId || message.runId === activeRun.id);
+    const seen = new Set();
+    const clearedAt = activeRun?.id ? Date.parse(clearedChatAtByRun[activeRun.id] ?? 0) : 0;
+    return [...persisted, ...local]
+      .filter((message) => !clearedAt || Date.parse(message.time ?? 0) > clearedAt)
+      .filter((message) => {
+        const key = `${message.role}|${message.time}|${message.text}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .sort((left, right) => Date.parse(left.time ?? 0) - Date.parse(right.time ?? 0));
+  }, [activeRun?.id, activeRun?.messages, chatMessages, clearedChatAtByRun]);
+  const olderChatMessages = visibleChatMessages.slice(0, Math.max(0, visibleChatMessages.length - 6));
+  const recentChatMessages = visibleChatMessages.slice(-6);
   const examples = [
     "Find robust SOLUSDT 15m settings for the last 2 years and reject overfit configs.",
     "Run 1000 sweep combinations for SOLUSDT 15m over the last 2 years and give me the 5 best robust settings.",
@@ -3223,6 +3248,28 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
       });
       await loadRuns();
       if (payload.run?.id) setActiveRunId(payload.run.id);
+      setChatMessages((current) => [
+        ...current,
+        {
+          localOnly: true,
+          role: "user",
+          runId: payload.run?.id,
+          text: prompt.trim(),
+          time: new Date().toISOString(),
+        },
+        {
+          evidence: [
+            `Run: ${payload.run?.id ?? "queued"}`,
+            `Requested: ${payload.run?.plan?.requestedCombinations ?? payload.run?.plan?.maxCombinations ?? "n/a"}`,
+            `Range: ${payload.run?.plan?.range?.from ? `${dateText(payload.run.plan.range.from)} to ${dateText(payload.run.plan.range.to)}` : "latest"}`,
+          ],
+          localOnly: true,
+          role: "assistant",
+          runId: payload.run?.id,
+          text: "I started the research job. I will keep this run as the context for follow-up questions.",
+          time: new Date().toISOString(),
+        },
+      ]);
       return payload;
     });
   }
@@ -3277,30 +3324,116 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
     };
   }
 
-  async function askFollowUp(message = prompt, row = null) {
+  function verifiedFromFor(row = activeResult) {
+    if (!row) return null;
+    const canonical = row.canonical ?? {};
+    return {
+      drawdown: canonical.metrics?.maxDrawdown ?? row.metrics?.maxDrawdown ?? row.maxDrawdown ?? null,
+      fillMode: canonical.fillMode ?? row.params?.fillMode ?? activeRun?.plan?.fillMode ?? "legacy",
+      integrityScore: row.integrity?.score ?? null,
+      integrityStatus: row.integrity?.status ?? canonical.status ?? null,
+      integrityWarnings: row.integrity?.warnings ?? [],
+      net: canonical.metrics?.netPnl ?? row.metrics?.netProfit ?? row.netProfit ?? null,
+      provider: canonical.provider ?? row.provenance?.provider ?? activeRun?.plan?.provider ?? "binance-futures",
+      profitFactor: canonical.metrics?.profitFactor ?? row.metrics?.profitFactor ?? row.profitFactor ?? null,
+      rank: row.rank ?? null,
+      range: canonical.range ?? {
+        from: row.provenance?.from ?? activeRun?.plan?.range?.from ?? null,
+        to: row.provenance?.to ?? activeRun?.plan?.range?.to ?? null,
+      },
+      runId: activeRun?.id ?? null,
+      sizingMode: canonical.sizingMode ?? row.params?.sizingMode ?? activeRun?.plan?.sizingMode ?? "position-percent",
+      symbol: canonical.symbol ?? row.symbol ?? activeRun?.plan?.symbol ?? "SOLUSDT",
+      timeframe: canonical.timeframe ?? row.timeframe ?? activeRun?.plan?.timeframe ?? "15m",
+      trades: canonical.metrics?.trades ?? row.metrics?.totalTrades ?? row.totalTrades ?? null,
+      verified: true,
+    };
+  }
+
+  function metricText(value, digits = 2, suffix = "") {
+    if (value === null || value === undefined || value === "") return "--";
+    return `${fmt(value, digits)}${suffix}`;
+  }
+
+  function clearVisibleChat() {
+    if (!activeRun?.id) {
+      setChatMessages([]);
+      return;
+    }
+    const now = new Date().toISOString();
+    setClearedChatAtByRun((current) => ({ ...current, [activeRun.id]: now }));
+    setChatMessages((current) => current.filter((message) => message.runId !== activeRun.id));
+  }
+
+  function startNewChat() {
+    clearVisibleChat();
+    setPrompt("");
+    setFollowUpText("");
+    setCollapseAllChat(false);
+  }
+
+  async function askFollowUp(message = followUpText, row = null) {
     return runAction("ai-agent-follow-up", "Ask copilot", async () => {
       if (!message.trim()) throw new Error("Ask a follow-up first.");
-      const userMessage = { role: "user", text: message.trim(), time: new Date().toISOString() };
+      if (!activeRun?.id) throw new Error("Open an AI run before asking a follow-up.");
+      const runId = activeRun.id;
+      const contextRow = row ?? activeResult;
+      const userMessage = { role: "user", runId, text: message.trim(), time: new Date().toISOString() };
+      setFollowUpState({ message: "Thinking with the active run context...", state: "thinking" });
       setChatMessages((current) => [...current, userMessage]);
-      const payload = await apiRequest("/ai/agent/chat", {
-        body: {
-          message: message.trim(),
-          rowId: row?.id,
-          runId: activeRun?.id,
-        },
-        method: "POST",
-      });
-      setChatMessages((current) => [
-        ...current,
-        {
-          evidence: payload.response?.evidence ?? [],
-          role: "assistant",
-          text: payload.response?.answer ?? "No answer came back.",
-          time: new Date().toISOString(),
-        },
-      ]);
-      await loadRuns();
-      return payload;
+      try {
+        const payload = await apiRequest("/ai/agent/chat", {
+          body: {
+            message: message.trim(),
+            rowId: contextRow?.id,
+            rowIndex: contextRow?.rank ? Number(contextRow.rank) - 1 : undefined,
+            runId,
+          },
+          method: "POST",
+        });
+        if (!payload.ok) {
+          throw new Error(payload.message ?? "The backend did not generate a follow-up response.");
+        }
+        setFollowUpState({ message: "Rendering response...", state: "responding" });
+        setChatMessages((current) => [
+          ...current,
+          {
+            confidence: payload.response?.confidence,
+            critique: payload.response?.critique,
+            evidence: payload.response?.evidence ?? [],
+            risk: payload.response?.risk,
+            role: "assistant",
+            row: payload.response?.row,
+            runId,
+            sections: payload.response?.sections ?? [],
+            text: payload.response?.answer ?? "No answer came back.",
+            time: new Date().toISOString(),
+            verifiedFrom: payload.response?.verifiedFrom,
+          },
+        ]);
+        setFollowUpText("");
+        await loadRuns();
+        setChatMessages((current) => current.filter((item) => item.runId !== runId || item.localOnly));
+        setFollowUpState({ message: "Follow-up answered.", state: "completed" });
+        window.setTimeout(() => setFollowUpState((current) => (
+          current.state === "completed" ? { message: "", state: "idle" } : current
+        )), 1400);
+        return payload;
+      } catch (error) {
+        const messageText = humanError(error);
+        setFollowUpState({ message: messageText, state: "failed" });
+        setChatMessages((current) => [
+          ...current,
+          {
+            evidence: ["The backend did not return a usable follow-up response."],
+            role: "assistant",
+            runId,
+            text: `Follow-up failed: ${messageText}`,
+            time: new Date().toISOString(),
+          },
+        ]);
+        throw error;
+      }
     });
   }
 
@@ -3329,6 +3462,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
         body: { rowId: row?.id },
         method: "POST",
       });
+      setManualResult(payload);
       const rawRange = payload.result?.range ?? (payload.provenance ? {
         from: payload.provenance.from,
         to: payload.provenance.to,
@@ -3360,6 +3494,32 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
     });
   }
 
+  async function verifyIntegrity(row = activeResult) {
+    return runAction("ai-agent-integrity", "Verify integrity", async () => {
+      if (!activeRun?.id) throw new Error("Open an AI run first.");
+      if (!row?.id) throw new Error("Choose a result to verify.");
+      const payload = await apiRequest(`/ai/agent/runs/${encodeURIComponent(activeRun.id)}/verify`, {
+        body: { rowId: row.id },
+        method: "POST",
+      });
+      setManualResult(payload);
+      setChatMessages((current) => [
+        ...current,
+        {
+          evidence: payload.result?.warnings?.length ? payload.result.warnings : ["Integrity check completed."],
+          role: "assistant",
+          runId: activeRun.id,
+          text: payload.result?.passed
+            ? "Integrity check passed. The stored AI row and exact rerun metrics match within the platform tolerance."
+            : "Integrity check found a mismatch or incomplete data. Open Details / Provenance and inspect the metric diff before trusting this row.",
+          time: new Date().toISOString(),
+          verifiedFrom: verifiedFromFor(row),
+        },
+      ]);
+      return payload;
+    });
+  }
+
   async function callManualTool(toolName, input = {}) {
     return runAction(`ai-manual-${toolName}`, toolName, async () => {
       const payload = await apiRequest("/ai/tool", {
@@ -3375,6 +3535,11 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
     loadRuns().catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    setActiveResultIndex(0);
+    setCollapseAllChat(false);
+  }, [activeRun?.id]);
 
   useEffect(() => {
     if (!running || !activeRun?.id) return undefined;
@@ -3395,6 +3560,103 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
     };
   }, [activeRun?.id, apiRequest, running]);
 
+  function renderVerifiedFrom(verifiedFrom, row = null) {
+    if (!verifiedFrom) return null;
+    return (
+      <div className="hubert-ai-verified">
+        <div className="hubert-lab__subhead">
+          <strong>{verifiedFrom.verified ? "Verified from stored metrics" : "Not fully verified"}</strong>
+          <span>{verifiedFrom.runId ? verifiedFrom.runId.slice(-6) : "no run"}</span>
+        </div>
+        <div className="hubert-ai-verified__grid">
+          <span>Run <b>{verifiedFrom.runId ?? "--"}</b></span>
+          <span>Config <b>{verifiedFrom.rank ? `#${verifiedFrom.rank}` : "--"}</b></span>
+          <span>Symbol <b>{verifiedFrom.symbol ?? "--"}</b></span>
+          <span>TF <b>{verifiedFrom.timeframe ?? "--"}</b></span>
+          <span>Range <b>{verifiedFrom.range?.from ? `${dateText(verifiedFrom.range.from)} → ${dateText(verifiedFrom.range.to)}` : "--"}</b></span>
+          <span>Provider <b>{verifiedFrom.provider ?? "--"}</b></span>
+          <span>Sizing <b>{verifiedFrom.sizingMode ?? "--"}</b></span>
+          <span>Fill <b>{verifiedFrom.fillMode ?? "--"}</b></span>
+          <span>Trades <b>{verifiedFrom.trades ?? "--"}</b></span>
+          <span>PF <b>{metricText(verifiedFrom.profitFactor)}</b></span>
+          <span>Net <b>{metricText(verifiedFrom.net, 2, " USDT")}</b></span>
+          <span>DD <b>{metricText(verifiedFrom.drawdown)}</b></span>
+          <span>Integrity <b>{verifiedFrom.integrityScore ?? "--"} · {verifiedFrom.integrityStatus ?? "unknown"}</b></span>
+        </div>
+        {verifiedFrom.integrityWarnings?.length > 0 && (
+          <MiniStatus tone="warn">{verifiedFrom.integrityWarnings.slice(0, 2).join(" · ")}</MiniStatus>
+        )}
+        {row?.params ? (
+          <div className="hubert-lab__actions">
+            <button type="button" onClick={() => verifyIntegrity(row)}>Verify integrity</button>
+            <button type="button" onClick={() => rerunExact(row)}>Re-run exact</button>
+            <button type="button" onClick={() => rerunExact(row, { openPanel: true })}>Open Backtest</button>
+            <button type="button" onClick={() => rerunExact(row)}>Compare with manual backtest</button>
+            <button type="button" onClick={() => rerunExact(row)}>Show metric diff</button>
+          </div>
+        ) : (
+          <MiniStatus tone="warn">I can explain this message, but I cannot re-run it because the exact config row is not attached.</MiniStatus>
+        )}
+      </div>
+    );
+  }
+
+  function renderChatMessage(message, index, total, forcedCollapsed = false) {
+    const isAssistant = message.role === "assistant";
+    const shouldCollapse = forcedCollapsed || collapseAllChat || (isAssistant && index < total - 4);
+    const row = message.row ?? null;
+    const content = (
+      <>
+        <strong>{message.role === "user" ? "You" : "Copilot"}</strong>
+        <span>{message.text}</span>
+        {isAssistant && (message.confidence || message.risk) && (
+          <div className="hubert-ai-badges">
+            {message.confidence && <em data-tone={message.confidence.label}>Confidence {message.confidence.label} · {message.confidence.score ?? "--"}/100</em>}
+            {message.risk && <em data-tone={message.risk.label}>Risk {message.risk.label}</em>}
+          </div>
+        )}
+        {isAssistant && renderVerifiedFrom(message.verifiedFrom, row)}
+        {isAssistant && message.sections?.length > 0 && (
+          <details className="hubert-ai-reasoning">
+            <summary>Details / reasoning</summary>
+            {message.sections.map((section, sectionIndex) => (
+              <section key={`${section.title}-${sectionIndex}`}>
+                <strong>{section.title}</strong>
+                {section.body && <p>{section.body}</p>}
+                {section.bullets?.length > 0 && (
+                  <ul>
+                    {section.bullets.slice(0, 8).map((item, itemIndex) => <li key={`${itemIndex}-${item}`}>{item}</li>)}
+                  </ul>
+                )}
+              </section>
+            ))}
+          </details>
+        )}
+        {message.evidence?.length > 0 && (
+          <details className="hubert-ai-reasoning">
+            <summary>Raw evidence lines</summary>
+            <small>{message.evidence.join(" · ")}</small>
+          </details>
+        )}
+      </>
+    );
+
+    if (shouldCollapse) {
+      return (
+        <details className="hubert-chat-message hubert-chat-message--collapsed" data-role={message.role} key={`${message.time}-${index}`}>
+          <summary>{message.role === "user" ? "You" : "Copilot"} · {String(message.text ?? "").slice(0, 110)}</summary>
+          {content}
+        </details>
+      );
+    }
+
+    return (
+      <div className="hubert-chat-message" data-role={message.role} key={`${message.time}-${index}`}>
+        {content}
+      </div>
+    );
+  }
+
   return (
     <section className="hubert-lab__section">
       <div className="hubert-lab__subhead"><strong>AI Copilot Workspace</strong><span>analysis only</span></div>
@@ -3409,26 +3671,62 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
 
       <div className="hubert-copilot-grid">
         <div>
+          <div className="hubert-lab__actions hubert-chat-toolbar">
+            <button type="button" onClick={() => setCollapseAllChat(true)}>Collapse all</button>
+            <button type="button" onClick={clearVisibleChat}>Clear visible chat</button>
+            <button type="button" onClick={() => setShowRunHistory((value) => !value)}>{showRunHistory ? "Hide run history" : "Open run history"}</button>
+          </div>
           <div className="hubert-chat-log">
-            {chatMessages.length === 0 ? (
+            {visibleChatMessages.length === 0 ? (
               <MiniStatus>Ask a research question, then follow up with “why config #2?” or “would this survive Conservative fill?”.</MiniStatus>
             ) : (
-              chatMessages.slice(-10).map((message, index) => (
-                <div className="hubert-chat-message" data-role={message.role} key={`${message.time}-${index}`}>
-                  <strong>{message.role === "user" ? "You" : "Copilot"}</strong>
-                  <span>{message.text}</span>
-                  {message.evidence?.length > 0 && <small>{message.evidence.join(" · ")}</small>}
-                </div>
-              ))
+              <>
+                {olderChatMessages.length > 0 && (
+                  <details className="hubert-chat-older">
+                    <summary>{olderChatMessages.length} older message{olderChatMessages.length === 1 ? "" : "s"} collapsed</summary>
+                    {olderChatMessages.map((message, index) => renderChatMessage(message, index, olderChatMessages.length, true))}
+                  </details>
+                )}
+                {recentChatMessages.map((message, index) => renderChatMessage(message, index, recentChatMessages.length))}
+              </>
+            )}
+            {["thinking", "responding"].includes(followUpState.state) && (
+              <div className="hubert-chat-message" data-role="assistant">
+                <strong>Copilot</strong>
+                <span>{followUpState.state === "thinking" ? "Thinking..." : "Responding..."}</span>
+                <small>{followUpState.message}</small>
+              </div>
             )}
           </div>
-          <label>
-            <span>Command or follow-up</span>
+          <div className="hubert-chat-composer">
+            <label>
+              <span>Ask about current result</span>
+              <textarea
+                placeholder={activeRun?.id ? "Ask a follow-up, for example: would you trust this live first?" : "Open or run research before asking about a result."}
+                value={followUpText}
+                onChange={(event) => setFollowUpText(event.target.value)}
+              />
+            </label>
+            <div className="hubert-lab__actions">
+              <button type="button" disabled={!activeRun?.id || ["thinking", "responding"].includes(followUpState.state)} onClick={() => askFollowUp(followUpText)}>Ask About Current Result</button>
+              <button type="button" disabled={!activeRun?.id || ["thinking", "responding"].includes(followUpState.state)} onClick={() => askFollowUp("Give me a deep analysis of the current result: strengths, weaknesses, overfit risk, confidence, and exact next tests.", activeResult)}>Deep Analysis</button>
+              <button type="button" onClick={startNewChat}>Start New Chat</button>
+            </div>
+          </div>
+          <details className="hubert-advanced">
+            <summary>Start new research job</summary>
+            <label>
+            <span>New research command</span>
             <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} />
-          </label>
+            </label>
+          </details>
+          {followUpState.state !== "idle" && (
+            <MiniStatus tone={followUpState.state === "failed" ? "bad" : followUpState.state === "completed" ? "good" : "neutral"}>
+              Follow-up: {followUpState.state}. {followUpState.message}
+            </MiniStatus>
+          )}
           <div className="hubert-lab__actions">
             <button type="button" onClick={startRun}>Run Research</button>
-            <button type="button" onClick={() => askFollowUp(prompt)}>Ask Follow-up</button>
             <button type="button" onClick={() => runAction("ai-agent-refresh", "Refresh agent runs", loadRuns)}>Refresh</button>
             {running && <button type="button" onClick={() => cancelRun(activeRun.id)}>Cancel</button>}
             {["interrupted", "stalled", "cancelled", "failed"].includes(activeRun?.status) && (
@@ -3489,12 +3787,17 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
             <Metric label="Cache hits" value={`${activeRun.cacheStats?.hits ?? activeRun.resultSummary?.cacheStats?.hits ?? 0}/${activeRun.cacheStats?.total ?? activeRun.resultSummary?.cacheStats?.total ?? 0}`} />
             <Metric label="Workers" value={`${queueStatus?.activeWorkerCount ?? activeRun.progress?.activeWorkers ?? 0}/${queueStatus?.concurrency ?? "--"}`} />
             <Metric label="Heartbeat" value={activeRun.heartbeatAt ? ageText(activeRun.heartbeatAt) : "--"} />
-            <Metric label="Last index" value={activeRun.progress?.worker?.lastCompletedIndex ?? "--"} />
-            <Metric label="Worker message" value={activeRun.progress?.worker?.lastMessage ?? "--"} />
-            <Metric label="Worker error" value={activeRun.progress?.worker?.lastError || "--"} />
             <Metric label="Intent" value={activeRun.parsedIntent ?? "analysis"} />
             <Metric label="Started" value={dateText(activeRun.startedAt)} />
           </div>
+          <details className="hubert-advanced">
+            <summary>Details / worker diagnostics</summary>
+            <div className="hubert-lab__metrics">
+              <Metric label="Last index" value={activeRun.progress?.worker?.lastCompletedIndex ?? "--"} />
+              <Metric label="Worker message" value={activeRun.progress?.worker?.lastMessage ?? "--"} />
+              <Metric label="Worker error" value={activeRun.progress?.worker?.lastError || "--"} />
+            </div>
+          </details>
           {activeRun.plan?.requestedCombinations !== activeRun.plan?.plannedCombinations && (
             <MiniStatus tone="warn">
               Requested {activeRun.plan?.requestedCombinations}, running {activeRun.plan?.plannedCombinations} after safety planning.
@@ -3511,39 +3814,50 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
             <div className="hubert-agent-result">
               <strong>{activeRun.resultSummary.message}</strong>
               {activeRun.resultSummary.topRows?.length > 0 && (
-                <div className="hubert-result-card-grid">
-                  {activeRun.resultSummary.topRows.slice(0, 5).map((row, index) => (
-                    <article className="hubert-live-card" key={`${row.id ?? row.timeframe ?? index}`}>
-                      <div className="hubert-lab__subhead"><strong>Config #{row.rank ?? index + 1}</strong><span>{row.research?.label ?? row.params?.sizingMode ?? "result"}</span></div>
-                      <div className="hubert-lab__metrics">
-                        <Metric label="Robustness" value={fmt(row.research?.robustnessScore ?? row.score)} />
-                        <Metric label="Net" value={`${fmt(row.metrics?.netProfit ?? row.netProfit)} USDT`} />
-                        <Metric label="PF" value={fmt(row.metrics?.profitFactor ?? row.profitFactor)} />
-                        <Metric label="Trades" value={row.metrics?.totalTrades ?? row.totalTrades ?? 0} />
+                <>
+                  <div className="hubert-ai-result-switcher">
+                    {activeRun.resultSummary.topRows.slice(0, 5).map((row, index) => (
+                      <button data-active={index === activeResultIndex} key={`${row.id ?? index}`} type="button" onClick={() => setActiveResultIndex(index)}>
+                        #{row.rank ?? index + 1}
+                      </button>
+                    ))}
+                  </div>
+                  {activeResult && (
+                    <article className="hubert-live-card">
+                      <div className="hubert-lab__subhead"><strong>Current Result #{activeResult.rank ?? activeResultIndex + 1}</strong><span>{activeResult.research?.label ?? activeResult.params?.sizingMode ?? "result"}</span></div>
+                      <div className="hubert-ai-badges">
+                        {activeResult.research?.overfit?.label && <em data-tone={activeResult.research.overfit.label === "low" ? "low" : activeResult.research.overfit.label}>Overfit {activeResult.research.overfit.label}</em>}
+                        {activeResult.research?.robustnessScore !== undefined && <em data-tone="moderate">Robustness {fmt(activeResult.research.robustnessScore)}</em>}
                       </div>
+                      <div className="hubert-lab__metrics">
+                        <Metric label="Robustness" value={fmt(activeResult.research?.robustnessScore ?? activeResult.score)} />
+                        <Metric label="Net" value={metricText(activeResult.canonical?.metrics?.netPnl ?? activeResult.metrics?.netProfit ?? activeResult.netProfit, 2, " USDT")} />
+                        <Metric label="PF" value={metricText(activeResult.canonical?.metrics?.profitFactor ?? activeResult.metrics?.profitFactor ?? activeResult.profitFactor)} />
+                        <Metric label="Trades" value={activeResult.canonical?.metrics?.trades ?? activeResult.metrics?.totalTrades ?? activeResult.totalTrades ?? 0} />
+                      </div>
+                      {renderVerifiedFrom(verifiedFromFor(activeResult), activeResult)}
                       <MiniStatus>
-                        {row.symbol ?? activeRun.plan?.symbol} · {row.timeframe ?? activeRun.plan?.timeframe} · {row.params ? `BW ${row.params.bandwidth}, NWE ${row.params.envelopeMultiplier}, ATR ${row.params.atrLength}/${row.params.atrMultiplier}` : "exact settings stored"}
-                      </MiniStatus>
-                      <MiniStatus>
-                        {dateText(row.provenance?.from ?? activeRun.plan?.range?.from)} → {dateText(row.provenance?.to ?? activeRun.plan?.range?.to)} · capital {fmt(row.provenance?.startingBalance ?? activeRun.plan?.startingBalance ?? 10000)} USDT · fill {row.params?.fillMode ?? activeRun.plan?.fillMode ?? "legacy"} · sizing {row.params?.sizingMode ?? activeRun.plan?.sizingMode ?? "position-percent"} · executed {activeRun.resultSummary?.executedCombinations ?? "--"} / planned {activeRun.resultSummary?.plannedCombinations ?? activeRun.plan?.plannedCombinations ?? "--"}
+                        {activeResult.params ? `BW ${activeResult.params.bandwidth}, NWE ${activeResult.params.envelopeMultiplier}, ATR ${activeResult.params.atrLength}/${activeResult.params.atrMultiplier}, max failures ${activeResult.params.maxSameSideFailures}` : "exact settings stored"}
                       </MiniStatus>
                       <details className="hubert-advanced">
-                        <summary>Provenance</summary>
-                        <pre className="hubert-ai-json">{JSON.stringify(row.provenance ?? row.params ?? {}, null, 2).slice(0, 5000)}</pre>
+                        <summary>Details / Provenance</summary>
+                        <pre className="hubert-ai-json">{JSON.stringify({ params: activeResult.params, provenance: activeResult.provenance, validation: activeResult.validation, research: activeResult.research }, null, 2).slice(0, 7000)}</pre>
                       </details>
                       <div className="hubert-lab__actions">
-                        <button type="button" onClick={() => rerunExact(row, { openPanel: true })}>Open Backtest</button>
-                        <button type="button" onClick={() => rerunExact(row, { openPanel: true })}>View on Chart</button>
-                        <button type="button" onClick={() => rerunExact(row)}>Re-run exact</button>
+                        <button type="button" onClick={() => rerunExact(activeResult)}>Re-run exact</button>
+                        <button type="button" onClick={() => verifyIntegrity(activeResult)}>Verify integrity</button>
+                        <button type="button" onClick={() => rerunExact(activeResult, { openPanel: true })}>Open Backtest</button>
+                        <button type="button" onClick={() => rerunExact(activeResult)}>Compare with manual backtest</button>
+                        <button type="button" onClick={() => rerunExact(activeResult)}>Show metric diff</button>
                         <button type="button" onClick={() => {
-                          setStrategyForm?.(rowStrategyDraft(row));
+                          setStrategyForm?.(rowStrategyDraft(activeResult));
                           setActivePanel?.("Strategy Decks");
                         }}>Open Strategy Draft</button>
-                        <button type="button" onClick={() => askFollowUp(`Explain config #${row.rank ?? index + 1}`, row)}>Ask about this</button>
+                        <button type="button" onClick={() => askFollowUp(`Explain current result #${activeResult.rank ?? activeResultIndex + 1}.`, activeResult)}>Ask about this</button>
                       </div>
                     </article>
-                  ))}
-                </div>
+                  )}
+                </>
               )}
             </div>
           )}
@@ -3557,19 +3871,23 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
         </article>
       )}
 
-      <div className="hubert-lab__subhead"><strong>Recent runs</strong><span>{runs.length}</span></div>
-      <div className="hubert-list-compact">
-        {runs.slice(0, 8).map((run) => (
-          <article key={run.id}>
-            <strong>{run.parsedIntent ?? "analysis"} · {run.status}</strong>
-            <span>{run.prompt}</span>
-            <div className="hubert-lab__actions">
-              <button type="button" onClick={() => setActiveRunId(run.id)}>Open</button>
-              {["queued", "running"].includes(run.status) && <button type="button" onClick={() => cancelRun(run.id)}>Cancel</button>}
-            </div>
-          </article>
-        ))}
-      </div>
+      {showRunHistory && (
+        <>
+          <div className="hubert-lab__subhead"><strong>Run history</strong><span>{runs.length}</span></div>
+          <div className="hubert-list-compact">
+            {runs.slice(0, 8).map((run) => (
+              <article key={run.id}>
+                <strong>{run.parsedIntent ?? "analysis"} · {run.status}</strong>
+                <span>{run.prompt}</span>
+                <div className="hubert-lab__actions">
+                  <button type="button" onClick={() => setActiveRunId(run.id)}>Open</button>
+                  {["queued", "running"].includes(run.status) && <button type="button" onClick={() => cancelRun(run.id)}>Cancel</button>}
+                </div>
+              </article>
+            ))}
+          </div>
+        </>
+      )}
 
       <details className="hubert-advanced">
         <summary>Manual backend tools</summary>

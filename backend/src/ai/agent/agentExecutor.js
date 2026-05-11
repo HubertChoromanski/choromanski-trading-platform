@@ -1,6 +1,7 @@
 import { createAgentArtifact } from "./agentArtifacts.js";
 import { mergeProgress } from "./agentProgress.js";
 import { composeAgentMarkdown, composeEmailDraft, composeTelegramDraft, rowsToCsv } from "./agentReportComposer.js";
+import { normalizeResearchRows, summarizeIntegrity } from "./agentResultIntegrity.js";
 import { runResearchWorkflow } from "../research/researchEngine.js";
 
 function sleep(ms) {
@@ -280,18 +281,33 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
 
       const latest = runStore.get(runId);
       const status = latest.cancelRequested || output.cancelled ? "cancelled" : "completed";
-      const artifacts = reportArtifacts({ output, plan: latest.plan, run: latest });
+      const rawRows = output.rankedResults ?? output.rows ?? [];
+      const normalizedRows = normalizeResearchRows(rawRows, { output, plan: latest.plan, run: latest });
+      const integrity = summarizeIntegrity(normalizedRows, output);
+      const normalizedOutput = {
+        ...output,
+        best: normalizedRows[0] ?? output.best ?? null,
+        integrity,
+        rankedResults: output.rankedResults ? normalizedRows : undefined,
+        rows: output.rows && !output.rankedResults ? normalizedRows : normalizedRows,
+        warnings: [
+          ...(output.warnings ?? []),
+          ...integrity.warnings.map((warning) => `Integrity: ${warning}`),
+        ],
+      };
+      const artifacts = reportArtifacts({ output: normalizedOutput, plan: latest.plan, run: latest });
       const resultSummary = {
-        best: output.best ?? output.rankedResults?.[0] ?? output.rows?.[0] ?? null,
-        cacheStats: output.cacheStats ?? latest.cacheStats ?? {},
-        executedCombinations: output.processedCombinations ?? output.testedCombinations ?? output.totalCombinations ?? latest.progress?.completed ?? 0,
-        failedCombinations: output.failedCombinationsCount ?? 0,
-        generatedCombinations: output.generatedCombinations,
-        message: output.summary,
+        best: normalizedRows[0] ?? null,
+        cacheStats: normalizedOutput.cacheStats ?? latest.cacheStats ?? {},
+        executedCombinations: normalizedOutput.processedCombinations ?? normalizedOutput.testedCombinations ?? normalizedOutput.totalCombinations ?? latest.progress?.completed ?? 0,
+        failedCombinations: normalizedOutput.failedCombinationsCount ?? 0,
+        generatedCombinations: normalizedOutput.generatedCombinations,
+        integrity,
+        message: normalizedOutput.summary,
         plannedCombinations: latest.plan?.plannedCombinations ?? latest.plan?.maxCombinations,
         requestedCombinations: latest.plan?.requestedCombinations ?? latest.plan?.maxCombinations,
         requestedRange: latest.plan?.range,
-        topRows: (output.rankedResults ?? output.rows ?? []).slice(0, 10),
+        topRows: normalizedRows.slice(0, 10),
       };
 
       return runStore.update(runId, {
@@ -301,7 +317,7 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
         progress: { ...latest.progress, percent: status === "cancelled" ? latest.progress?.percent ?? 0 : 100 },
         resultSummary,
         status,
-        warnings: [...(latest.warnings ?? []), ...(output.warnings ?? [])],
+        warnings: [...(latest.warnings ?? []), ...(normalizedOutput.warnings ?? [])],
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

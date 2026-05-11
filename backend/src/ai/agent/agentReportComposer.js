@@ -1,10 +1,17 @@
+import { buildRunReasoningSummary } from "../reasoning/reasoningEngine.js";
+
 function number(value, digits = 2) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed.toFixed(digits) : "n/a";
 }
 
 function metricValue(row, key) {
-  return row?.metrics?.[key] ?? row?.[key] ?? "";
+  if (key === "netProfit") return row?.canonical?.metrics?.netPnl ?? row?.metrics?.netProfit ?? row?.netProfit ?? "";
+  if (key === "totalTrades") return row?.canonical?.metrics?.trades ?? row?.metrics?.totalTrades ?? row?.totalTrades ?? "";
+  if (key === "maxDrawdown") return row?.canonical?.metrics?.maxDrawdown ?? row?.metrics?.maxDrawdown ?? row?.maxDrawdown ?? "";
+  if (key === "profitFactor") return row?.canonical?.metrics?.profitFactor ?? row?.metrics?.profitFactor ?? row?.profitFactor ?? "";
+  if (key === "winRate") return row?.canonical?.metrics?.winRate ?? row?.metrics?.winRate ?? row?.winRate ?? "";
+  return row?.metrics?.[key] ?? row?.canonical?.metrics?.[key] ?? row?.[key] ?? "";
 }
 
 export function rowsToCsv(rows = []) {
@@ -33,6 +40,11 @@ export function rowsToCsv(rows = []) {
     timeframe: row.timeframe,
     totalTrades: metricValue(row, "totalTrades"),
     winRate: metricValue(row, "winRate"),
+    integrityScore: row.integrity?.score,
+    integrityStatus: row.integrity?.status,
+    integrityWarnings: (row.integrity?.warnings ?? []).join("; "),
+    canonicalConfigId: row.canonical?.configId,
+    canonicalRunId: row.canonical?.runId,
   }));
   const headers = [...new Set(flatRows.flatMap((row) => Object.keys(row)))];
   const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
@@ -47,11 +59,18 @@ export function composeAgentMarkdown({ output = {}, plan = {}, run = {} }) {
   const topRows = output.rankedResults ?? output.rows ?? [];
   const best = topRows[0] ?? output.best ?? null;
   const narrative = output.narrative;
+  const reasoning = buildRunReasoningSummary({ run: { ...run, plan }, rows: topRows });
+  const topReasoningSections = reasoning.sections ?? [];
+  const evidenceSection = topReasoningSections.find((section) => section.title === "Evidence Used");
+  const concernSection = topReasoningSections.find((section) => section.title === "What Worries Me")
+    ?? topReasoningSections.find((section) => section.title === "Uncertainty");
+  const combinationsTested = output.processedCombinations ?? output.testedCombinations ?? output.totalCombinations ?? output.resultSummary?.executedCombinations ?? 0;
+  const integrity = output.integrity ?? {};
   const lines = [
     `# AI Agent Report`,
     "",
     "## Executive Summary",
-    narrative?.executiveSummary ?? output.summary ?? (best
+    reasoning.headline ?? narrative?.executiveSummary ?? output.summary ?? (best
       ? `Best visible result is rank ${best.rank ?? 1} with score ${number(best.score)}.`
       : "The agent completed the requested analysis."),
     "",
@@ -65,9 +84,14 @@ export function composeAgentMarkdown({ output = {}, plan = {}, run = {} }) {
     `- Fill mode: ${plan.fillMode ?? "legacy"}`,
     "",
     "## Data Used",
-    `- Combinations tested: ${output.totalCombinations ?? output.testedCombinations ?? 0}`,
+    `- Combinations tested: ${combinationsTested}`,
     `- Candles used: ${output.candlesUsed ?? output.best?.candlesUsed ?? "varies by test"}`,
     `- Backend tools: ${(output.toolsUsed ?? []).join(", ") || "existing platform tools"}`,
+    `- Integrity score: ${integrity.score ?? "not evaluated"}`,
+    `- Complete rows: ${integrity.completeRows ?? "n/a"}`,
+    "",
+    "## Integrity Warnings",
+    ...(integrity.warnings?.length ? integrity.warnings.map((warning) => `- ${warning}`) : ["- No report integrity warning was produced."]),
     "",
     "## Top Configurations",
   ];
@@ -87,11 +111,28 @@ export function composeAgentMarkdown({ output = {}, plan = {}, run = {} }) {
 
   lines.push(
     "",
+    "## Key Evidence",
+    ...(evidenceSection?.bullets?.length
+      ? evidenceSection.bullets.map((item) => `- ${item}`)
+      : ["- No compact evidence block was available for the top row."]),
+    "",
+    "## Why Top Configs Won",
+    ...(topRows.slice(0, 5).map((row) => {
+      const label = row.research?.label ?? "research candidate";
+      const overfit = row.research?.overfit?.label ?? "not evaluated";
+      return `- Rank ${row.rank ?? "?"}: ${label}. It scored ${number(row.research?.robustnessScore ?? row.score)} with net ${number(metricValue(row, "netProfit"))}, PF ${number(metricValue(row, "profitFactor"))}, drawdown ${number(metricValue(row, "maxDrawdown"))}, ${metricValue(row, "totalTrades") ?? 0} trades, and ${overfit} overfit risk.`;
+    })),
+    "",
     "## Methodology",
     ...(narrative?.methodology?.length ? narrative.methodology.map((item) => `- ${item}`) : ["- Used existing platform tools without changing strategy or backtest math."]),
     "",
     "## Robustness",
     output.robustnessNotes ?? narrative?.productionViability ?? "Treat the ranking as a research result. Re-test nearby settings across neighboring periods before deployment.",
+    "",
+    "## Weaknesses and Risks",
+    ...(concernSection?.bullets?.length
+      ? concernSection.bullets.map((item) => `- ${item}`)
+      : (reasoning.risks ?? ["Sample size and validation coverage should be checked."]).map((item) => `- ${item}`)),
     "",
     "## Overfit Risk",
     ...(topRows.slice(0, 5).map((row) => `- Rank ${row.rank ?? "?"}: ${row.research?.overfit?.label ?? "not evaluated"} risk. ${(row.research?.overfit?.explanation ?? []).join(" ")}`)),
@@ -103,6 +144,16 @@ export function composeAgentMarkdown({ output = {}, plan = {}, run = {} }) {
     `- Production: ${narrative?.recommendedConfigurations?.production ?? "No production candidate"}`,
     `- Stable: ${narrative?.recommendedConfigurations?.stable ?? "No stable candidate"}`,
     `- Aggressive: ${narrative?.recommendedConfigurations?.aggressive ?? "No aggressive candidate"}`,
+    "",
+    "## Confidence Level",
+    `- ${reasoning.confidence?.label ?? "unknown"} (${reasoning.confidence?.score ?? "n/a"}/100).`,
+    ...(reasoning.confidence?.reasons?.length ? reasoning.confidence.reasons.map((item) => `- ${item}`) : ["- Confidence details were not available."]),
+    "",
+    "## What Could Invalidate This",
+    "- A materially worse Conservative fill result.",
+    "- Performance concentrated in one small historical period.",
+    "- Neighboring parameters or timeframes collapsing.",
+    "- Manual exact rerun metrics not matching the agent row provenance.",
     "",
     "## Risks",
     ...(output.warnings?.length ? output.warnings.map((warning) => `- ${warning}`) : ["- Sample size and data freshness can change conclusions.", "- AI analysis cannot place trades and does not modify live execution."]),

@@ -4,6 +4,9 @@ import { createAgentPlan } from "./agentPlanner.js";
 import { createAgentRunStore } from "./agentRunStore.js";
 import { checkAgentPlanSafety } from "./agentRiskGuard.js";
 import { createAgentToolRegistry } from "./agentToolRegistry.js";
+import { composeAgentMarkdown, rowsToCsv } from "./agentReportComposer.js";
+import { metricDiff as diffMetrics, normalizeResearchResult, summarizeIntegrity } from "./agentResultIntegrity.js";
+import { buildReasoningResponse } from "../reasoning/reasoningEngine.js";
 
 export function createAgentOrchestrator({ store, tools }) {
   const runStore = createAgentRunStore({ store });
@@ -102,6 +105,62 @@ export function createAgentOrchestrator({ store, tools }) {
     }
 
     const format = body.format === "csv" ? "csv" : body.format === "json" ? "json" : "md";
+    const rows = (run.resultSummary?.topRows ?? []).map((row, index) => normalizeResearchResult(row, {
+      index,
+      output: run.resultSummary,
+      plan: run.plan,
+      run,
+    }));
+    const exportIntegrity = run.resultSummary?.integrity ?? summarizeIntegrity(rows, run.resultSummary ?? {});
+    if (rows.length || run.resultSummary) {
+      if (format === "csv") {
+        return {
+          content: rowsToCsv(rows),
+          fileName: "agent-ranking.csv",
+          format,
+          mime: "text/csv",
+          ok: true,
+        };
+      }
+      if (format === "json") {
+        return {
+          content: JSON.stringify({
+            integrity: exportIntegrity,
+            plan: run.plan,
+            resultSummary: {
+              ...run.resultSummary,
+              best: rows[0] ?? run.resultSummary?.best ?? null,
+              integrity: exportIntegrity,
+              topRows: rows,
+            },
+            runId: run.id,
+          }, null, 2),
+          fileName: "agent-result.json",
+          format,
+          mime: "application/json",
+          ok: true,
+        };
+      }
+      return {
+        content: composeAgentMarkdown({
+          output: {
+            ...run.resultSummary,
+            integrity: exportIntegrity,
+            processedCombinations: run.resultSummary?.executedCombinations,
+            rankedResults: rows,
+            summary: run.resultSummary?.message,
+            testedCombinations: run.resultSummary?.executedCombinations,
+            totalCombinations: run.resultSummary?.plannedCombinations,
+          },
+          plan: run.plan,
+          run,
+        }),
+        fileName: "agent-report.md",
+        format,
+        mime: "text/markdown",
+        ok: true,
+      };
+    }
     const artifact =
       (run.artifacts ?? []).find((item) => item.id === body.artifactId) ??
       (run.artifacts ?? []).find((item) => item.format === format) ??
@@ -142,6 +201,9 @@ export function createAgentOrchestrator({ store, tools }) {
     if (!row) return null;
     return {
       id: row.id,
+      canonical: row.canonical,
+      dataCompleteness: row.dataCompleteness,
+      integrity: row.integrity,
       metrics: row.metrics,
       params: row.params,
       provenance: row.provenance,
@@ -150,6 +212,36 @@ export function createAgentOrchestrator({ store, tools }) {
       score: row.score,
       symbol: row.symbol,
       timeframe: row.timeframe,
+    };
+  }
+
+  function verifiedFrom(run, row) {
+    if (!row) {
+      return {
+        missing: ["No ranked config row was selected for this answer."],
+        runId: run?.id ?? null,
+        verified: false,
+      };
+    }
+
+    const normalized = row.canonical ? row : normalizeResearchResult(row, { run, plan: run?.plan });
+    return {
+      drawdown: normalized.canonical?.metrics?.maxDrawdown ?? null,
+      fillMode: normalized.canonical?.fillMode ?? "legacy",
+      integrityScore: normalized.integrity?.score ?? null,
+      integrityStatus: normalized.integrity?.status ?? "unknown",
+      integrityWarnings: normalized.integrity?.warnings ?? [],
+      net: normalized.canonical?.metrics?.netPnl ?? null,
+      provider: normalized.canonical?.provider ?? "binance-futures",
+      rank: normalized.rank ?? null,
+      range: normalized.canonical?.range ?? { from: null, to: null },
+      runId: run?.id ?? null,
+      sizingMode: normalized.canonical?.sizingMode ?? "position-percent",
+      symbol: normalized.canonical?.symbol ?? "SOLUSDT",
+      timeframe: normalized.canonical?.timeframe ?? null,
+      trades: normalized.canonical?.metrics?.trades ?? null,
+      profitFactor: normalized.canonical?.metrics?.profitFactor ?? null,
+      verified: true,
     };
   }
 
@@ -179,26 +271,55 @@ export function createAgentOrchestrator({ store, tools }) {
       sizingMode,
       timeframe: body.timeframe ?? row.timeframe ?? run.plan.timeframe,
     });
+    const normalizedAiRow = normalizeResearchResult(row, { run, plan: run.plan });
+    const normalizedRerunRow = normalizeResearchResult({
+      candlesUsed: result.candlesUsed,
+      fillMode: result.fillMode,
+      metrics: result.metrics ?? {},
+      params: row.params,
+      provenance: result.provenance,
+      rank: row.rank,
+      symbol: result.symbol,
+      timeframe: result.timeframe,
+    }, { run, plan: run.plan });
     const metricDiff = {
-      aiNetProfit: row.metrics?.netProfit ?? row.netProfit ?? null,
-      aiProfitFactor: row.metrics?.profitFactor ?? row.profitFactor ?? null,
-      aiTrades: row.metrics?.totalTrades ?? row.totalTrades ?? null,
-      rerunNetProfit: result.metrics?.netProfit ?? null,
-      rerunProfitFactor: result.metrics?.profitFactor ?? null,
-      rerunTrades: result.metrics?.totalTrades ?? null,
+      ...diffMetrics(normalizedAiRow, normalizedRerunRow),
+      aiNetProfit: normalizedAiRow.canonical.metrics.netPnl,
+      aiProfitFactor: normalizedAiRow.canonical.metrics.profitFactor,
+      aiTrades: normalizedAiRow.canonical.metrics.trades,
+      rerunNetProfit: normalizedRerunRow.canonical.metrics.netPnl,
+      rerunProfitFactor: normalizedRerunRow.canonical.metrics.profitFactor,
+      rerunTrades: normalizedRerunRow.canonical.metrics.trades,
       sameCandles: Number(row.candlesUsed ?? 0) === Number(result.candlesUsed ?? 0),
       sameFillMode: (row.params?.fillMode ?? run.plan.fillMode ?? "legacy") === (result.fillMode ?? "legacy"),
       sameSizingMode: (row.params?.sizingMode ?? run.plan.sizingMode ?? "position-percent") === (result.provenance?.sizingMode ?? run.plan.sizingMode ?? "position-percent"),
     };
+    const diffValues = Object.values(metricDiff).filter((item) => item && typeof item === "object" && "match" in item);
+    const parityPassed = diffValues.length > 0 && diffValues.every((item) => item.match) && metricDiff.sameCandles && metricDiff.sameFillMode && metricDiff.sameSizingMode;
+    const integrityPassed = parityPassed && normalizedAiRow.canonical.status === "complete" && normalizedRerunRow.canonical.status === "complete";
+    const integrityWarnings = [
+      ...(parityPassed ? [] : ["AI result and exact rerun are not fully identical."]),
+      ...(normalizedAiRow.integrity?.warnings ?? []).map((warning) => `AI row: ${warning}`),
+      ...(normalizedRerunRow.integrity?.warnings ?? []).map((warning) => `Rerun: ${warning}`),
+    ];
 
     return {
       cacheHit: Boolean(result.cacheHit),
       exactConfig: row.params,
+      integrity: {
+        ai: normalizedAiRow.integrity,
+        metricDiff,
+        passed: integrityPassed,
+        parityPassed,
+        rerun: normalizedRerunRow.integrity,
+        warnings: [...new Set(integrityWarnings)],
+      },
       metricDiff,
       ok: true,
       provenance: result.provenance,
       result,
-      row,
+      row: normalizedAiRow,
+      rerunRow: normalizedRerunRow,
     };
   }
 
@@ -221,40 +342,60 @@ export function createAgentOrchestrator({ store, tools }) {
     const rows = rowsForRun(run);
     const configMatch = message.match(/config\s*#?\s*(\d+)/i);
     const rowIndex = configMatch ? Math.max(0, Number(configMatch[1]) - 1) : 0;
-    const row = rows[rowIndex] ?? rows[0];
-    const lower = message.toLowerCase();
+    const explicitRow = body.rowId || body.rowIndex !== undefined || body.configIndex !== undefined
+      ? resolveRow(run, body)
+      : null;
+    const row = explicitRow ?? rows[rowIndex] ?? rows[0];
+    const normalizedRows = rows.map((item, index) => normalizeResearchResult(item, {
+      index,
+      output: run.resultSummary ?? {},
+      plan: run.plan,
+      run,
+    }));
+    const normalizedRow = row
+      ? normalizeResearchResult(row, {
+        index: rowIndex,
+        output: run.resultSummary ?? {},
+        plan: run.plan,
+        run,
+      })
+      : null;
+    const reasoning = buildReasoningResponse({ question: message, row: normalizedRow, rows: normalizedRows, run });
     const evidence = [
       `Run: ${run.id}`,
       `Intent: ${run.parsedIntent}`,
       `Range: ${run.plan?.range?.from} to ${run.plan?.range?.to}`,
       `Provider: ${run.plan?.provider}`,
-      row ? `Selected row: rank ${row.rank ?? rowIndex + 1}` : "No ranked row available.",
+      normalizedRow ? `Selected row: rank ${normalizedRow.rank ?? rowIndex + 1}` : "No ranked row available.",
+      ...(reasoning.evidence ?? []),
     ];
-    let answer = run.resultSummary?.message ?? "This run completed, but no compact summary is available.";
-
-    if (lower.includes("why") && row) {
-      answer = `Config #${row.rank ?? rowIndex + 1} ranked where it did because its robustness score balances net profit, drawdown, trade count, profit factor, and validation penalties. Label: ${row.research?.label ?? "not research-scored"}.`;
-    }
-    if ((lower.includes("conservative") || lower.includes("fill")) && row) {
-      answer = row.validation?.fillSensitivity
-        ? `Legacy net was ${row.validation.fillSensitivity.legacyNet}; Conservative net was ${row.validation.fillSensitivity.conservativeNet}. Sensitivity label: ${row.validation.fillSensitivity.label}.`
-        : "This run does not include fill-mode validation for that row. Ask me to compare Legacy vs Conservative to validate it.";
-    }
-    if (lower.includes("overfit") && row) {
-      answer = row.research?.overfit
-        ? `Overfit risk is ${row.research.overfit.label}. ${row.research.overfit.explanation.join(" ")}`
-        : "This row does not include overfit diagnostics. Run a research prompt to add overfit checks.";
-    }
-    if (lower.includes("weak month") || lower.includes("weak period")) {
-      answer = run.resultSummary?.best?.validation?.periods?.length
-        ? `Weakest periods are visible in the research artifact. Use Export Markdown for the full period notes.`
-        : "This run did not store period validation in the compact card. Run a research prompt with period validation.";
-    }
+    const answer = reasoning.answer ?? run.resultSummary?.message ?? "This run completed, but no compact summary is available.";
+    const responseRow = compactRow(reasoning.row ?? normalizedRow);
+    const responseVerifiedFrom = verifiedFrom(run, reasoning.row ?? normalizedRow);
 
     const nextMessages = [
       ...(run.messages ?? []),
-      { role: "user", text: message, time: new Date().toISOString() },
-      { role: "assistant", text: answer, time: new Date().toISOString() },
+      {
+        context: {
+          rowId: row?.id ?? null,
+          rowRank: normalizedRow?.rank ?? null,
+        },
+        role: "user",
+        text: message,
+        time: new Date().toISOString(),
+      },
+      {
+        evidence,
+        confidence: reasoning.confidence,
+        critique: reasoning.critique,
+        risk: reasoning.risk,
+        role: "assistant",
+        sections: reasoning.sections,
+        text: answer,
+        time: new Date().toISOString(),
+        row: responseRow,
+        verifiedFrom: responseVerifiedFrom,
+      },
     ].slice(-40);
     await runStore.update(run.id, { messages: nextMessages });
 
@@ -262,10 +403,52 @@ export function createAgentOrchestrator({ store, tools }) {
       ok: true,
       response: {
         answer,
+        confidence: reasoning.confidence,
+        critique: reasoning.critique,
         evidence,
-        nextAction: "Use Re-run exact config if you want a manual backtest check against this AI row.",
-        row: compactRow(row),
+        intent: reasoning.intent,
+        nextAction: reasoning.nextAction ?? "Use Re-run exact config if you want a manual backtest check against this AI row.",
+        recommendation: reasoning.recommendation,
+        risk: reasoning.risk,
+        row: responseRow,
         runId: run.id,
+        sections: reasoning.sections,
+        verifiedFrom: responseVerifiedFrom,
+      },
+    };
+  }
+
+  async function verifyIntegrity(id, body = {}) {
+    const run = runStore.get(id);
+    if (!run) {
+      return { ok: false, message: "That agent run was not found.", statusCode: 404 };
+    }
+    const row = resolveRow(run, body);
+    if (!row?.params) {
+      return {
+        ok: false,
+        message: "This run does not include an exact config row to verify.",
+        statusCode: 400,
+      };
+    }
+
+    const rerun = await rerunExact(id, { ...body, rowId: row.id });
+    if (!rerun.ok) return rerun;
+
+    return {
+      ok: true,
+      result: {
+        ai: {
+          canonical: rerun.row?.canonical,
+          integrity: rerun.integrity?.ai,
+        },
+        diff: rerun.metricDiff,
+        passed: Boolean(rerun.integrity?.passed),
+        rerun: {
+          canonical: rerun.rerunRow?.canonical,
+          integrity: rerun.integrity?.rerun,
+        },
+        warnings: rerun.integrity?.warnings ?? [],
       },
     };
   }
@@ -328,5 +511,6 @@ export function createAgentOrchestrator({ store, tools }) {
     rerunExact,
     restartRun,
     startRun,
+    verifyIntegrity,
   };
 }

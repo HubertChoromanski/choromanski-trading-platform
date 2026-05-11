@@ -1,23 +1,34 @@
+import { normalizeResearchResult } from "./agentResultIntegrity.js";
+
 const RUN_LIMIT = 80;
 
-function publicRow(row) {
+function publicRow(row, run, index = 0) {
   if (!row) return row;
+  const normalized = row.canonical ? row : normalizeResearchResult(row, {
+    index,
+    output: run?.resultSummary ?? {},
+    plan: run?.plan ?? {},
+    run,
+  });
   return {
-    candlesUsed: row.candlesUsed,
-    fillMode: row.fillMode,
-    id: row.id,
-    metrics: row.metrics,
-    netProfit: row.netProfit,
-    params: row.params,
-    provenance: row.provenance,
-    rank: row.rank,
-    research: row.research,
-    score: row.score,
-    settings: row.settings,
-    symbol: row.symbol,
-    timeframe: row.timeframe,
-    totalTrades: row.totalTrades,
-    winRate: row.winRate,
+    candlesUsed: normalized.candlesUsed,
+    canonical: normalized.canonical,
+    dataCompleteness: normalized.dataCompleteness,
+    fillMode: normalized.fillMode,
+    id: normalized.id,
+    integrity: normalized.integrity,
+    metrics: normalized.metrics,
+    netProfit: normalized.netProfit,
+    params: normalized.params,
+    provenance: normalized.provenance,
+    rank: normalized.rank,
+    research: normalized.research,
+    score: normalized.score,
+    settings: normalized.settings,
+    symbol: normalized.symbol,
+    timeframe: normalized.timeframe,
+    totalTrades: normalized.totalTrades,
+    winRate: normalized.winRate,
   };
 }
 
@@ -25,8 +36,8 @@ function publicRun(run, persistenceWarning = "") {
   if (!run) return null;
   const resultSummary = run.resultSummary ? {
     ...run.resultSummary,
-    best: publicRow(run.resultSummary.best),
-    topRows: (run.resultSummary.topRows ?? []).map(publicRow),
+    best: publicRow(run.resultSummary.best, run, 0),
+    topRows: (run.resultSummary.topRows ?? []).map((row, index) => publicRow(row, run, index)),
   } : null;
   return {
     artifacts: (run.artifacts ?? []).map(({ content, ...artifact }) => artifact),
@@ -36,7 +47,7 @@ function publicRun(run, persistenceWarning = "") {
     id: run.id,
     messages: run.messages ?? [],
     parsedIntent: run.parsedIntent,
-    partialResults: (run.partialResults ?? []).map(publicRow),
+    partialResults: (run.partialResults ?? []).map((row, index) => publicRow(row, run, index)),
     plan: run.plan,
     progress: run.progress,
     prompt: run.prompt,

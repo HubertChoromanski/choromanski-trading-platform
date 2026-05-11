@@ -1476,6 +1476,13 @@ const server = http.createServer(async (request, response) => {
 	        return;
 	      }
 
+	      if (request.method === "POST" && parts.length === 5 && parts[4] === "verify") {
+	        const body = await readBody(request);
+	        const result = await aiAgent.verifyIntegrity(runId, body);
+	        sendJson(response, result.statusCode ?? 200, result);
+	        return;
+	      }
+
 	      if (request.method === "POST" && parts.length === 5 && parts[4] === "restart") {
 	        const result = await aiAgent.restartRun(runId);
 	        sendJson(response, result.statusCode ?? 200, result);
