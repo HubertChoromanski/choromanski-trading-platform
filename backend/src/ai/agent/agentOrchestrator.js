@@ -8,6 +8,14 @@ import { composeAgentMarkdown, rowsToCsv } from "./agentReportComposer.js";
 import { metricDiff as diffMetrics, normalizeResearchResult, summarizeIntegrity } from "./agentResultIntegrity.js";
 import { buildReasoningResponse } from "../reasoning/reasoningEngine.js";
 
+function isPolishQuestion(value = "") {
+  const normalized = String(value)
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase();
+  return /(^|\s)(co|czemu|dlaczego|jak|gdzie|porownaj|wynik|dziala|nadal|robi|robia|ustawienia|blad|gorszy|lepszy)(\s|$)/u.test(normalized);
+}
+
 export function createAgentOrchestrator({ store, tools }) {
   const runStore = createAgentRunStore({ store });
   const toolRegistry = createAgentToolRegistry({ tools });
@@ -218,6 +226,7 @@ export function createAgentOrchestrator({ store, tools }) {
   function extractBaselineName(message = "") {
     const source = String(message);
     const patterns = [
+      /\b(?:compare|porownaj|porównaj)\b.*?\b(?:with|to|z|do)\s+["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,
       /\b(?:compare|porownaj|porównaj)\s+(?:config\s*#?\s*\d+\s+)?(?:with|to|z|do)\s+["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,
       /\b(?:worse|better|gorszy|gorsze|lepszy|lepsze)\s+(?:than|niz|niż)\s+["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,
       /\b(?:baseline|baz[ae]|punkt odniesienia)\s*[:=]?\s*["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,
@@ -605,8 +614,30 @@ export function createAgentOrchestrator({ store, tools }) {
       ] : baselineComparison ? [`Baseline comparison failed: ${baselineComparison.message}`] : []),
       ...(reasoning.evidence ?? []),
     ];
+    const polish = isPolishQuestion(message);
     const answer = baselineComparison?.ok
-      ? `${baselineComparison.explanation} ${reasoning.answer ?? ""}`.trim()
+      ? polish
+        ? [
+            `Porównałem wybrany wynik AI z zapisanym backtestem „${baselineComparison.baseline?.name}”.`,
+            `AI: net ${baselineComparison.metricDiff?.netProfit?.ai ?? "n/a"}, PF ${baselineComparison.metricDiff?.profitFactor?.ai ?? "n/a"}, trades ${baselineComparison.metricDiff?.trades?.ai ?? "n/a"}.`,
+            `Hubert: net ${baselineComparison.metricDiff?.netProfit?.saved ?? "n/a"}, PF ${baselineComparison.metricDiff?.profitFactor?.saved ?? "n/a"}, trades ${baselineComparison.metricDiff?.trades?.saved ?? "n/a"}.`,
+            baselineComparison.parity?.allContextMatch
+              ? "Kontekst testu wygląda zgodnie, więc metryki można porównać bezpośrednio."
+              : "Kontekst nie jest identyczny, więc nie wolno traktować różnicy metryk jako czystej przewagi jednej konfiguracji.",
+            (() => {
+              const different = Object.entries(baselineComparison.contextDiff ?? {})
+                .filter(([, value]) => value && value.match === false)
+                .map(([key]) => key)
+                .slice(0, 8);
+              return different.length ? `Różnice kontekstu: ${different.join(", ")}.` : "";
+            })(),
+            Number(baselineComparison.metricDiff?.netProfit?.ai ?? 0) < Number(baselineComparison.metricDiff?.netProfit?.saved ?? 0)
+              ? "Wynik AI jest słabszy od hubert pod względem net PnL i musi to jasno przyznać."
+              : "Wynik AI ma wyższy net PnL niż hubert w zapisanych metrykach, ale nadal trzeba sprawdzić zgodność kontekstu.",
+            `PF: AI ${baselineComparison.metricDiff?.profitFactor?.ai ?? "n/a"} vs hubert ${baselineComparison.metricDiff?.profitFactor?.saved ?? "n/a"}.`,
+            baselineComparison.parity?.warnings?.length ? `Ostrzeżenia: ${baselineComparison.parity.warnings.join(" ")}` : "",
+          ].join(" ")
+        : `${baselineComparison.explanation} ${reasoning.answer ?? ""}`.trim()
       : reasoning.answer ?? run.resultSummary?.message ?? "This run completed, but no compact summary is available.";
     const responseRow = compactRow(reasoning.row ?? normalizedRow);
     const responseVerifiedFrom = verifiedFrom(run, reasoning.row ?? normalizedRow);

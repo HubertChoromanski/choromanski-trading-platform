@@ -72,6 +72,17 @@ function normalizeExchangeList(value) {
   return value ? [value] : [];
 }
 
+function parseBingxJson(text) {
+  if (!text) return {};
+
+  const safeText = text.replace(
+    /"(orderId|orderID|positionId|positionID|triggerOrderId|mainOrderId)"\s*:\s*(\d{15,})/gu,
+    '"$1":"$2"',
+  );
+
+  return JSON.parse(safeText);
+}
+
 function normalizeResponse(payload) {
   if (payload?.code !== undefined && Number(payload.code) !== 0) {
     const error = new Error(payload.msg || payload.message || "BingX API error");
@@ -227,9 +238,8 @@ export function createBingxClient({
     async placePositionStopLoss(symbol, side, stopPrice, options = {}) {
       const positionSide = normalizePositionSide(options.positionSide) ?? entrySideToPositionSide(side);
       const payload = {
-        closePosition: true,
+        closePosition: "true",
         positionSide,
-        quantity: options.quantity ?? positionQuantity(options.position),
         side: positionSide ? closeSideForPositionSide(positionSide) : oppositeOrderSide(side),
         stopPrice,
         symbol: normalizeSymbol(symbol),
@@ -248,9 +258,8 @@ export function createBingxClient({
     async placePositionTakeProfit(symbol, side, stopPrice, options = {}) {
       const positionSide = normalizePositionSide(options.positionSide) ?? entrySideToPositionSide(side);
       const payload = {
-        closePosition: true,
+        closePosition: "true",
         positionSide,
-        quantity: options.quantity ?? positionQuantity(options.position),
         side: positionSide ? closeSideForPositionSide(positionSide) : oppositeOrderSide(side),
         stopPrice,
         symbol: normalizeSymbol(symbol),
@@ -351,6 +360,17 @@ export function createBingxClient({
       });
     },
 
+    async getProtectiveOrders(symbol) {
+      const result = await client.getOpenOrders(symbol);
+      return withDiagnostics(result, {
+        endpoint: "/openApi/swap/v2/trade/openOrders",
+        method: "GET",
+        note: "BingX normal USD-M futures exposes STOP_MARKET/TAKE_PROFIT_MARKET/TRIGGER_* protection through openOrders; copyTrading setTPSL is not used for regular positions.",
+        payload: { symbol: symbol ? normalizeSymbol(symbol) : undefined },
+        response: result?._diagnostics?.response ?? result,
+      });
+    },
+
     async getOrderStatus(orderId, symbol) {
       return request("GET", "/openApi/swap/v2/trade/order", {
         orderId,
@@ -391,7 +411,7 @@ export function createBingxClient({
           signal: controller.signal,
         });
         const text = await response.text();
-        const payload = text ? JSON.parse(text) : {};
+        const payload = parseBingxJson(text);
 
         if (!response.ok) {
           const error = new Error(payload.msg || `BingX HTTP ${response.status}`);

@@ -142,6 +142,7 @@ function parseBaselineQuery(text, options = {}) {
   if (options.baselineQuery) return String(options.baselineQuery).trim();
   const source = String(text);
   const patterns = [
+    /\b(?:compare|porownaj|porównaj)\b.*?\b(?:with|to|z|do)\s*["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,
     /\b(?:compare|porownaj|porównaj)\s+(?:with|to|z|do)?\s*["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,
     /\b(?:worse|better|gorszy|gorsze|lepszy|lepsze)\s+(?:than|niz|niż)\s*["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,
     /\b(?:baseline|baz[ae]|punkt odniesienia)\s*[:=]?\s*["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,

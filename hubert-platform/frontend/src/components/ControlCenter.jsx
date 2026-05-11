@@ -1201,9 +1201,12 @@ export default function ControlCenter({
 
     if (values.direct && action) {
       return runAction(`position-card-${action}`, action === "MOVE_SL" ? "Move SL" : action === "MOVE_TP" ? "Move TP" : "Send manual action", async () => {
+        if (values.confirm && !window.confirm(values.confirmMessage ?? "Send this manual action for the displayed BingX position?")) {
+          throw new Error("Manual action cancelled.");
+        }
         await apiFetch("/execution/crisis/on", { method: "POST" });
         setManualActionResult(null);
-        setManualMessage("Sending manual action to BingX...");
+        setManualMessage("Request sent to BingX...");
         let response;
 
         try {
@@ -1227,7 +1230,7 @@ export default function ControlCenter({
         if (payload.livestream) {
           setLivestream(payload.livestream);
         }
-        setManualMessage(payload.message || (ok ? "Manual exchange action confirmed on BingX." : "BingX rejected the manual action."));
+        setManualMessage(payload.message || (ok ? "Exchange accepted request. Fresh sync completed." : "BingX rejected the manual action."));
 
         if (!ok || payload.ok === false) {
           const error = new Error(payload.message || "BingX rejected the manual action.");
@@ -2023,7 +2026,7 @@ export default function ControlCenter({
           onManualAction={(body) =>
             runAction(`manual-${body.action}`, "Send manual action", async () => {
               setManualActionResult(null);
-              setManualMessage("Sending manual action to BingX...");
+              setManualMessage("Request sent to BingX...");
               let response;
 
               try {
@@ -2039,7 +2042,7 @@ export default function ControlCenter({
               if (payload.livestream) {
                 setLivestream(payload.livestream);
               }
-              setManualMessage(payload.message || (ok ? "Manual exchange action confirmed on BingX." : "BingX rejected the manual action."));
+              setManualMessage(payload.message || (ok ? "Exchange accepted request. Fresh sync completed." : "BingX rejected the manual action."));
 
               if (!ok || payload.ok === false) {
                 const error = new Error(payload.message || "BingX rejected the manual action.");
@@ -2434,11 +2437,30 @@ function LivestreamPanel({ accountProfiles = [], livestream, manualMessage, manu
                 >
                   Move TP
                 </button>
-                <button type="button" onClick={() => onPositionAction(position, "CLOSE_POSITION")}>Close Position</button>
+                <button
+                  type="button"
+                  onClick={() => onPositionAction(position, "CLOSE_POSITION", {
+                    confirm: true,
+                    confirmMessage: `Close ${position.symbol} ${position.side} position ${position.positionId ?? ""}?`,
+                    direct: true,
+                  })}
+                >
+                  Close Position
+                </button>
                 <button type="button" onClick={onRefresh}>Force Sync</button>
               </div>
               <div className="hubert-lab__actions">
-                <button type="button" onClick={() => onPositionAction(position, "CANCEL_ATTACHED_ORDERS")}>Cancel Orders</button>
+                <button
+                  type="button"
+                  disabled={(position.attachedOrders ?? []).length === 0}
+                  onClick={() => onPositionAction(position, "CANCEL_ATTACHED_ORDERS", {
+                    confirm: true,
+                    confirmMessage: `Cancel attached protective/orders for ${position.symbol} ${position.side}?`,
+                    direct: true,
+                  })}
+                >
+                  Cancel Protection/Orders
+                </button>
                 <button type="button" onClick={() => onPositionAction(position, null)}>Crisis Control</button>
               </div>
             </div>

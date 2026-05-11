@@ -659,7 +659,11 @@ function findAttachedPrice(orders, matcher) {
 }
 
 function findAttachedOrder(orders, matcher) {
-  return orders.find((item) => matcher(String(item.type ?? item.orderType ?? "").toUpperCase())) ?? null;
+  return orders
+    .filter(isActiveOrder)
+    .slice()
+    .sort((left, right) => Number(right.updateTime ?? right.time ?? right.orderId ?? 0) - Number(left.updateTime ?? left.time ?? left.orderId ?? 0))
+    .find((item) => matcher(String(item.type ?? item.orderType ?? "").toUpperCase())) ?? null;
 }
 
 function positionEntryPrice(position) {
@@ -1050,6 +1054,11 @@ function orderClientIdentifier(order) {
   return order?.clientOrderId ?? order?.clientOrderID ?? null;
 }
 
+function orderKey(order) {
+  const id = orderIdentifier(order) ?? orderClientIdentifier(order);
+  return id === null || id === undefined ? "" : String(id);
+}
+
 function orderPositionSide(order) {
   const explicitSide = String(order?.positionSide ?? "").toUpperCase();
   if (explicitSide.includes("LONG")) return "LONG";
@@ -1127,13 +1136,20 @@ function isProtectiveOrderForAction(order, action) {
 
 async function cancelExistingProtectiveOrders({ action, client, position, symbol }) {
   const orders = normalizeExchangeList(await client.getOpenOrders(symbol));
-  const matchingOrders = orders.filter(
-    (order) => isSamePositionOrder(order, position, symbol) && isProtectiveOrderForAction(order, action),
-  );
+  const matchingOrders = orders.filter((order) => {
+    if (!isSamePositionOrder(order, position, symbol)) return false;
+    return action ? isProtectiveOrderForAction(order, action) : true;
+  });
+  return cancelMatchedOrders({ client, matchingOrders, symbol });
+}
+
+async function cancelMatchedOrders({ client, excludeOrderIds = [], matchingOrders, symbol }) {
+  const excluded = new Set(excludeOrderIds.map((item) => String(item)).filter(Boolean));
   const cancelled = [];
   const cancelErrors = [];
 
   for (const order of matchingOrders) {
+    if (excluded.has(orderKey(order))) continue;
     const orderId = orderIdentifier(order);
     const clientOrderId = orderClientIdentifier(order);
 
@@ -1163,7 +1179,46 @@ async function cancelExistingProtectiveOrders({ action, client, position, symbol
   return {
     cancelErrors,
     cancelled,
+    excluded: [...excluded],
     matched: matchingOrders.map(orderDiagnostic).filter(Boolean),
+  };
+}
+
+async function protectionOrderState({ client, placedOrderStatus = null, symbol }) {
+  const [positionsResult, openOrdersResult, protectiveOrdersResult] = await Promise.allSettled([
+    client.getOpenPositions(symbol),
+    client.getOpenOrders(symbol),
+    typeof client.getProtectiveOrders === "function" ? client.getProtectiveOrders(symbol) : client.getOpenOrders(symbol),
+  ]);
+  const openPositions = positionsResult.status === "fulfilled" ? normalizeExchangeList(positionsResult.value) : [];
+  const openOrders = openOrdersResult.status === "fulfilled" ? normalizeExchangeList(openOrdersResult.value) : [];
+  const protectiveOrders = protectiveOrdersResult.status === "fulfilled" ? normalizeExchangeList(protectiveOrdersResult.value) : [];
+  const placedOrderItems = placedOrderStatus?.order ? [placedOrderStatus.order] : [];
+
+  return {
+    errors: [
+      ...(positionsResult.status === "rejected" ? [{ source: "positions", message: humanBackendError(positionsResult.reason), exchange: positionsResult.reason?.bingx ?? null }] : []),
+      ...(openOrdersResult.status === "rejected" ? [{ source: "openOrders", message: humanBackendError(openOrdersResult.reason), exchange: openOrdersResult.reason?.bingx ?? null }] : []),
+      ...(protectiveOrdersResult.status === "rejected" ? [{ source: "protectiveOrders", message: humanBackendError(protectiveOrdersResult.reason), exchange: protectiveOrdersResult.reason?.bingx ?? null }] : []),
+    ],
+    fetchedAt: new Date().toISOString(),
+    openOrders,
+    openPositions,
+    planOrders: protectiveOrders.filter((order) => {
+      const type = orderType(order);
+      return type.includes("TRIGGER") || type.includes("PLAN");
+    }),
+    placedOrderItems,
+    protectionSourcesChecked: [
+      "position fields",
+      "open orders",
+      "protective orders via openOrders",
+      "plan/trigger orders via openOrders",
+      "placed order status",
+    ],
+    protectiveOrders,
+    tpslOrders: protectiveOrders.filter((order) => isProtectiveOrderForAction(order, "MOVE_SL") || isProtectiveOrderForAction(order, "MOVE_TP")),
+    tpslEndpointNote: "Official normal USD-M futures docs expose STOP_MARKET/TAKE_PROFIT_MARKET protection via /openApi/swap/v2/trade/order and /openApi/swap/v2/trade/openOrders. The copyTrading setTPSL endpoint is not used for regular positions.",
   };
 }
 
@@ -1236,17 +1291,25 @@ function verifyProtectiveAction({ action, position, requestedPrice, snapshot, sy
   }
 
   const directPrice = positionProtectionPrice(currentPosition, action === "MOVE_SL" ? "SL" : "TP");
-  const protectiveOrders = [
-    ...normalizeExchangeList(snapshot?.openOrders),
-    ...normalizeExchangeList(snapshot?.placedOrderItems),
-  ].filter(
-    (order) => isSamePositionOrder(order, currentPosition, symbol) && isProtectiveOrderForAction(order, action),
+  const orderSources = [
+    { name: "open order", orders: normalizeExchangeList(snapshot?.openOrders) },
+    { name: "protective order", orders: normalizeExchangeList(snapshot?.protectiveOrders) },
+    { name: "plan order", orders: normalizeExchangeList(snapshot?.planOrders) },
+    { name: "TPSL order", orders: normalizeExchangeList(snapshot?.tpslOrders) },
+    { name: "placed order status", orders: normalizeExchangeList(snapshot?.placedOrderItems) },
+  ];
+  const protectiveOrders = orderSources.flatMap(({ name, orders }) =>
+    orders
+      .filter((order) => isSamePositionOrder(order, currentPosition, symbol) && isProtectiveOrderForAction(order, action))
+      .map((order) => ({ order, source: name })),
   );
-  const activeProtectiveOrders = protectiveOrders.filter(isActiveOrder);
-  const matchedOrder = activeProtectiveOrders.find((order) => isClosePriceMatch(orderPrice(order), requestedPrice)) ?? null;
+  const activeProtectiveOrders = protectiveOrders.filter(({ order }) => isActiveOrder(order));
+  const matched = activeProtectiveOrders.find(({ order }) => isClosePriceMatch(orderPrice(order), requestedPrice)) ?? null;
+  const matchedOrder = matched?.order ?? null;
   const matchedPrice = matchedOrder ? orderPrice(matchedOrder) : null;
   const directMatches = isClosePriceMatch(directPrice, requestedPrice);
   const confirmedPrice = directMatches ? directPrice : matchedPrice;
+  const source = matched ? matched.source : directMatches ? "position field" : "not found";
 
   if (matchedOrder || directMatches) {
     return {
@@ -1254,10 +1317,13 @@ function verifyProtectiveAction({ action, position, requestedPrice, snapshot, sy
       confirmedPrice,
       directPrice,
       matchedOrder: orderDiagnostic(matchedOrder),
-      message: action === "MOVE_SL" ? "Stop loss confirmed on BingX." : "Take profit confirmed on BingX.",
+      message: action === "MOVE_SL"
+        ? `Protection verified: SL found in ${source} at ${confirmedPrice}.`
+        : `Protection verified: TP found in ${source} at ${confirmedPrice}.`,
       priceMatchesRequest: true,
       reason: "protective_order_found_after_sync",
-      source: matchedOrder ? "open_orders" : "position_fields",
+      source,
+      sourcesChecked: snapshot?.protectionSourcesChecked ?? [],
     };
   }
 
@@ -1265,13 +1331,17 @@ function verifyProtectiveAction({ action, position, requestedPrice, snapshot, sy
     return {
       activeProtection: {
         directPrice,
-        orders: activeProtectiveOrders.map(orderDiagnostic).filter(Boolean),
+        orders: activeProtectiveOrders.map(({ order, source }) => ({
+          ...orderDiagnostic(order),
+          source,
+        })).filter(Boolean),
       },
       confirmed: false,
       message: action === "MOVE_SL"
         ? "Request accepted, but the active SL found after sync does not match the requested price."
         : "Request accepted, but the active TP found after sync does not match the requested price.",
       reason: "protective_price_mismatch_after_sync",
+      sourcesChecked: snapshot?.protectionSourcesChecked ?? [],
     };
   }
 
@@ -1281,6 +1351,7 @@ function verifyProtectiveAction({ action, position, requestedPrice, snapshot, sy
       ? "Request accepted, but no active SL was found after sync."
       : "Request accepted, but no active TP was found after sync.",
     reason: "protective_order_missing_after_sync",
+    sourcesChecked: snapshot?.protectionSourcesChecked ?? [],
   };
 }
 
@@ -1288,6 +1359,45 @@ function sleepMs(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+async function waitForProtectionVerification({
+  action,
+  client,
+  placedOrderStatus,
+  position,
+  requestedPrice,
+  symbol,
+}) {
+  let lastSnapshot = null;
+  let lastVerification = null;
+
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    lastSnapshot = await protectionOrderState({ client, placedOrderStatus, symbol });
+    lastVerification = verifyProtectiveAction({
+      action,
+      position,
+      requestedPrice,
+      snapshot: lastSnapshot,
+      symbol,
+    });
+
+    if (lastVerification.confirmed || attempt === 4) {
+      return {
+        attempts: attempt,
+        snapshot: lastSnapshot,
+        verification: lastVerification,
+      };
+    }
+
+    await sleepMs(900 * attempt);
+  }
+
+  return {
+    attempts: 0,
+    snapshot: lastSnapshot,
+    verification: lastVerification,
+  };
 }
 
 async function executeManualAction(body) {
@@ -1317,6 +1427,7 @@ async function executeManualAction(body) {
   let fetchedPositions = [];
   let postActionSync = null;
   let verification = null;
+  let protectionWait = null;
 
   async function openPosition() {
     fetchedPositions = normalizeExchangeList(await client.getOpenPositions(symbol));
@@ -1361,8 +1472,45 @@ async function executeManualAction(body) {
       position,
       positionSide: positionSide(position),
     });
-  } else if (action === "CANCEL_ALL" || action === "CANCEL_ATTACHED_ORDERS") {
+  } else if (action === "CANCEL_ALL") {
     result = await client.cancelOpenOrders(symbol);
+  } else if (action === "CANCEL_ATTACHED_ORDERS") {
+    const position = await openPosition();
+
+    if (!position) {
+      return { ok: false, message: "No open position found on BingX for this symbol." };
+    }
+
+    protectionManagement = await cancelExistingProtectiveOrders({ client, position, symbol });
+
+    if (protectionManagement.cancelErrors.length > 0) {
+      return {
+        ok: false,
+        message: "BingX could not cancel every attached order for this position.",
+        diagnostics: {
+          action,
+          hedgeMode: "positionSide",
+          positionsFound: fetchedPositions.map(positionDiagnostic).filter(Boolean),
+          protectionManagement,
+          selectedPosition: positionDiagnostic(selectedPosition),
+        },
+        symbol,
+      };
+    }
+
+    result = {
+      cancelledAttachedOrders: protectionManagement.cancelled,
+      ok: true,
+      _diagnostics: {
+        endpoint: "/openApi/swap/v2/trade/order",
+        method: "DELETE",
+        payload: {
+          cancelledOrderIds: protectionManagement.cancelled.map((item) => orderIdentifier(resultOrder(item.result))).filter(Boolean),
+          symbol,
+        },
+        response: protectionManagement,
+      },
+    };
   } else if (["MOVE_SL", "MOVE_TP"].includes(action)) {
     const position = await openPosition();
 
@@ -1381,23 +1529,6 @@ async function executeManualAction(body) {
       if (!Number.isFinite(stopPrice) || stopPrice <= 0) {
         return { ok: false, message: "Enter a valid SL price first." };
       }
-      protectionManagement = await cancelExistingProtectiveOrders({ action, client, position, symbol });
-
-      if (protectionManagement.cancelErrors.length > 0) {
-        return {
-          ok: false,
-          message: "BingX could not cancel the existing stop-loss order, so the SL was not moved.",
-          diagnostics: {
-            action,
-            hedgeMode: "positionSide",
-            positionsFound: fetchedPositions.map(positionDiagnostic).filter(Boolean),
-            protectionManagement,
-            selectedPosition: positionDiagnostic(selectedPosition),
-          },
-          symbol,
-        };
-      }
-
       placementMode = "position-close-stop";
       try {
         result = await client.placePositionStopLoss(symbol, side, stopPrice, {
@@ -1423,23 +1554,6 @@ async function executeManualAction(body) {
       if (!Number.isFinite(takeProfitPrice) || takeProfitPrice <= 0) {
         return { ok: false, message: "Enter a valid TP price first." };
       }
-      protectionManagement = await cancelExistingProtectiveOrders({ action, client, position, symbol });
-
-      if (protectionManagement.cancelErrors.length > 0) {
-        return {
-          ok: false,
-          message: "BingX could not cancel the existing take-profit order, so the TP was not moved.",
-          diagnostics: {
-            action,
-            hedgeMode: "positionSide",
-            positionsFound: fetchedPositions.map(positionDiagnostic).filter(Boolean),
-            protectionManagement,
-            selectedPosition: positionDiagnostic(selectedPosition),
-          },
-          symbol,
-        };
-      }
-
       placementMode = "position-close-take-profit";
       try {
         result = await client.placePositionTakeProfit(symbol, side, takeProfitPrice, {
@@ -1488,8 +1602,40 @@ async function executeManualAction(body) {
   }
 
   if (["MOVE_SL", "MOVE_TP"].includes(action)) {
-    await sleepMs(1200);
     placedOrderStatus = await queryPlacedOrder({ client, result, symbol });
+    protectionWait = await waitForProtectionVerification({
+      action,
+      client,
+      placedOrderStatus,
+      position: selectedPosition,
+      requestedPrice: action === "MOVE_SL" ? stopPrice : takeProfitPrice,
+      symbol,
+    });
+    verification = protectionWait.verification;
+
+    if (verification?.confirmed) {
+      const keepOrderId = verification.matchedOrder?.orderId ?? resultOrderId(result);
+      const staleProtectiveOrders = normalizeExchangeList(protectionWait.snapshot?.openOrders)
+        .filter((order) => isSamePositionOrder(order, selectedPosition, symbol) && isProtectiveOrderForAction(order, action));
+      protectionManagement = await cancelMatchedOrders({
+        client,
+        excludeOrderIds: [keepOrderId].filter(Boolean),
+        matchingOrders: staleProtectiveOrders,
+        symbol,
+      });
+
+      if (protectionManagement.cancelled.length || protectionManagement.cancelErrors.length) {
+        protectionWait = await waitForProtectionVerification({
+          action,
+          client,
+          placedOrderStatus,
+          position: selectedPosition,
+          requestedPrice: action === "MOVE_SL" ? stopPrice : takeProfitPrice,
+          symbol,
+        });
+        verification = protectionWait.verification;
+      }
+    }
   }
 
   const freshRows = await publicApiProfiles({ fresh: true });
@@ -1510,6 +1656,12 @@ async function executeManualAction(body) {
     positionDiagnostics: normalizeExchangeList(profileRow?.openPositionItems).map(positionDiagnostic).filter(Boolean),
     source: profileRow?.status === "connected" ? "fresh BingX" : "stale/error",
     status: profileRow?.status ?? "missing profile",
+    protectionSourcesChecked: protectionWait?.snapshot?.protectionSourcesChecked ?? [],
+    protectiveOrders: normalizeExchangeList(protectionWait?.snapshot?.protectiveOrders),
+    planOrders: normalizeExchangeList(protectionWait?.snapshot?.planOrders),
+    tpslOrders: normalizeExchangeList(protectionWait?.snapshot?.tpslOrders),
+    tpslEndpointNote: protectionWait?.snapshot?.tpslEndpointNote ?? null,
+    protectionSyncErrors: protectionWait?.snapshot?.errors ?? [],
   };
   postActionSync = {
     accountProfile: {
@@ -1531,16 +1683,51 @@ async function executeManualAction(body) {
     },
   };
 
-  if (["MOVE_SL", "MOVE_TP"].includes(action)) {
-    verification = profileRow?.status === "connected"
-      ? verifyProtectiveAction({
+  if (action === "CANCEL_ATTACHED_ORDERS") {
+    const currentPosition = matchingSnapshotPosition(profileSnapshot, selectedPosition, symbol);
+    const remainingOrders = currentPosition
+      ? attachedOrdersForPosition(profileSnapshot.openOrders, currentPosition).filter(isActiveOrder)
+      : [];
+
+    if (remainingOrders.length > 0) {
+      return {
+        action,
+        ok: false,
+        message: "Request accepted, but attached orders are still visible after fresh sync.",
+        diagnostics: {
           action,
-          position: selectedPosition,
-          requestedPrice: action === "MOVE_SL" ? stopPrice : takeProfitPrice,
-          snapshot: profileSnapshot,
-          symbol,
-        })
-      : {
+          parsedSuccess: false,
+          postActionSync,
+          protectionManagement,
+          remainingOrders: remainingOrders.map(orderDiagnostic).filter(Boolean),
+          selectedPosition: positionDiagnostic(selectedPosition),
+        },
+        livestream: postActionSync.livestream,
+        result,
+        symbol,
+      };
+    }
+
+    verification = {
+      confirmed: true,
+      message: "Attached protection/orders cancelled. Fresh sync shows no active attached orders for this position.",
+      reason: "attached_orders_cleared_after_sync",
+      source: "open orders",
+    };
+  }
+
+  if (["MOVE_SL", "MOVE_TP"].includes(action)) {
+    verification = profileRow?.status === "connected" && verification
+      ? verification
+      : profileRow?.status === "connected"
+        ? verifyProtectiveAction({
+            action,
+            position: selectedPosition,
+            requestedPrice: action === "MOVE_SL" ? stopPrice : takeProfitPrice,
+            snapshot: profileSnapshot,
+            symbol,
+          })
+        : {
           confirmed: false,
           message: "BingX accepted the request, but the platform could not complete a fresh sync to confirm it.",
           reason: "fresh_sync_failed",
@@ -1577,6 +1764,7 @@ async function executeManualAction(body) {
           placedOrderStatus,
           placementMode,
           positionsFound: fetchedPositions.map(positionDiagnostic).filter(Boolean),
+          protectionWait,
           postActionSync,
           protectionManagement,
           selectedPosition: positionDiagnostic(selectedPosition),
@@ -1602,13 +1790,14 @@ async function executeManualAction(body) {
       symbol,
       verification,
     },
-    message: verification?.message ?? "manual exchange action confirmed",
+    message: verification?.message ?? "manual exchange action accepted",
   });
 
   return {
     action,
     ok: true,
-    message: verification?.message ?? "Manual exchange action confirmed on BingX.",
+    message: verification?.message ?? "Exchange accepted request. Fresh sync completed.",
+    status: verification?.confirmed ? "protection_verified" : "exchange_accepted",
     diagnostics: {
       action,
       exchange: resultDiagnostics(result),
@@ -1619,6 +1808,7 @@ async function executeManualAction(body) {
       placedOrderStatus,
       placementMode,
       positionsFound: fetchedPositions.map(positionDiagnostic).filter(Boolean),
+      protectionWait,
       postActionSync,
       protectionManagement,
       selectedPosition: positionDiagnostic(selectedPosition),

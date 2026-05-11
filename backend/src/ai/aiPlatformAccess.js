@@ -47,7 +47,7 @@ const ACTION_TRACES = {
     ],
     exchange: [
       "POST /openApi/swap/v2/trade/order",
-      "type=STOP_MARKET, closePosition=true, quantity, stopPrice, side=closing side, positionSide=LONG/SHORT",
+      "type=STOP_MARKET, closePosition=true, stopPrice, side=closing side, positionSide=LONG/SHORT; fallback uses quantity without closePosition if needed",
       "Active protection is verified from openOrders/position fields after fresh sync.",
     ],
     frontend: [
@@ -71,7 +71,7 @@ const ACTION_TRACES = {
     ],
     exchange: [
       "POST /openApi/swap/v2/trade/order",
-      "type=TAKE_PROFIT_MARKET, closePosition=true, quantity, stopPrice, side=closing side, positionSide=LONG/SHORT",
+      "type=TAKE_PROFIT_MARKET, closePosition=true, stopPrice, side=closing side, positionSide=LONG/SHORT; fallback uses quantity without closePosition if needed",
       "Active protection is verified from openOrders/position fields after fresh sync.",
     ],
     frontend: [
@@ -292,6 +292,15 @@ function extractKeywords(question = "") {
   ].filter((keyword) => normalized.includes(normalizeText(keyword)));
   if (preferred.length) return preferred;
   return normalized.split(" ").filter((word) => word.length >= 4).slice(0, 5);
+}
+
+function isPolishQuestion(value = "") {
+  const normalized = normalizeText(value);
+  return /(^|\s)(co|czemu|dlaczego|jak|gdzie|porownaj|porównaj|wynik|dziala|działa|nadal|robi|robia|robią|ustawienia|blad|błąd)(\s|$)/iu.test(String(value)) ||
+    normalized.includes("czemu") ||
+    normalized.includes("dlaczego") ||
+    normalized.includes("porownaj") ||
+    normalized.includes("robi");
 }
 
 function formatRuntimePosition(position = {}) {
@@ -555,6 +564,7 @@ export function createAiPlatformAccess({
     const question = String(input.question ?? input.message ?? "").trim();
     if (!question) return { ok: false, message: "Ask a platform question first." };
     const normalized = normalizeText(question);
+    const polish = isPolishQuestion(question);
     const inspected = [];
     const evidence = [];
     let answer = "";
@@ -562,22 +572,80 @@ export function createAiPlatformAccess({
     let unknown = ["No live browser click was performed by this answer."];
     let suggestedVerification = ["Open the relevant panel and run the exact UI action after reading the trace."];
 
+    if ((normalized.includes("sl") || normalized.includes("stop loss")) && (normalized.includes("czemu") || normalized.includes("dlaczego") || normalized.includes("nadal") || normalized.includes("nie dziala") || normalized.includes("nie działa"))) {
+      const runtime = await getRuntimeState({ fresh: true, includeAvailability: false, logLimit: 8 });
+      const slPositions = runtime.live?.positions ?? [];
+      const protectedPositions = slPositions.filter((position) => Number(position.stopLoss ?? 0) > 0 || position.attachedOrders?.some((order) => String(order.type ?? "").includes("STOP")));
+      inspected.push(
+        "runtime fresh BingX livestream state",
+        "backend/src/index.js buildLivestreamPayload",
+        "backend/src/index.js verifyProtectiveAction",
+        "backend/src/exchanges/bingxClient.js placePositionStopLoss/placeStopLoss",
+      );
+      evidence.push(
+        `Fresh positions: ${slPositions.length}`,
+        `Positions with detected SL/protection: ${protectedPositions.length}`,
+        ...slPositions.slice(0, 4).map((position) =>
+          `${position.symbol} ${position.positionSide ?? position.side}: SL=${position.stopLoss ?? 0}, source=${position.protectionSource ?? "unknown"}, attachedOrders=${position.attachedOrders?.length ?? 0}`,
+        ),
+      );
+      answer = polish
+        ? protectedPositions.length
+          ? `Według świeżego syncu BingX ochrona SL istnieje, ale źródłem jest open order, a nie pole pozycji. Dlatego stary UI mógł pokazywać SL=0, jeśli patrzył tylko na position.stopLoss. Aktualnie wykryte pozycje z SL: ${protectedPositions.map((position) => `${position.symbol} ${position.positionSide ?? position.side} SL ${position.stopLoss ?? "?"} (${position.protectionSource ?? "źródło nieznane"})`).join("; ")}. Jeśli przycisk nadal mówi sukces bez aktywnego ordera, błąd jest w warstwie potwierdzenia/verifiera, nie w strategii.`
+          : "Świeży sync BingX nie pokazuje aktywnej ochrony SL dla widocznych pozycji. W takim stanie UI nie powinien mówić „confirmed”. Trzeba sprawdzić diagnostykę /manual/action: endpoint, payload, raw response oraz czy openOrders/protectiveOrders po syncu zawierają STOP_MARKET dla tego positionSide."
+        : protectedPositions.length
+          ? `Fresh BingX sync sees SL protection, but it is coming from an open order rather than a position field: ${protectedPositions.map((position) => `${position.symbol} ${position.positionSide ?? position.side} SL ${position.stopLoss ?? "?"} (${position.protectionSource ?? "unknown"})`).join("; ")}. Old UI could show SL=0 if it looked only at the position field.`
+          : "Fresh BingX sync does not show active SL protection for the visible positions, so the UI must not say confirmed. Inspect /manual/action diagnostics and openOrders/protectiveOrders after sync.";
+      confidence = "high";
+      unknown = ["This answer uses the latest backend sync. The BingX mobile app view still has to be checked manually if the app display differs."];
+      suggestedVerification = polish
+        ? ["Kliknij Force Sync na karcie pozycji.", "Rozwiń Last exchange response po Move SL i sprawdź endpoint, payload, raw response oraz verification.source.", "W BingX app sprawdź aktywne conditional/open orders dla tej pozycji."]
+        : ["Click Force Sync on the position card.", "Expand Last exchange response after Move SL and inspect endpoint, payload, raw response, and verification.source.", "Check active conditional/open orders in the BingX app."];
+    } else if ((normalized.includes("verify integrity") || normalized.includes("integrity")) && (normalized.includes("rerun exact") || normalized.includes("re run exact") || normalized.includes("re-run exact"))) {
+      inspected.push(
+        "AiAgentPanel.verifyIntegrity in hubert-platform/frontend/src/components/ControlCenter.jsx",
+        "AiAgentPanel.rerunExact in hubert-platform/frontend/src/components/ControlCenter.jsx",
+        "POST /ai/agent/runs/:id/verify in backend/src/index.js",
+        "POST /ai/agent/runs/:id/rerun in backend/src/index.js",
+        "createAgentOrchestrator().verifyIntegrity/rerunExact in backend/src/ai/agent/agentOrchestrator.js",
+      );
+      evidence.push(
+        "Verify integrity reruns/compares the stored AI row against exact platform metrics and reports mismatches.",
+        "Re-run exact runs the selected AI config again using stored symbol/timeframe/range/provider/sizing/fill/params.",
+        "Neither action changes live execution or places orders.",
+      );
+      answer = polish
+        ? "Verify integrity sprawdza, czy wynik AI jest spójny z dokładnym ponownym uruchomieniem tej samej konfiguracji. Pokazuje różnice metryk, np. PF, net, candles, zakres i tryb sizing/fill. Re-run exact po prostu odpala jeszcze raz dokładnie tę samą konfigurację z karty wyniku AI, żeby zobaczyć, czy wynik da się odtworzyć. Oba przyciski są analityczne: nie handlują i nie zmieniają decków."
+        : "Verify integrity checks whether the stored AI result matches an exact platform rerun and reports metric/context diffs. Re-run exact reruns the selected AI config with the stored symbol, timeframe, range, provider, sizing, fill mode, and parameters. Both are analysis-only.";
+      confidence = "high";
+      suggestedVerification = polish
+        ? ["Otwórz kartę wyniku AI, kliknij Verify integrity, potem porównaj sekcję metric diff.", "Kliknij Re-run exact i sprawdź, czy zakres/candles/PF są identyczne."]
+        : ["Open an AI result card, click Verify integrity, then inspect metric diff.", "Click Re-run exact and confirm the range/candles/PF match."];
+    } else {
     const tracedKey = actionKey(question);
     if (tracedKey) {
       const traced = await traceAction({ actionName: tracedKey });
       inspected.push(...traced.path.frontend, ...traced.path.backend, ...traced.path.exchange);
       evidence.push(...traced.path.notes, ...traced.codeEvidence.slice(0, 8).map((item) => `${item.path}:${item.line} ${item.text}`));
       answer = tracedKey === "pf calculation"
-        ? "Profit factor is calculated in calculateBacktestMetrics inside hubert-platform/frontend/src/backtest/metrics.js as grossProfit / grossLoss. If grossLoss is zero, positive grossProfit returns Infinity; otherwise PF is 0. AI/backtest reports consume that metric from runBacktest rather than recalculating it separately."
-        : `${tracedKey} path: ${traced.path.frontend.join(" → ")} → ${traced.path.backend.join(" → ")}${traced.path.exchange.length ? ` → ${traced.path.exchange.join(" / ")}` : ""}`;
+        ? polish
+          ? "PF jest liczony w calculateBacktestMetrics w pliku hubert-platform/frontend/src/backtest/metrics.js jako grossProfit / grossLoss. Jeśli grossLoss = 0 i jest zysk, PF jest Infinity; jeśli nie ma strat ani zysku, PF jest 0. AI i raporty biorą tę metrykę z runBacktest, nie liczą jej osobno."
+          : "Profit factor is calculated in calculateBacktestMetrics inside hubert-platform/frontend/src/backtest/metrics.js as grossProfit / grossLoss. If grossLoss is zero, positive grossProfit returns Infinity; otherwise PF is 0. AI/backtest reports consume that metric from runBacktest rather than recalculating it separately."
+        : polish
+          ? `Ścieżka ${tracedKey}: ${traced.path.frontend.join(" → ")} → ${traced.path.backend.join(" → ")}${traced.path.exchange.length ? ` → ${traced.path.exchange.join(" / ")}` : ""}`
+          : `${tracedKey} path: ${traced.path.frontend.join(" → ")} → ${traced.path.backend.join(" → ")}${traced.path.exchange.length ? ` → ${traced.path.exchange.join(" / ")}` : ""}`;
       confidence = "high";
       unknown = traced.unknown;
-      suggestedVerification = traced.suggestedVerification;
+      suggestedVerification = polish
+        ? ["Wykonaj akcję na małej pozycji testowej.", "Sprawdź diagnostykę odpowiedzi i wymuś świeży sync z BingX."]
+        : traced.suggestedVerification;
     } else if (normalized.includes("pf") || normalized.includes("profit factor")) {
       const details = await getFunctionOrRouteDetails({ query: "profitFactor", filePath: "hubert-platform/frontend/src/backtest/metrics.js", limit: 6 });
       inspected.push("hubert-platform/frontend/src/backtest/metrics.js calculateBacktestMetrics");
       evidence.push(...details.details.map((item) => `${item.path}:${item.line} ${item.preview}`));
-      answer = "Profit factor is calculated in calculateBacktestMetrics as grossProfit / grossLoss. If grossLoss is zero, positive grossProfit becomes Infinity; otherwise it is 0.";
+      answer = polish
+        ? "PF jest liczony w calculateBacktestMetrics jako grossProfit / grossLoss. Jeśli grossLoss = 0 i grossProfit > 0, PF jest Infinity; w przeciwnym razie 0."
+        : "Profit factor is calculated in calculateBacktestMetrics as grossProfit / grossLoss. If grossLoss is zero, positive grossProfit becomes Infinity; otherwise it is 0.";
       confidence = "high";
       suggestedVerification = ["Open hubert-platform/frontend/src/backtest/metrics.js and inspect calculateBacktestMetrics."];
     } else if (normalized.includes("hubert") || normalized.includes("saved backtest") || normalized.includes("ai config differ")) {
@@ -587,8 +655,12 @@ export function createAiPlatformAccess({
       inspected.push("backend/data saved collections through state store", "backend/src/ai/aiLibraryTools.js resolver");
       evidence.push(hubert ? `Found possible saved item: ${hubert.name ?? hubert.id}` : "No saved item named hubert was found in current collections.");
       answer = hubert
-        ? "The AI can compare against the saved Hubert baseline through resolveLibraryItem/getBacktestDetail and compareAgentResultToBacktest. If metrics differ, the exact range, provider, fill mode, sizing mode, candles, and strategy params must be compared before judging the AI row."
-        : "I could not see a saved item named Hubert in the current sanitized collections. The next step is to check Favorites/Backtests spelling or use the direct saved backtest id.";
+        ? polish
+          ? "Widzę zapisany element pasujący do „hubert”. AI może porównać go przez resolveLibraryItem/getBacktestDetail i compareAgentResultToBacktest. Żeby porównanie było uczciwe, trzeba zestawić zakres, timeframe, provider, fill mode, sizing mode, candles used, parametry strategii oraz metryki. Jeśli kontekst się różni, wynik AI i hubert nie są bezpośrednio porównywalne."
+          : "The AI can compare against the saved Hubert baseline through resolveLibraryItem/getBacktestDetail and compareAgentResultToBacktest. If metrics differ, the exact range, provider, fill mode, sizing mode, candles, and strategy params must be compared before judging the AI row."
+        : polish
+          ? "Nie widzę zapisanego elementu o nazwie „hubert” w bezpiecznym widoku kolekcji. Sprawdź nazwę w Favorites/Backtests albo użyj bezpośredniego ID backtestu."
+          : "I could not see a saved item named Hubert in the current sanitized collections. The next step is to check Favorites/Backtests spelling or use the direct saved backtest id.";
       confidence = hubert ? "high" : "medium";
       suggestedVerification = ["Use the AI result card action: Compare to saved backtest, with name hubert.", "If ambiguous, use the saved backtest id."];
     } else {
@@ -602,6 +674,7 @@ export function createAiPlatformAccess({
         ? `I searched the platform source for ${keywords.join(", ")} and found ${evidence.length} code evidence lines. Use the evidence list to narrow the exact route/function.`
         : "I did not find direct code evidence for that wording. Try naming the button, route, or metric more directly.";
       confidence = evidence.length ? "medium" : "low";
+    }
     }
 
     return sanitizeForAi({
