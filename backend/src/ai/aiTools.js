@@ -1,5 +1,7 @@
 import { runBacktest } from "../../../hubert-platform/frontend/src/backtest/backtestEngine.js";
 import { fetchCandles } from "../strategy/strategyRunner.js";
+import { createAiLibraryTools } from "./aiLibraryTools.js";
+import { createAiPlatformAccess } from "./aiPlatformAccess.js";
 import { backtestConclusion, buildBacktestSummaryReport, buildSweepReport } from "./aiReportBuilder.js";
 
 const DEFAULT_STRATEGY = {
@@ -133,6 +135,14 @@ export function createAiTools({
   publicStatusPayload,
   store,
 }) {
+  const libraryTools = createAiLibraryTools({ store });
+  const platformTools = createAiPlatformAccess({
+    buildLivestreamPayload,
+    dataAvailability,
+    publicApiProfiles,
+    publicStatusPayload,
+    store,
+  });
   const candleCache = new Map();
   const maxCandleCacheEntries = Number(process.env.AI_CANDLE_CACHE_SIZE ?? 30);
 
@@ -323,10 +333,18 @@ export function createAiTools({
     },
 
     async compareBacktests(input = {}) {
-      const ids = input.ids ?? [];
-      const source = ids.length
-        ? (store.getCollection("backtests") ?? []).filter((item) => ids.includes(item.id))
-        : (store.getCollection("backtests") ?? []).slice(-4);
+      const ids = input.ids ?? input.names ?? [];
+      const resolved = ids.length
+        ? ids
+            .map((idOrName) => libraryTools.getBacktestDetail(idOrName))
+            .filter((item) => item.ok)
+        : (store.getCollection("backtests") ?? []).slice(-4).map((item) => libraryTools.getBacktestDetail(item.id)).filter((item) => item.ok);
+      const source = resolved.map((detail) => ({
+        id: detail.id,
+        metrics: detail.metrics,
+        name: detail.name,
+        trades: detail.trades,
+      }));
       const rows = source.map((item) => ({
         id: item.id,
         maxDrawdown: item.metrics?.maxDrawdown ?? 0,
@@ -409,7 +427,12 @@ export function createAiTools({
       };
     },
 
+    getBacktestDetail: libraryTools.getBacktestDetail,
+    getLibraryItemDetail: libraryTools.getLibraryItemDetail,
+    ...platformTools,
+
     prepareHistoricalBacktest,
+    resolveLibraryItem: libraryTools.resolveLibraryItem,
     runHistoricalBacktest,
     runSweepAnalysis,
 

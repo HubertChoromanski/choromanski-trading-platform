@@ -23,14 +23,15 @@ function parseSymbol(text) {
 function parseMaxCombinations(text, fallback) {
   const direct =
     String(text).match(/\b(\d{1,5})\s*(?:sweep\s*)?(?:combination|combinations|combos|tests|runs)\b/i) ??
-    String(text).match(/\b(?:sweep|test|run)\s*(\d{1,5})\s*(?:combination|combinations|combos|tests|runs)?\b/i);
+    String(text).match(/\b(\d{1,5})\s*(?:kombinacji|kombinacje|testow|testów|uruchomien|uruchomień)\b/i) ??
+    String(text).match(/\b(?:sweep|test|run|przetestuj|uruchom)\s*(\d{1,5})\s*(?:combination|combinations|combos|tests|runs|kombinacji|testow|testów)?\b/i);
   if (direct) {
     return {
       explicit: true,
       requested: Number(direct[1]),
     };
   }
-  const sweep = /\b(sweep|optimi[sz]e|best settings|best configs?)\b/i.test(text);
+  const sweep = /\b(sweep|optimi[sz]e|best settings|best configs?|najlepsze ustawienia|najlepsze parametry|najlepsza konfiguracja)\b/i.test(text);
   return {
     explicit: false,
     requested: sweep ? fallback : Math.min(fallback, 100),
@@ -137,6 +138,26 @@ function inferObjective(text, options = {}) {
   return "robustness-adjusted return";
 }
 
+function parseBaselineQuery(text, options = {}) {
+  if (options.baselineQuery) return String(options.baselineQuery).trim();
+  const source = String(text);
+  const patterns = [
+    /\b(?:compare|porownaj|porównaj)\s+(?:with|to|z|do)?\s*["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,
+    /\b(?:worse|better|gorszy|gorsze|lepszy|lepsze)\s+(?:than|niz|niż)\s*["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,
+    /\b(?:baseline|baz[ae]|punkt odniesienia)\s*[:=]?\s*["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,
+    /\b(?:uzyj|użyj)\s+(?:backtestu|testu|wyniku)\s+["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?\s+(?:jako|as)\s+(?:baseline|baze|bazę|punkt odniesienia)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = source.match(pattern);
+    if (match?.[1]) {
+      return match[1]
+        .replace(/\b(?:as|jako|baseline|baze|bazę|punkt|odniesienia|and|i|oraz)\b.*$/i, "")
+        .trim();
+    }
+  }
+  return "";
+}
+
 function inferKind(text) {
   const lower = String(text).toLowerCase();
   if (
@@ -144,6 +165,9 @@ function inferKind(text) {
     lower.includes("overfit") ||
     lower.includes("production candidate") ||
     lower.includes("stable settings") ||
+    lower.includes("najlepsze ustawienia") ||
+    lower.includes("najlepsze parametry") ||
+    lower.includes("najlepsza konfiguracja") ||
     lower.includes("quant") ||
     lower.includes("research")
   ) return "research";
@@ -152,7 +176,7 @@ function inferKind(text) {
   if (lower.includes("find the best") || lower.includes("best settings") || lower.includes("best config")) return "research";
   if (lower.includes("sweep") || lower.includes("optimize")) return "sweep";
   if (lower.includes("backtest") || lower.includes("q1")) return "backtest";
-  if (lower.includes("diagnose") || lower.includes("why") || lower.includes("issue") || lower.includes("worse")) return "diagnose";
+  if (lower.includes("diagnose") || lower.includes("why") || lower.includes("issue") || lower.includes("worse") || lower.includes("czemu") || lower.includes("dlaczego") || lower.includes("gorszy") || lower.includes("lepszy") || lower.includes("porównaj") || lower.includes("porownaj") || lower.includes("baseline")) return "diagnose";
   if (lower.includes("report") || lower.includes("presentation") || lower.includes("email") || lower.includes("telegram")) return "report";
   return "analysis";
 }
@@ -169,6 +193,13 @@ function requestedArtifacts(text) {
   };
 }
 
+function inferLanguage(text, options = {}) {
+  if (options.language) return options.language;
+  return /[ąćęłńóśźż]/i.test(text) || /\b(najlepsze|ustawienia|porownaj|porównaj|czemu|dlaczego|wynik|gorszy|lepszy|uzyj|użyj|backtestu)\b/i.test(text)
+    ? "pl"
+    : "en";
+}
+
 export function createAgentPlan({ options = {}, prompt = "" }) {
   const kind = options.kind ?? inferKind(prompt);
   const timeframes = options.timeframes?.length
@@ -177,7 +208,8 @@ export function createAgentPlan({ options = {}, prompt = "" }) {
   const fillMode = /conservative/i.test(prompt) && !/legacy\s+vs\s+conservative|conservative\s+vs\s+legacy/i.test(prompt)
     ? "conservative"
     : options.fillMode ?? "legacy";
-  const sizingMode = options.sizingMode ?? (/fixed risk|risk per/i.test(prompt) ? "fixed-risk" : "position-percent");
+  const sizingModeExplicit = Boolean(options.sizingMode || /fixed risk|risk per|fixed risk per trade|ryzyko na/i.test(prompt));
+  const sizingMode = options.sizingMode ?? (sizingModeExplicit ? "fixed-risk" : "position-percent");
   const fallbackCombinations = Number(options.maxCombinations) || (kind === "research" ? 100 : 1000);
   const combinationRequest = parseMaxCombinations(prompt, fallbackCombinations);
   const requestedCombinations = Math.max(1, combinationRequest.requested);
@@ -186,8 +218,10 @@ export function createAgentPlan({ options = {}, prompt = "" }) {
 
   return {
     artifacts: requestedArtifacts(prompt),
+    baselineQuery: parseBaselineQuery(prompt, options),
     fillMode,
     kind,
+    language: inferLanguage(prompt, options),
     maxCombinations,
     plannedCombinations: maxCombinations,
     requestedCombinations,
@@ -206,6 +240,7 @@ export function createAgentPlan({ options = {}, prompt = "" }) {
     range: parseRange(prompt, options),
     reportStyle: /presentation|slides/i.test(prompt) ? "presentation" : "operator",
     sizingMode,
+    sizingModeExplicit,
     startingBalance,
     symbol: options.symbol ? String(options.symbol).toUpperCase() : parseSymbol(prompt),
     timeframe: timeframes[0] ?? "15m",

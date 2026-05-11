@@ -877,6 +877,35 @@ button {
   line-height: 1.35;
 }
 
+.hubert-details {
+  display: grid;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  border-radius: 6px;
+  background: rgba(230, 230, 230, 0.72);
+}
+
+.hubert-details summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 820;
+  text-transform: uppercase;
+}
+
+.hubert-details pre {
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  padding: 8px;
+  border-radius: 5px;
+  background: rgba(14, 14, 14, 0.88);
+  color: #f1f1f1;
+  font-size: 10px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+}
+
 .hubert-live-card,
 .hubert-chart-box,
 .hubert-chat-message {
@@ -914,6 +943,37 @@ button {
   line-height: 1.35;
 }
 
+.hubert-position-controls {
+  display: grid;
+  grid-template-columns: minmax(90px, 1fr) auto minmax(90px, 1fr) auto auto auto;
+  align-items: end;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  border-radius: 6px;
+  background: rgba(224, 224, 224, 0.62);
+}
+
+.hubert-position-controls label {
+  gap: 4px;
+}
+
+.hubert-position-controls span {
+  color: rgba(0, 0, 0, 0.62);
+  font-size: 10px;
+  font-weight: 820;
+  text-transform: uppercase;
+}
+
+.hubert-position-controls button {
+  white-space: nowrap;
+}
+
+.hubert-position-controls button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
 .hubert-chart-axis {
   display: flex;
   align-items: center;
@@ -945,6 +1005,16 @@ button {
 
 .hubert-chat-toolbar {
   justify-content: flex-end;
+}
+
+.hubert-ai-mode {
+  gap: 8px;
+}
+
+.hubert-ai-mode button[data-active="true"] {
+  border-color: rgba(102, 224, 163, 0.75);
+  background: rgba(102, 224, 163, 0.14);
+  color: var(--hubert-text);
 }
 
 .hubert-chat-log {
@@ -1544,6 +1614,35 @@ button {
   line-height: 1;
 }
 
+.hubert-inline-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+  margin-top: 8px;
+}
+
+.hubert-inline-form label {
+  display: grid;
+  gap: 4px;
+}
+
+.hubert-inline-form span {
+  color: #9aa4ad;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.hubert-inline-form input {
+  min-height: 32px;
+  padding: 7px 9px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 6px;
+  background: rgba(2, 6, 23, 0.72);
+  color: #e5eef7;
+}
+
 @media (max-width: 760px) {
   .hubert-toolbar {
     top: 10px;
@@ -1587,6 +1686,10 @@ button {
   .hubert-lab__toggles,
   .hubert-manual-grid,
   .hubert-confirm-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .hubert-inline-form {
     grid-template-columns: 1fr;
   }
 

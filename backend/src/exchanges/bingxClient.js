@@ -15,6 +15,63 @@ function normalizeSymbol(symbol) {
   return symbol.includes("-") ? symbol : symbol.replace(/USDT$/u, "-USDT");
 }
 
+function normalizePositionSide(value) {
+  const side = String(value ?? "").toUpperCase();
+  if (side.includes("LONG")) return "LONG";
+  if (side.includes("SHORT")) return "SHORT";
+  return null;
+}
+
+function entrySideToPositionSide(side) {
+  return String(side).toUpperCase() === "BUY" ? "LONG" : "SHORT";
+}
+
+function closeSideForPositionSide(positionSide) {
+  return normalizePositionSide(positionSide) === "LONG" ? "SELL" : "BUY";
+}
+
+function oppositeOrderSide(side) {
+  return String(side).toUpperCase() === "BUY" ? "SELL" : "BUY";
+}
+
+function positionSideFromPosition(position) {
+  if (!position || typeof position !== "object") return null;
+  const explicit = normalizePositionSide(position?.positionSide ?? position?.side);
+  if (explicit) return explicit;
+  const amount = Number(position?.positionAmt ?? position?.positionAmount ?? position?.quantity ?? 0);
+  return amount < 0 ? "SHORT" : "LONG";
+}
+
+function positionIdentifier(position) {
+  return (
+    position?.positionId ??
+    position?.positionID ??
+    position?.id ??
+    position?.position_id ??
+    null
+  );
+}
+
+function positionQuantity(position) {
+  return Math.abs(Number(
+    position?.positionAmt ??
+      position?.positionAmount ??
+      position?.positionQuantity ??
+      position?.availableAmt ??
+      position?.quantity ??
+      position?.positionSize ??
+      0,
+  ));
+}
+
+function normalizeExchangeList(value) {
+  if (Array.isArray(value)) return value;
+  if (Array.isArray(value?.positions)) return value.positions;
+  if (Array.isArray(value?.orders)) return value.orders;
+  if (Array.isArray(value?.data)) return value.data;
+  return value ? [value] : [];
+}
+
 function normalizeResponse(payload) {
   if (payload?.code !== undefined && Number(payload.code) !== 0) {
     const error = new Error(payload.msg || payload.message || "BingX API error");
@@ -109,50 +166,181 @@ export function createBingxClient({
       });
     },
 
-    async placeReduceOnlyMarketOrder(symbol, side, quantity) {
-      return request("POST", "/openApi/swap/v2/trade/order", {
+    async placeReduceOnlyMarketOrder(symbol, side, quantity, options = {}) {
+      const positionSide = normalizePositionSide(options.positionSide) ?? positionSideFromPosition(options.position);
+      const payload = {
         quantity,
-        reduceOnly: true,
         side,
         symbol: normalizeSymbol(symbol),
         type: "MARKET",
-      });
+      };
+
+      if (positionSide) {
+        payload.positionSide = positionSide;
+      } else {
+        payload.reduceOnly = true;
+      }
+
+      return request("POST", "/openApi/swap/v2/trade/order", payload);
     },
 
-    async placeStopLoss(symbol, side, stopPrice, quantity) {
-      const closeSide = side === "BUY" ? "SELL" : "BUY";
-      return request("POST", "/openApi/swap/v2/trade/order", {
-        positionSide: side === "BUY" ? "LONG" : "SHORT",
+    async placeStopLoss(symbol, side, stopPrice, quantity, options = {}) {
+      const positionSide = normalizePositionSide(options.positionSide) ?? entrySideToPositionSide(side);
+      const payload = {
+        positionSide,
         quantity,
-        reduceOnly: true,
-        side: closeSide,
+        side: positionSide ? closeSideForPositionSide(positionSide) : oppositeOrderSide(side),
         stopPrice,
         symbol: normalizeSymbol(symbol),
         type: "STOP_MARKET",
-      });
+        workingType: options.workingType ?? "MARK_PRICE",
+      };
+      const positionId = options.positionId ?? positionIdentifier(options.position);
+
+      if (positionId) {
+        payload.positionId = positionId;
+      }
+
+      return request("POST", "/openApi/swap/v2/trade/order", payload);
     },
 
-    async placeTakeProfit(symbol, side, stopPrice, quantity) {
-      const closeSide = side === "BUY" ? "SELL" : "BUY";
-      return request("POST", "/openApi/swap/v2/trade/order", {
-        positionSide: side === "BUY" ? "LONG" : "SHORT",
+    async placeTakeProfit(symbol, side, stopPrice, quantity, options = {}) {
+      const positionSide = normalizePositionSide(options.positionSide) ?? entrySideToPositionSide(side);
+      const payload = {
+        positionSide,
         quantity,
-        reduceOnly: true,
-        side: closeSide,
+        side: positionSide ? closeSideForPositionSide(positionSide) : oppositeOrderSide(side),
         stopPrice,
         symbol: normalizeSymbol(symbol),
         type: "TAKE_PROFIT_MARKET",
-      });
+        workingType: options.workingType ?? "MARK_PRICE",
+      };
+      const positionId = options.positionId ?? positionIdentifier(options.position);
+
+      if (positionId) {
+        payload.positionId = positionId;
+      }
+
+      return request("POST", "/openApi/swap/v2/trade/order", payload);
     },
 
-    async closePosition(symbol) {
-      return request("POST", "/openApi/swap/v1/trade/closePosition", {
+    async placePositionStopLoss(symbol, side, stopPrice, options = {}) {
+      const positionSide = normalizePositionSide(options.positionSide) ?? entrySideToPositionSide(side);
+      const payload = {
+        closePosition: true,
+        positionSide,
+        quantity: options.quantity ?? positionQuantity(options.position),
+        side: positionSide ? closeSideForPositionSide(positionSide) : oppositeOrderSide(side),
+        stopPrice,
         symbol: normalizeSymbol(symbol),
+        type: "STOP_MARKET",
+        workingType: options.workingType ?? "MARK_PRICE",
+      };
+      const positionId = options.positionId ?? positionIdentifier(options.position);
+
+      if (positionId) {
+        payload.positionId = positionId;
+      }
+
+      return request("POST", "/openApi/swap/v2/trade/order", payload);
+    },
+
+    async placePositionTakeProfit(symbol, side, stopPrice, options = {}) {
+      const positionSide = normalizePositionSide(options.positionSide) ?? entrySideToPositionSide(side);
+      const payload = {
+        closePosition: true,
+        positionSide,
+        quantity: options.quantity ?? positionQuantity(options.position),
+        side: positionSide ? closeSideForPositionSide(positionSide) : oppositeOrderSide(side),
+        stopPrice,
+        symbol: normalizeSymbol(symbol),
+        type: "TAKE_PROFIT_MARKET",
+        workingType: options.workingType ?? "MARK_PRICE",
+      };
+      const positionId = options.positionId ?? positionIdentifier(options.position);
+
+      if (positionId) {
+        payload.positionId = positionId;
+      }
+
+      return request("POST", "/openApi/swap/v2/trade/order", payload);
+    },
+
+    async closePosition(symbol, options = {}) {
+      const normalizedSymbol = normalizeSymbol(symbol);
+      const positionId = options.positionId ?? positionIdentifier(options.position);
+
+      if (positionId) {
+        return request("POST", "/openApi/swap/v1/trade/closePosition", {
+          positionId,
+          symbol: normalizedSymbol,
+        });
+      }
+
+      const positions = options.position
+        ? [options.position]
+        : normalizeExchangeList(await client.getOpenPositions(symbol));
+      const requestedSide = normalizePositionSide(options.positionSide ?? options.side);
+      const openPositions = positions.filter((position) => {
+        if (compactSymbol(position.symbol) !== compactSymbol(symbol)) return false;
+        if (positionQuantity(position) <= 0) return false;
+        return !requestedSide || positionSideFromPosition(position) === requestedSide;
       });
+
+      if (openPositions.length === 0) {
+        return {
+          message: "No matching BingX position found to close.",
+          ok: false,
+          _diagnostics: {
+            endpoint: "/openApi/swap/v1/trade/closePosition",
+            hedgeMode: requestedSide ? "positionSide selected" : "no positionSide selected",
+            payload: { positionSide: requestedSide, symbol: normalizedSymbol },
+          },
+        };
+      }
+
+      const results = [];
+
+      for (const position of openPositions) {
+        const candidateId = positionIdentifier(position);
+
+        if (candidateId) {
+          results.push(await request("POST", "/openApi/swap/v1/trade/closePosition", {
+            positionId: candidateId,
+            symbol: normalizedSymbol,
+          }));
+          continue;
+        }
+
+        results.push(await client.placeReduceOnlyMarketOrder(
+          symbol,
+          closeSideForPositionSide(positionSideFromPosition(position)),
+          positionQuantity(position),
+          { position, positionSide: positionSideFromPosition(position) },
+        ));
+      }
+
+      return results.length === 1
+        ? results[0]
+        : {
+            closed: results,
+            _diagnostics: {
+              endpoint: "/openApi/swap/v1/trade/closePosition",
+              payload: { symbol: normalizedSymbol },
+            },
+          };
     },
 
     async cancelOpenOrders(symbol) {
       return request("POST", "/openApi/swap/v2/trade/allOpenOrders", {
+        symbol: normalizeSymbol(symbol),
+      });
+    },
+
+    async cancelOrder(symbol, { clientOrderId, orderId } = {}) {
+      return request("DELETE", "/openApi/swap/v2/trade/order", {
+        clientOrderId,
+        orderId,
         symbol: normalizeSymbol(symbol),
       });
     },
@@ -207,13 +395,25 @@ export function createBingxClient({
 
         if (!response.ok) {
           const error = new Error(payload.msg || `BingX HTTP ${response.status}`);
+          error.payload = payload;
           error.status = response.status;
           throw error;
         }
 
-        return normalizeResponse(payload);
+        let normalized;
+        try {
+          normalized = normalizeResponse(payload);
+        } catch (error) {
+          error.bingx = requestDiagnostics({ endpoint, method, payload: cleanParams, response: payload });
+          throw error;
+        }
+
+        return withDiagnostics(normalized, requestDiagnostics({ endpoint, method, payload: cleanParams, response: payload }));
       } catch (error) {
         if (attempt === MAX_RETRIES || !isRetryable(error)) {
+          if (!error.bingx) {
+            error.bingx = requestDiagnostics({ endpoint, method, payload: cleanParams, response: error.payload });
+          }
           throw error;
         }
 
@@ -252,4 +452,28 @@ export function createBingxClient({
   }
 
   return client;
+}
+
+function compactSymbol(symbol) {
+  return String(symbol ?? "").replace("-", "").toUpperCase();
+}
+
+function requestDiagnostics({ endpoint, method, payload, response }) {
+  return {
+    endpoint,
+    method,
+    payload,
+    response,
+  };
+}
+
+function withDiagnostics(value, diagnostics) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return {
+      ...value,
+      _diagnostics: diagnostics,
+    };
+  }
+
+  return value;
 }

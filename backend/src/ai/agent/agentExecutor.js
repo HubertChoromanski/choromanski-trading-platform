@@ -230,13 +230,22 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
     await updateProgress(run.id, { completed: 0, percent: 25, total: 1 }, "Reading platform status");
     const status = await toolRegistry.getPlatformStatus();
     const issue = await toolRegistry.diagnoseIssue({ question: run.prompt });
+    const baseline = run.plan?.baselineQuery && typeof toolRegistry.getBacktestDetail === "function"
+      ? await toolRegistry.getBacktestDetail(run.plan.baselineQuery, { tradeLimit: 100 })
+      : null;
     await updateProgress(run.id, { completed: 1, percent: 100, total: 1 }, "Diagnosis complete");
 
     return {
       rows: [],
-      summary: issue.likelyCause ?? "No clear issue was found in the latest backend status.",
-      toolsUsed: ["getPlatformStatus", "diagnoseIssue"],
-      warnings: status.status?.state?.lastError ? [status.status.state.lastError] : [],
+      baseline,
+      summary: baseline?.ok
+        ? `Resolved saved baseline ${baseline.name}: net ${baseline.metrics?.netProfit ?? "n/a"}, PF ${baseline.metrics?.profitFactor ?? "n/a"}, trades ${baseline.metrics?.totalTrades ?? "n/a"}. Ask a follow-up against a specific AI config to compare parity.`
+        : issue.likelyCause ?? "No clear issue was found in the latest backend status.",
+      toolsUsed: ["getPlatformStatus", "diagnoseIssue", ...(baseline ? ["getBacktestDetail"] : [])],
+      warnings: [
+        ...(status.status?.state?.lastError ? [status.status.state.lastError] : []),
+        ...(baseline && !baseline.ok ? [baseline.message ?? "Saved baseline could not be resolved."] : []),
+      ],
     };
   }
 
@@ -304,6 +313,8 @@ export function createAgentExecutor({ runStore, toolRegistry }) {
         generatedCombinations: normalizedOutput.generatedCombinations,
         integrity,
         message: normalizedOutput.summary,
+        baseline: normalizedOutput.baseline ?? null,
+        baselineComparison: normalizedOutput.baselineComparison ?? [],
         plannedCombinations: latest.plan?.plannedCombinations ?? latest.plan?.maxCombinations,
         requestedCombinations: latest.plan?.requestedCombinations ?? latest.plan?.maxCombinations,
         requestedRange: latest.plan?.range,

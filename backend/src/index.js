@@ -590,19 +590,76 @@ function publicStatusPayload() {
   };
 }
 
+function firstFiniteNumber(...values) {
+  for (const value of values) {
+    const numeric = Number(value);
+
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return numeric;
+    }
+  }
+
+  return null;
+}
+
+function extractNestedProtectionPrice(value) {
+  if (!value || typeof value !== "object") return null;
+  return firstFiniteNumber(
+    value.stopPrice,
+    value.triggerPrice,
+    value.price,
+    value.entrustPrice,
+    value.orderPrice,
+  );
+}
+
+function positionProtectionPrice(position, kind) {
+  if (!position || typeof position !== "object") return null;
+
+  if (kind === "SL") {
+    return firstFiniteNumber(
+      extractNestedProtectionPrice(position.stopLoss),
+      position.stopLossPrice,
+      position.stopLoss,
+      position.stopLossEntrustPrice,
+      position.slPrice,
+    );
+  }
+
+  return firstFiniteNumber(
+    extractNestedProtectionPrice(position.takeProfit),
+    position.takeProfitPrice,
+    position.takeProfit,
+    position.takeProfitEntrustPrice,
+    position.tpPrice,
+  );
+}
+
 function attachedOrdersForPosition(orders, position) {
   const symbol = compactSymbol(position.symbol);
-  return orders.filter((order) => compactSymbol(order.symbol) === symbol);
+  return orders.filter((order) => compactSymbol(order.symbol) === symbol && isSamePositionOrder(order, position, symbol));
 }
 
 function orderPrice(order) {
-  return Number(order.stopPrice ?? order.price ?? order.avgPrice ?? order.triggerPrice ?? 0);
+  if (!order || typeof order !== "object") return null;
+  return firstFiniteNumber(
+    order.stopPrice,
+    order.triggerPrice,
+    order.price,
+    order.avgPrice,
+    order.takeProfit?.stopPrice,
+    order.stopLoss?.stopPrice,
+  );
 }
 
 function findAttachedPrice(orders, matcher) {
   const order = orders.find((item) => matcher(String(item.type ?? item.orderType ?? "").toUpperCase()));
   const price = order ? orderPrice(order) : null;
   return Number.isFinite(price) && price > 0 ? price : null;
+}
+
+function findAttachedOrder(orders, matcher) {
+  return orders.find((item) => matcher(String(item.type ?? item.orderType ?? "").toUpperCase())) ?? null;
 }
 
 function positionEntryPrice(position) {
@@ -631,6 +688,7 @@ function buildLivestreamPayload(apiProfileRows = []) {
   const strategyDecks = store.getCollection("strategyDecks");
   const mmDecks = store.getCollection("mmDecks");
   const profiles = store.getProfiles().filter(isLiveExecutionProfile);
+  const hasExchangeProfileSync = apiProfileRows.length > 0;
   const liveProfileOrders = apiProfileRows.flatMap((profile) =>
     normalizeExchangeList(profile.openOrderItems).map((order) => ({
       ...order,
@@ -646,10 +704,10 @@ function buildLivestreamPayload(apiProfileRows = []) {
       __markPrice: profile.markPrices?.[compactSymbol(position.symbol)] ?? null,
     })),
   );
-  const openOrders = liveProfileOrders.length
+  const openOrders = hasExchangeProfileSync
     ? liveProfileOrders
     : normalizeExchangeList(state.bingx?.openOrders);
-  const exchangePositions = (liveProfilePositions.length
+  const exchangePositions = (hasExchangeProfileSync
     ? liveProfilePositions
     : normalizeExchangeList(state.bingx?.openPositions)).filter(
     (position) => positionAmount(position) > 0,
@@ -674,8 +732,12 @@ function buildLivestreamPayload(apiProfileRows = []) {
     const markPrice = positionMarkPrice(exchangePosition);
     const quantity = positionAmount(exchangePosition);
     const side = positionSide(exchangePosition);
-    const stopLoss = findAttachedPrice(orders, (type) => type.includes("STOP"));
-    const takeProfit = findAttachedPrice(orders, (type) => type.includes("TAKE_PROFIT") || type.includes("PROFIT"));
+    const stopLossOrder = findAttachedOrder(orders, (type) => type.includes("STOP") && !type.includes("TAKE"));
+    const takeProfitOrder = findAttachedOrder(orders, (type) => type.includes("TAKE_PROFIT") || type.includes("PROFIT"));
+    const directStopLoss = positionProtectionPrice(exchangePosition, "SL");
+    const directTakeProfit = positionProtectionPrice(exchangePosition, "TP");
+    const stopLoss = (stopLossOrder ? orderPrice(stopLossOrder) : null) ?? directStopLoss;
+    const takeProfit = (takeProfitOrder ? orderPrice(takeProfitOrder) : null) ?? directTakeProfit;
     const notional = markPrice * quantity;
     const pnl = positionPnl(exchangePosition);
     const openTime = exchangePosition.updateTime ?? exchangePosition.openTime ?? exchangePosition.time ?? null;
@@ -705,14 +767,24 @@ function buildLivestreamPayload(apiProfileRows = []) {
       notionalSize: notional,
       openTime,
       pnlPercent: notional ? pnl / notional * 100 : null,
+      positionId: positionIdentifier(exchangePosition),
+      positionSide: side,
+      protectionSource:
+        stopLossOrder || takeProfitOrder
+          ? "open orders"
+          : directStopLoss || directTakeProfit
+            ? "position fields"
+            : "none",
       quantity,
       realizedSessionPnl: calculateAnalytics(store.getTrades()).totalPnl,
       side,
       sourceProfileId: matchingProfile?.id ?? null,
       strategyDeckName: strategyDeck?.name ?? null,
       stopLoss,
+      stopLossSource: stopLossOrder ? "open orders" : directStopLoss ? "position fields" : "none",
       symbol: compactSymbol(exchangePosition.symbol),
       takeProfit,
+      takeProfitSource: takeProfitOrder ? "open orders" : directTakeProfit ? "position fields" : "none",
       timeframe: battleDeck?.timeframe ?? matchingProfile?.timeframe ?? null,
       unrealizedPnl: pnl,
     };
@@ -929,9 +1001,299 @@ function positionSide(position) {
   return Number(position.positionAmt ?? position.positionAmount ?? 0) < 0 ? "SHORT" : "LONG";
 }
 
+function positionIdentifier(position) {
+  return (
+    position?.positionId ??
+    position?.positionID ??
+    position?.id ??
+    position?.position_id ??
+    null
+  );
+}
+
+function selectManualPosition(positions, body, symbol) {
+  const requestedId = body.positionId ? String(body.positionId) : "";
+  const requestedSide = String(body.positionSide ?? body.side ?? "").toUpperCase();
+  const openPositions = positions.filter(
+    (position) => compactSymbol(position.symbol) === compactSymbol(symbol) && positionAmount(position) > 0,
+  );
+
+  if (requestedId) {
+    const match = openPositions.find((position) => String(positionIdentifier(position)) === requestedId);
+    if (match) return match;
+  }
+
+  if (requestedSide.includes("LONG") || requestedSide.includes("SHORT")) {
+    const side = requestedSide.includes("LONG") ? "LONG" : "SHORT";
+    const match = openPositions.find((position) => positionSide(position) === side);
+    if (match) return match;
+  }
+
+  return openPositions[0] ?? null;
+}
+
+function positionDiagnostic(position) {
+  if (!position) return null;
+  return {
+    positionId: positionIdentifier(position),
+    positionSide: positionSide(position),
+    quantity: positionAmount(position),
+    symbol: compactSymbol(position.symbol),
+  };
+}
+
+function orderIdentifier(order) {
+  return order?.orderId ?? order?.orderID ?? order?.id ?? null;
+}
+
+function orderClientIdentifier(order) {
+  return order?.clientOrderId ?? order?.clientOrderID ?? null;
+}
+
+function orderPositionSide(order) {
+  const explicitSide = String(order?.positionSide ?? "").toUpperCase();
+  if (explicitSide.includes("LONG")) return "LONG";
+  if (explicitSide.includes("SHORT")) return "SHORT";
+
+  const side = String(order?.side ?? "").toUpperCase();
+  const type = orderType(order);
+
+  if ((type.includes("STOP") || type.includes("PROFIT")) && side === "SELL") return "LONG";
+  if ((type.includes("STOP") || type.includes("PROFIT")) && side === "BUY") return "SHORT";
+  if (side.includes("LONG")) return "LONG";
+  if (side.includes("SHORT")) return "SHORT";
+  return null;
+}
+
+function orderType(order) {
+  return String(order?.type ?? order?.orderType ?? order?.origType ?? "").toUpperCase();
+}
+
+function orderDiagnostic(order) {
+  if (!order) return null;
+  return {
+    clientOrderId: orderClientIdentifier(order),
+    closePosition: order.closePosition ?? null,
+    orderId: orderIdentifier(order),
+    positionId: positionIdentifier(order),
+    positionSide: orderPositionSide(order),
+    price: orderPrice(order),
+    side: order.side ?? null,
+    status: order.status ?? null,
+    symbol: compactSymbol(order.symbol),
+    type: orderType(order),
+  };
+}
+
+function resultDiagnostics(result) {
+  return result?._diagnostics ?? null;
+}
+
+function resultOrder(result) {
+  return result?.order ?? result?.data?.order ?? result;
+}
+
+function resultOrderId(result) {
+  const order = resultOrder(result);
+  return orderIdentifier(order);
+}
+
+function isActiveOrder(order) {
+  const status = String(order?.status ?? "").toUpperCase();
+
+  if (!status) return Boolean(orderIdentifier(order) || orderClientIdentifier(order));
+  return !["CANCELED", "CANCELLED", "EXPIRED", "FILLED", "REJECTED"].includes(status);
+}
+
+function isSamePositionOrder(order, position, symbol) {
+  if (compactSymbol(order.symbol) !== compactSymbol(symbol)) return false;
+  const side = orderPositionSide(order);
+  return !side || side === positionSide(position);
+}
+
+function isProtectiveOrderForAction(order, action) {
+  const type = orderType(order);
+
+  if (action === "MOVE_SL") {
+    return type.includes("STOP") && !type.includes("TAKE");
+  }
+
+  if (action === "MOVE_TP") {
+    return type.includes("TAKE_PROFIT") || type.includes("PROFIT");
+  }
+
+  return false;
+}
+
+async function cancelExistingProtectiveOrders({ action, client, position, symbol }) {
+  const orders = normalizeExchangeList(await client.getOpenOrders(symbol));
+  const matchingOrders = orders.filter(
+    (order) => isSamePositionOrder(order, position, symbol) && isProtectiveOrderForAction(order, action),
+  );
+  const cancelled = [];
+  const cancelErrors = [];
+
+  for (const order of matchingOrders) {
+    const orderId = orderIdentifier(order);
+    const clientOrderId = orderClientIdentifier(order);
+
+    if (!orderId && !clientOrderId) {
+      cancelErrors.push({
+        error: "Open order had no orderId/clientOrderId.",
+        order: orderDiagnostic(order),
+      });
+      continue;
+    }
+
+    try {
+      const result = await client.cancelOrder(symbol, { clientOrderId, orderId });
+      cancelled.push({
+        order: orderDiagnostic(order),
+        result,
+      });
+    } catch (error) {
+      cancelErrors.push({
+        error: error instanceof Error ? error.message : String(error),
+        exchange: error?.bingx ?? null,
+        order: orderDiagnostic(order),
+      });
+    }
+  }
+
+  return {
+    cancelErrors,
+    cancelled,
+    matched: matchingOrders.map(orderDiagnostic).filter(Boolean),
+  };
+}
+
+async function queryPlacedOrder({ client, result, symbol }) {
+  const orderId = resultOrderId(result);
+
+  if (!orderId) {
+    return {
+      error: "BingX response did not include an order id.",
+      order: null,
+    };
+  }
+
+  try {
+    const statusResult = await client.getOrderStatus(orderId, symbol);
+    return {
+      diagnostics: resultDiagnostics(statusResult),
+      order: resultOrder(statusResult),
+      orderId,
+      raw: statusResult,
+    };
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : String(error),
+      exchange: error?.bingx ?? null,
+      orderId,
+      order: null,
+    };
+  }
+}
+
+function matchingSnapshotPosition(snapshot, originalPosition, symbol) {
+  const originalId = positionIdentifier(originalPosition);
+  const originalSide = positionSide(originalPosition);
+  const positions = normalizeExchangeList(snapshot?.openPositions);
+
+  if (originalId) {
+    const idMatch = positions.find((position) => String(positionIdentifier(position)) === String(originalId));
+    if (idMatch) return idMatch;
+  }
+
+  return positions.find(
+    (position) =>
+      compactSymbol(position.symbol) === compactSymbol(symbol) &&
+      positionSide(position) === originalSide &&
+      positionAmount(position) > 0,
+  ) ?? null;
+}
+
+function isClosePriceMatch(actual, requested) {
+  const actualNumber = Number(actual);
+  const requestedNumber = Number(requested);
+
+  if (!Number.isFinite(actualNumber) || !Number.isFinite(requestedNumber) || actualNumber <= 0 || requestedNumber <= 0) {
+    return false;
+  }
+
+  return Math.abs(actualNumber - requestedNumber) <= Math.max(0.00000001, requestedNumber * 0.001);
+}
+
+function verifyProtectiveAction({ action, position, requestedPrice, snapshot, symbol }) {
+  const currentPosition = matchingSnapshotPosition(snapshot, position, symbol);
+
+  if (!currentPosition) {
+    return {
+      confirmed: false,
+      message: "Exchange sync completed, but the original position is no longer open.",
+      reason: "position_missing_after_sync",
+    };
+  }
+
+  const directPrice = positionProtectionPrice(currentPosition, action === "MOVE_SL" ? "SL" : "TP");
+  const protectiveOrders = [
+    ...normalizeExchangeList(snapshot?.openOrders),
+    ...normalizeExchangeList(snapshot?.placedOrderItems),
+  ].filter(
+    (order) => isSamePositionOrder(order, currentPosition, symbol) && isProtectiveOrderForAction(order, action),
+  );
+  const activeProtectiveOrders = protectiveOrders.filter(isActiveOrder);
+  const matchedOrder = activeProtectiveOrders.find((order) => isClosePriceMatch(orderPrice(order), requestedPrice)) ?? null;
+  const matchedPrice = matchedOrder ? orderPrice(matchedOrder) : null;
+  const directMatches = isClosePriceMatch(directPrice, requestedPrice);
+  const confirmedPrice = directMatches ? directPrice : matchedPrice;
+
+  if (matchedOrder || directMatches) {
+    return {
+      confirmed: true,
+      confirmedPrice,
+      directPrice,
+      matchedOrder: orderDiagnostic(matchedOrder),
+      message: action === "MOVE_SL" ? "Stop loss confirmed on BingX." : "Take profit confirmed on BingX.",
+      priceMatchesRequest: true,
+      reason: "protective_order_found_after_sync",
+      source: matchedOrder ? "open_orders" : "position_fields",
+    };
+  }
+
+  if (activeProtectiveOrders.length > 0 || directPrice) {
+    return {
+      activeProtection: {
+        directPrice,
+        orders: activeProtectiveOrders.map(orderDiagnostic).filter(Boolean),
+      },
+      confirmed: false,
+      message: action === "MOVE_SL"
+        ? "Request accepted, but the active SL found after sync does not match the requested price."
+        : "Request accepted, but the active TP found after sync does not match the requested price.",
+      reason: "protective_price_mismatch_after_sync",
+    };
+  }
+
+  return {
+    confirmed: false,
+    message: action === "MOVE_SL"
+      ? "Request accepted, but no active SL was found after sync."
+      : "Request accepted, but no active TP was found after sync.",
+    reason: "protective_order_missing_after_sync",
+  };
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 async function executeManualAction(body) {
   const state = store.getState();
-  const client = getApiProfileClient(body.apiProfile ?? "main");
+  const apiProfile = String(body.apiProfile ?? "main").toLowerCase();
+  const client = getApiProfileClient(apiProfile);
 
   if (!client.auth.configured) {
     return { ok: false, message: "BingX keys are not configured." };
@@ -947,6 +1309,25 @@ async function executeManualAction(body) {
   const takeProfitPrice = Number(body.takeProfitPrice);
   const action = String(body.action ?? "").toUpperCase();
   let result;
+  let placementMode = null;
+  const placementErrors = [];
+  let placedOrderStatus = null;
+  let protectionManagement = null;
+  let selectedPosition = null;
+  let fetchedPositions = [];
+  let postActionSync = null;
+  let verification = null;
+
+  async function openPosition() {
+    fetchedPositions = normalizeExchangeList(await client.getOpenPositions(symbol));
+    selectedPosition = selectManualPosition(fetchedPositions, body, symbol);
+
+    if (!selectedPosition) {
+      return null;
+    }
+
+    return selectedPosition;
+  }
 
   if (["MARKET_LONG", "MARKET_SHORT"].includes(action)) {
     if (!Number.isFinite(quantity) || quantity <= 0) {
@@ -954,61 +1335,296 @@ async function executeManualAction(body) {
     }
     result = await client.placeMarketOrder(symbol, action === "MARKET_LONG" ? "BUY" : "SELL", quantity);
   } else if (action === "CLOSE_POSITION") {
-    result = await client.closePosition(symbol);
+    const position = await openPosition();
+
+    if (!position) {
+      return { ok: false, message: "No open position found on BingX for this symbol." };
+    }
+
+    result = await client.closePosition(symbol, {
+      position,
+      positionId: body.positionId ?? positionIdentifier(position),
+      positionSide: positionSide(position),
+    });
   } else if (action === "CLOSE_PARTIAL") {
     if (!Number.isFinite(quantity) || quantity <= 0) {
       return { ok: false, message: "Enter a valid partial close quantity first." };
     }
-    const positions = normalizeExchangeList(await client.getOpenPositions(symbol)).filter(
-      (position) => compactSymbol(position.symbol) === compactSymbol(symbol) && positionAmount(position) > 0,
-    );
-    const position = positions[0];
+    const position = await openPosition();
 
     if (!position) {
       return { ok: false, message: "No open position found on BingX for this symbol." };
     }
 
     const closeSide = positionSide(position) === "LONG" ? "SELL" : "BUY";
-    result = await client.placeReduceOnlyMarketOrder(symbol, closeSide, quantity);
+    result = await client.placeReduceOnlyMarketOrder(symbol, closeSide, quantity, {
+      position,
+      positionSide: positionSide(position),
+    });
   } else if (action === "CANCEL_ALL" || action === "CANCEL_ATTACHED_ORDERS") {
     result = await client.cancelOpenOrders(symbol);
   } else if (["MOVE_SL", "MOVE_TP"].includes(action)) {
-    const positions = normalizeExchangeList(await client.getOpenPositions(symbol)).filter(
-      (position) => compactSymbol(position.symbol) === compactSymbol(symbol) && positionAmount(position) > 0,
-    );
-    const position = positions[0];
+    const position = await openPosition();
 
     if (!position) {
       return { ok: false, message: "No open position found on BingX for this symbol." };
     }
 
     const side = positionSide(position) === "LONG" ? "BUY" : "SELL";
-    const inferredQuantity = positionAmount(position);
+    const protectiveQuantity = positionAmount(position);
+
+    if (!Number.isFinite(protectiveQuantity) || protectiveQuantity <= 0) {
+      return { ok: false, message: "BingX returned an open position without a usable quantity." };
+    }
 
     if (action === "MOVE_SL") {
       if (!Number.isFinite(stopPrice) || stopPrice <= 0) {
         return { ok: false, message: "Enter a valid SL price first." };
       }
-      result = await client.placeStopLoss(symbol, side, stopPrice, inferredQuantity);
+      protectionManagement = await cancelExistingProtectiveOrders({ action, client, position, symbol });
+
+      if (protectionManagement.cancelErrors.length > 0) {
+        return {
+          ok: false,
+          message: "BingX could not cancel the existing stop-loss order, so the SL was not moved.",
+          diagnostics: {
+            action,
+            hedgeMode: "positionSide",
+            positionsFound: fetchedPositions.map(positionDiagnostic).filter(Boolean),
+            protectionManagement,
+            selectedPosition: positionDiagnostic(selectedPosition),
+          },
+          symbol,
+        };
+      }
+
+      placementMode = "position-close-stop";
+      try {
+        result = await client.placePositionStopLoss(symbol, side, stopPrice, {
+          position,
+          positionId: body.positionId ?? positionIdentifier(position),
+          positionSide: positionSide(position),
+          quantity: protectiveQuantity,
+        });
+      } catch (error) {
+        placementErrors.push({
+          exchange: error?.bingx ?? null,
+          message: error instanceof Error ? error.message : String(error),
+          mode: placementMode,
+        });
+        placementMode = "standard-stop";
+        result = await client.placeStopLoss(symbol, side, stopPrice, protectiveQuantity, {
+          position,
+          positionId: body.positionId ?? positionIdentifier(position),
+          positionSide: positionSide(position),
+        });
+      }
     } else {
       if (!Number.isFinite(takeProfitPrice) || takeProfitPrice <= 0) {
         return { ok: false, message: "Enter a valid TP price first." };
       }
-      result = await client.placeTakeProfit(symbol, side, takeProfitPrice, inferredQuantity);
+      protectionManagement = await cancelExistingProtectiveOrders({ action, client, position, symbol });
+
+      if (protectionManagement.cancelErrors.length > 0) {
+        return {
+          ok: false,
+          message: "BingX could not cancel the existing take-profit order, so the TP was not moved.",
+          diagnostics: {
+            action,
+            hedgeMode: "positionSide",
+            positionsFound: fetchedPositions.map(positionDiagnostic).filter(Boolean),
+            protectionManagement,
+            selectedPosition: positionDiagnostic(selectedPosition),
+          },
+          symbol,
+        };
+      }
+
+      placementMode = "position-close-take-profit";
+      try {
+        result = await client.placePositionTakeProfit(symbol, side, takeProfitPrice, {
+          position,
+          positionId: body.positionId ?? positionIdentifier(position),
+          positionSide: positionSide(position),
+          quantity: protectiveQuantity,
+        });
+      } catch (error) {
+        placementErrors.push({
+          exchange: error?.bingx ?? null,
+          message: error instanceof Error ? error.message : String(error),
+          mode: placementMode,
+        });
+        placementMode = "standard-take-profit";
+        result = await client.placeTakeProfit(symbol, side, takeProfitPrice, protectiveQuantity, {
+          position,
+          positionId: body.positionId ?? positionIdentifier(position),
+          positionSide: positionSide(position),
+        });
+      }
     }
   } else {
     return { ok: false, message: "Choose a manual action first." };
   }
 
+  if (result?.ok === false) {
+    return {
+      ok: false,
+      message: result.message ?? "BingX did not accept the manual action.",
+      diagnostics: {
+          action,
+          exchange: resultDiagnostics(result),
+          exchangeResponse: resultDiagnostics(result)?.response ?? result,
+          hedgeMode: selectedPosition ? "positionSide" : "none",
+          placementErrors,
+          placedOrderStatus,
+          placementMode,
+          positionsFound: fetchedPositions.map(positionDiagnostic).filter(Boolean),
+        protectionManagement,
+        selectedPosition: positionDiagnostic(selectedPosition),
+      },
+      result,
+      symbol,
+    };
+  }
+
+  if (["MOVE_SL", "MOVE_TP"].includes(action)) {
+    await sleepMs(1200);
+    placedOrderStatus = await queryPlacedOrder({ client, result, symbol });
+  }
+
+  const freshRows = await publicApiProfiles({ fresh: true });
+  const profileRow =
+    freshRows.find((row) => row.id === apiProfile) ??
+    freshRows.find((row) => row.id === "main") ??
+    freshRows[0] ??
+    null;
+  const profileSnapshot = {
+    apiProfile,
+    balance: profileRow?.futuresBalance ?? null,
+    fetchedAt: profileRow?.lastSyncAt ?? new Date().toISOString(),
+    openOrders: normalizeExchangeList(profileRow?.openOrderItems),
+    openPositions: normalizeExchangeList(profileRow?.openPositionItems),
+    placedOrderItems: placedOrderStatus?.order ? [placedOrderStatus.order] : [],
+    orderDiagnostics: normalizeExchangeList(profileRow?.openOrderItems).map(orderDiagnostic).filter(Boolean),
+    placedOrderDiagnostics: placedOrderStatus?.order ? [orderDiagnostic(placedOrderStatus.order)].filter(Boolean) : [],
+    positionDiagnostics: normalizeExchangeList(profileRow?.openPositionItems).map(positionDiagnostic).filter(Boolean),
+    source: profileRow?.status === "connected" ? "fresh BingX" : "stale/error",
+    status: profileRow?.status ?? "missing profile",
+  };
+  postActionSync = {
+    accountProfile: {
+      configured: profileRow?.configured ?? false,
+      futuresBalance: profileRow?.futuresBalance ?? null,
+      id: profileRow?.id ?? apiProfile,
+      label: profileRow?.label ?? apiProfile,
+      lastSyncAt: profileRow?.lastSyncAt ?? null,
+      openOrders: profileRow?.openOrders ?? 0,
+      openPositions: profileRow?.openPositions ?? 0,
+      status: profileRow?.status ?? "missing profile",
+    },
+    livestream: buildLivestreamPayload(freshRows),
+    snapshot: {
+      ...profileSnapshot,
+      openOrders: profileSnapshot.orderDiagnostics,
+      openPositions: profileSnapshot.positionDiagnostics,
+      placedOrder: placedOrderStatus,
+    },
+  };
+
+  if (["MOVE_SL", "MOVE_TP"].includes(action)) {
+    verification = profileRow?.status === "connected"
+      ? verifyProtectiveAction({
+          action,
+          position: selectedPosition,
+          requestedPrice: action === "MOVE_SL" ? stopPrice : takeProfitPrice,
+          snapshot: profileSnapshot,
+          symbol,
+        })
+      : {
+          confirmed: false,
+          message: "BingX accepted the request, but the platform could not complete a fresh sync to confirm it.",
+          reason: "fresh_sync_failed",
+        };
+
+    if (!verification.confirmed) {
+      await store.appendLog({
+        context: {
+          action,
+          exchange: resultDiagnostics(result),
+          placementErrors,
+          placedOrderStatus,
+          placementMode,
+          postActionSync,
+          result,
+          selectedPosition: positionDiagnostic(selectedPosition),
+          symbol,
+          verification,
+        },
+        message: action === "MOVE_SL" ? "manual SL move unconfirmed" : "manual TP move unconfirmed",
+      });
+
+      return {
+        action,
+        ok: false,
+        message: verification.message,
+        diagnostics: {
+          action,
+          exchange: resultDiagnostics(result),
+          exchangeResponse: resultDiagnostics(result)?.response ?? result,
+          hedgeMode: selectedPosition ? "positionSide" : "none",
+          parsedSuccess: false,
+          placementErrors,
+          placedOrderStatus,
+          placementMode,
+          positionsFound: fetchedPositions.map(positionDiagnostic).filter(Boolean),
+          postActionSync,
+          protectionManagement,
+          selectedPosition: positionDiagnostic(selectedPosition),
+          verification,
+        },
+        livestream: postActionSync.livestream,
+        result,
+        symbol,
+      };
+    }
+  }
+
   await store.appendLog({
-    context: { action, result, symbol },
-    message: "manual exchange action sent",
+    context: {
+      action,
+      exchange: resultDiagnostics(result),
+      placementErrors,
+      placedOrderStatus,
+      placementMode,
+      postActionSync,
+      result,
+      selectedPosition: positionDiagnostic(selectedPosition),
+      symbol,
+      verification,
+    },
+    message: verification?.message ?? "manual exchange action confirmed",
   });
 
   return {
     action,
     ok: true,
-    message: "Manual exchange action sent.",
+    message: verification?.message ?? "Manual exchange action confirmed on BingX.",
+    diagnostics: {
+      action,
+      exchange: resultDiagnostics(result),
+      exchangeResponse: resultDiagnostics(result)?.response ?? result,
+      hedgeMode: selectedPosition ? "positionSide" : "none",
+      parsedSuccess: true,
+      placementErrors,
+      placedOrderStatus,
+      placementMode,
+      positionsFound: fetchedPositions.map(positionDiagnostic).filter(Boolean),
+      postActionSync,
+      protectionManagement,
+      selectedPosition: positionDiagnostic(selectedPosition),
+      verification,
+    },
+    livestream: postActionSync.livestream,
     result,
     symbol,
   };
@@ -1396,14 +2012,33 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "POST" && pathname === "/manual/action") {
       if (!requireDashboardToken(request, response)) return;
       const body = await readBody(request);
-      const result = await executeManualAction(body);
-      await botRunner.reconcileNow().catch((error) =>
-        store.appendLog({
-          context: { message: error instanceof Error ? error.message : String(error) },
-          message: "manual action reconciliation failed",
-        }),
-      );
-      sendJson(response, result.ok ? 200 : 400, result);
+      try {
+        const result = await executeManualAction(body);
+        await botRunner.reconcileNow().catch((error) =>
+          store.appendLog({
+            context: { message: error instanceof Error ? error.message : String(error) },
+            message: "manual action reconciliation failed",
+          }),
+        );
+        sendJson(response, result.ok ? 200 : 400, result);
+      } catch (error) {
+        const diagnostics = error?.bingx ?? null;
+        await store.appendLog({
+          context: {
+            action: body.action,
+            diagnostics,
+            message: error instanceof Error ? error.message : String(error),
+            symbol: body.symbol,
+          },
+          message: "manual exchange action failed",
+        });
+        sendJson(response, 502, {
+          ok: false,
+          message: `BingX rejected the manual action: ${humanBackendError(error)}`,
+          diagnostics,
+          rawExchangeResponse: diagnostics?.response ?? error?.payload ?? null,
+        });
+      }
       return;
     }
 
@@ -1419,6 +2054,29 @@ const server = http.createServer(async (request, response) => {
 
 	    if (request.method === "GET" && pathname === "/ai/code-map") {
 	      sendJson(response, 200, await buildCodeMap());
+	      return;
+	    }
+
+	    if (request.method === "GET" && pathname === "/ai/platform-map") {
+	      sendJson(response, 200, await aiTools.getPlatformMap());
+	      return;
+	    }
+
+	    if (request.method === "POST" && pathname === "/ai/platform/search") {
+	      const body = await readBody(request);
+	      sendJson(response, 200, await aiTools.searchPlatformCode(body));
+	      return;
+	    }
+
+	    if (request.method === "POST" && pathname === "/ai/platform/trace") {
+	      const body = await readBody(request);
+	      sendJson(response, 200, await aiTools.traceAction(body));
+	      return;
+	    }
+
+	    if (request.method === "POST" && pathname === "/ai/platform/state") {
+	      const body = await readBody(request);
+	      sendJson(response, 200, await aiTools.getRuntimeState(body));
 	      return;
 	    }
 
@@ -1479,6 +2137,13 @@ const server = http.createServer(async (request, response) => {
 	      if (request.method === "POST" && parts.length === 5 && parts[4] === "verify") {
 	        const body = await readBody(request);
 	        const result = await aiAgent.verifyIntegrity(runId, body);
+	        sendJson(response, result.statusCode ?? 200, result);
+	        return;
+	      }
+
+	      if (request.method === "POST" && parts.length === 5 && parts[4] === "compare-backtest") {
+	        const body = await readBody(request);
+	        const result = await aiAgent.compareAgentResultToBacktest(runId, body);
 	        sendJson(response, result.statusCode ?? 200, result);
 	        return;
 	      }

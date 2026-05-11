@@ -162,6 +162,26 @@ async function apiFetch(path, options = {}) {
   return payload;
 }
 
+async function apiFetchDetailed(path, options = {}) {
+  const headers = {
+    "Content-Type": "application/json",
+    ...(DASHBOARD_TOKEN ? { "X-Dashboard-Token": DASHBOARD_TOKEN } : {}),
+    ...(options.headers ?? {}),
+  };
+  const response = await fetch(apiUrl(path), {
+    ...options,
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+  const payload = await response.json().catch(() => ({}));
+
+  return {
+    ok: response.ok,
+    payload,
+    status: response.status,
+  };
+}
+
 function humanError(error) {
   const message = error instanceof Error ? error.message : String(error);
 
@@ -302,6 +322,16 @@ function displayBotStatus(status) {
 
 function compact(value) {
   return String(value ?? "").replace("-", "").toUpperCase();
+}
+
+function positionIdentifier(position) {
+  return (
+    position?.positionId ??
+    position?.positionID ??
+    position?.id ??
+    position?.position_id ??
+    null
+  );
 }
 
 function humanProfileStatus(profile = {}) {
@@ -941,8 +971,11 @@ export default function ControlCenter({
     timeframe: selectedInterval,
   });
   const [executionDeckId, setExecutionDeckId] = useState("");
+  const [manualActionResult, setManualActionResult] = useState(null);
   const [manualMessage, setManualMessage] = useState("");
   const [manualForm, setManualForm] = useState({
+    positionId: "",
+    positionSide: "",
     quantity: "",
     stopPrice: "",
     symbol: "SOLUSDT",
@@ -1151,15 +1184,63 @@ export default function ControlCenter({
     return saveCollectionItem("favorites", { ...favorite, hidden: true });
   }
 
-  function prepareCrisisAction(position, action) {
-    setManualForm((current) => ({
+  function prepareCrisisAction(position, action, values = {}) {
+    const current = manualForm;
+    const nextForm = {
       ...current,
       apiProfile: position.apiProfile ?? "main",
       quantity: position.quantity ? Number(position.quantity).toFixed(3) : current.quantity,
-      stopPrice: position.stopLoss ?? current.stopPrice,
+      positionId: position.positionId ?? current.positionId,
+      positionSide: position.positionSide ?? position.side ?? current.positionSide,
+      stopPrice: values.stopPrice ?? position.stopLoss ?? current.stopPrice,
       symbol: position.symbol ?? current.symbol ?? "SOLUSDT",
-      takeProfitPrice: position.takeProfit ?? current.takeProfitPrice,
-    }));
+      takeProfitPrice: values.takeProfitPrice ?? position.takeProfit ?? current.takeProfitPrice,
+    };
+
+    setManualForm(nextForm);
+
+    if (values.direct && action) {
+      return runAction(`position-card-${action}`, action === "MOVE_SL" ? "Move SL" : action === "MOVE_TP" ? "Move TP" : "Send manual action", async () => {
+        await apiFetch("/execution/crisis/on", { method: "POST" });
+        setManualActionResult(null);
+        setManualMessage("Sending manual action to BingX...");
+        let response;
+
+        try {
+          response = await apiFetchDetailed("/manual/action", {
+            body: {
+              ...nextForm,
+              action,
+              stopPrice: values.stopPrice ?? nextForm.stopPrice,
+              takeProfitPrice: values.takeProfitPrice ?? nextForm.takeProfitPrice,
+            },
+            method: "POST",
+          });
+        } catch (error) {
+          setManualMessage(humanError(error));
+          setManualActionResult({ ok: false, message: humanError(error) });
+          throw error;
+        }
+
+        const { ok, payload, status } = response;
+        setManualActionResult(payload);
+        if (payload.livestream) {
+          setLivestream(payload.livestream);
+        }
+        setManualMessage(payload.message || (ok ? "Manual exchange action confirmed on BingX." : "BingX rejected the manual action."));
+
+        if (!ok || payload.ok === false) {
+          const error = new Error(payload.message || "BingX rejected the manual action.");
+          error.status = status;
+          throw error;
+        }
+
+        setPendingManualAction(null);
+        await refreshLiveStatus({ fresh: true });
+        return payload;
+      });
+    }
+
     setPendingManualAction(action);
     setActivePanel("Crisis");
     if (!action) {
@@ -1321,6 +1402,14 @@ export default function ControlCenter({
 
   async function openAiBacktest(run, row) {
     if (!run || !row) throw new Error("Choose an AI result card first.");
+    if (!row.params || Object.keys(row.params).length === 0) {
+      throw new Error("Exact config missing. I cannot open this AI result as a backtest without stored parameters.");
+    }
+    const requiredParams = ["bandwidth", "envelopeMultiplier", "atrLength", "atrMultiplier", "maxSameSideFailures"];
+    const missingParams = requiredParams.filter((key) => row.params?.[key] === undefined || row.params?.[key] === null || row.params?.[key] === "");
+    if (missingParams.length) {
+      throw new Error(`Exact config missing ${missingParams.join(", ")}. Open diagnostics instead of running defaults.`);
+    }
     const provenance = row.provenance ?? {};
     const from = provenance.from ?? run.plan?.range?.from;
     const to = provenance.to ?? run.plan?.range?.to;
@@ -1774,6 +1863,8 @@ export default function ControlCenter({
         <LivestreamPanel
           accountProfiles={accountProfiles}
           livestream={livestream}
+          manualMessage={manualMessage}
+          manualResult={manualActionResult}
           onRefresh={() => runAction("refresh-live", "Refresh live stream", () => refreshLiveStatus({ fresh: true }))}
           onPositionAction={prepareCrisisAction}
         />
@@ -1898,11 +1989,13 @@ export default function ControlCenter({
           accountProfiles={accountProfiles}
           battleDecks={battleDecks}
           executionDeckId={executionDeckId}
+          livestream={livestream}
           rawCandles={rawCandles}
           selectedBattleDeck={selectedBattleDeck}
           setExecutionDeckId={setExecutionDeckId}
           setActivePanel={setActivePanel}
           status={system}
+          onForceSync={() => runAction("force-sync-execution", "Force BingX sync", () => refreshLiveStatus({ fresh: true }))}
           onAction={(path, label, body = {}) =>
             runAction(label, label, async () => {
               const result = await apiFetch(path, { body, method: "POST" });
@@ -1919,18 +2012,43 @@ export default function ControlCenter({
           livestream={livestream}
           message={manualMessage}
           pendingAction={pendingManualAction}
+          result={manualActionResult}
           setForm={setManualForm}
           setMessage={setManualMessage}
           setPendingAction={setPendingManualAction}
           symbol={selectedBattleDeck?.symbol ?? decision.symbol}
           onCrisisOff={() => runAction("crisis-off", "Crisis OFF", () => apiFetch("/execution/crisis/off", { method: "POST" }).then(refreshAll))}
           onCrisisOn={() => runAction("crisis-on", "Crisis ON", () => apiFetch("/execution/crisis/on", { method: "POST" }).then(refreshAll))}
+          onForceSync={() => runAction("force-sync-crisis", "Force BingX sync", () => refreshLiveStatus({ fresh: true }))}
           onManualAction={(body) =>
             runAction(`manual-${body.action}`, "Send manual action", async () => {
-              const result = await apiFetch("/manual/action", { body, method: "POST" });
-              setManualMessage(result.message);
+              setManualActionResult(null);
+              setManualMessage("Sending manual action to BingX...");
+              let response;
+
+              try {
+                response = await apiFetchDetailed("/manual/action", { body, method: "POST" });
+              } catch (error) {
+                setManualMessage(humanError(error));
+                setManualActionResult({ ok: false, message: humanError(error) });
+                throw error;
+              }
+
+              const { ok, payload, status } = response;
+              setManualActionResult(payload);
+              if (payload.livestream) {
+                setLivestream(payload.livestream);
+              }
+              setManualMessage(payload.message || (ok ? "Manual exchange action confirmed on BingX." : "BingX rejected the manual action."));
+
+              if (!ok || payload.ok === false) {
+                const error = new Error(payload.message || "BingX rejected the manual action.");
+                error.status = status;
+                throw error;
+              }
+
               setPendingManualAction(null);
-              await refreshAll();
+              await refreshLiveStatus({ fresh: true });
             })
           }
         />
@@ -2163,7 +2281,8 @@ function SystemPanel({
   );
 }
 
-function LivestreamPanel({ accountProfiles = [], livestream, onPositionAction, onRefresh }) {
+function LivestreamPanel({ accountProfiles = [], livestream, manualMessage, manualResult, onPositionAction, onRefresh }) {
+  const [positionControls, setPositionControls] = useState({});
   const summary = livestream?.accountSummary ?? {};
   const positions = livestream?.positions ?? [];
   const profileRows = accountProfiles.length ? accountProfiles : (summary.apiProfiles ?? []);
@@ -2177,6 +2296,15 @@ function LivestreamPanel({ accountProfiles = [], livestream, onPositionAction, o
   const lastSyncAt = summary.lastBingxSyncAt ?? summary.lastRefreshAt;
   const stale = secondsSince(lastSyncAt) !== null && secondsSince(lastSyncAt) > 120;
   const source = summary.source ?? (stale ? "backend cache" : "fresh BingX sync");
+  const updatePositionControl = (key, field, value) => {
+    setPositionControls((current) => ({
+      ...current,
+      [key]: {
+        ...(current[key] ?? {}),
+        [field]: value,
+      },
+    }));
+  };
 
   return (
     <section className="hubert-lab__section">
@@ -2198,6 +2326,22 @@ function LivestreamPanel({ accountProfiles = [], livestream, onPositionAction, o
         <MiniStatus tone="bad">
           Data may be stale. Last successful sync: {ageText(lastSyncAt)}.
         </MiniStatus>
+      )}
+      {manualMessage && (
+        <MiniStatus tone={manualResult?.ok === false ? "bad" : manualResult?.ok === true ? "good" : "neutral"}>
+          {manualMessage}
+        </MiniStatus>
+      )}
+      {manualResult && (
+        <details className="hubert-details">
+          <summary>Last exchange response</summary>
+          <pre>{JSON.stringify({
+            diagnostics: manualResult.diagnostics,
+            message: manualResult.message,
+            ok: manualResult.ok,
+            result: manualResult.result,
+          }, null, 2)}</pre>
+        </details>
       )}
       {profileRows.length > 0 && (
         <div className="hubert-lab__table">
@@ -2223,8 +2367,14 @@ function LivestreamPanel({ accountProfiles = [], livestream, onPositionAction, o
         <MiniStatus>No live positions are open right now.</MiniStatus>
       ) : (
         <div className="hubert-live-stack">
-          {positions.map((position) => (
-            <div className="hubert-live-card" key={`${position.symbol}-${position.side}-${position.apiProfile}`}>
+          {positions.map((position) => {
+            const key = `${position.symbol}-${position.side}-${position.apiProfile}-${position.positionId ?? ""}`;
+            const controls = positionControls[key] ?? {};
+            const slValue = controls.stopPrice ?? (position.stopLoss ? String(position.stopLoss) : "");
+            const tpValue = controls.takeProfitPrice ?? (position.takeProfit ? String(position.takeProfit) : "");
+
+            return (
+            <div className="hubert-live-card" key={key}>
               <div className="hubert-live-card__head">
                 <strong>{position.symbol} {position.side}</strong>
                 <span>{position.battleDeckName ?? "Manual"} · {position.timeframe ?? "--"} · {position.apiProfileLabel ?? position.apiProfile}</span>
@@ -2240,6 +2390,7 @@ function LivestreamPanel({ accountProfiles = [], livestream, onPositionAction, o
                 <Metric label="Leverage" value={position.leverage ? `${fmt(position.leverage, 1)}x` : "--"} />
                 <Metric label="SL" value={fmt(position.stopLoss)} />
                 <Metric label="TP" value={fmt(position.takeProfit)} />
+                <Metric label="Protection source" value={position.protectionSource ?? "none"} />
                 <Metric label="PnL" value={`${fmt(position.unrealizedPnl)} / ${fmt(position.pnlPercent)}%`} />
                 <Metric label="Distance to SL" value={position.distanceToSl ? `${fmt(position.distanceToSl)} (${fmt(position.distanceToSlPercent)}%)` : "--"} />
                 <Metric label="Distance to TP" value={position.distanceToTp ? `${fmt(position.distanceToTp)} (${fmt(position.distanceToTpPercent)}%)` : "--"} />
@@ -2248,15 +2399,51 @@ function LivestreamPanel({ accountProfiles = [], livestream, onPositionAction, o
                 <Metric label="Last action" value={position.lastAction ?? "--"} />
               </div>
               <OrderTable orders={position.attachedOrders ?? []} />
-              <div className="hubert-lab__actions">
+              <div className="hubert-position-controls">
+                <label>
+                  <span>SL</span>
+                  <input
+                    inputMode="decimal"
+                    placeholder="Stop price"
+                    type="number"
+                    value={slValue}
+                    onChange={(event) => updatePositionControl(key, "stopPrice", event.target.value)}
+                  />
+                </label>
+                <button
+                  type="button"
+                  disabled={!Number.isFinite(Number(slValue)) || Number(slValue) <= 0}
+                  onClick={() => onPositionAction(position, "MOVE_SL", { direct: true, stopPrice: slValue })}
+                >
+                  Move SL
+                </button>
+                <label>
+                  <span>TP</span>
+                  <input
+                    inputMode="decimal"
+                    placeholder="Take profit"
+                    type="number"
+                    value={tpValue}
+                    onChange={(event) => updatePositionControl(key, "takeProfitPrice", event.target.value)}
+                  />
+                </label>
+                <button
+                  type="button"
+                  disabled={!Number.isFinite(Number(tpValue)) || Number(tpValue) <= 0}
+                  onClick={() => onPositionAction(position, "MOVE_TP", { direct: true, takeProfitPrice: tpValue })}
+                >
+                  Move TP
+                </button>
                 <button type="button" onClick={() => onPositionAction(position, "CLOSE_POSITION")}>Close Position</button>
-                <button type="button" onClick={() => onPositionAction(position, "MOVE_SL")}>Move SL</button>
-                <button type="button" onClick={() => onPositionAction(position, "MOVE_TP")}>Move TP</button>
+                <button type="button" onClick={onRefresh}>Force Sync</button>
+              </div>
+              <div className="hubert-lab__actions">
                 <button type="button" onClick={() => onPositionAction(position, "CANCEL_ATTACHED_ORDERS")}>Cancel Orders</button>
                 <button type="button" onClick={() => onPositionAction(position, null)}>Crisis Control</button>
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </section>
@@ -2951,7 +3138,7 @@ function BattleDecksPanel({ decks, onDelete, onDuplicate, onFavorite, onSend }) 
   );
 }
 
-function ExecutionPanel({ accountProfiles, battleDecks, executionDeckId, onAction, rawCandles, selectedBattleDeck, setActivePanel, setExecutionDeckId, status }) {
+function ExecutionPanel({ accountProfiles, battleDecks, executionDeckId, livestream, onAction, onForceSync, rawCandles, selectedBattleDeck, setActivePanel, setExecutionDeckId, status }) {
   const state = status?.state ?? {};
   const bingx = state.bingx ?? {};
   const selectedProfile =
@@ -2965,9 +3152,10 @@ function ExecutionPanel({ accountProfiles, battleDecks, executionDeckId, onActio
     status,
   });
   const ready = readinessIssues.length === 0;
-  const exchangePosition = status?.summary?.openPosition ?? bingx.openPositions?.[0] ?? null;
-  const openOrders = bingx.openOrders ?? [];
+  const exchangePosition = livestream?.positions?.[0] ?? null;
+  const openOrders = livestream?.openOrders ?? [];
   const currentPrice = rawCandles.at(-1)?.close;
+  const liveSummary = livestream?.accountSummary ?? {};
 
   return (
     <section className="hubert-lab__section">
@@ -2987,12 +3175,14 @@ function ExecutionPanel({ accountProfiles, battleDecks, executionDeckId, onActio
         <Metric label="Futures balance" value={fmt(executionBalance)} />
         <Metric label="Position" value={exchangePosition ? `${exchangePosition.symbol ?? selectedBattleDeck?.symbol} ${exchangePosition.positionSide ?? exchangePosition.side ?? ""}` : "None"} />
         <Metric label="Open orders" value={openOrders.length} />
+        <Metric label="Live sync" value={liveSummary.lastBingxSyncAt ? `${ageText(liveSummary.lastBingxSyncAt)} · ${liveSummary.source ?? "BingX"}` : "Syncing"} />
         <Metric label="Last signal" value={state.lastStrategySignal?.direction ?? "--"} />
         <Metric label="Last action" value={state.lastExecutionDecision ?? "--"} />
       </div>
       <div className="hubert-lab__actions hubert-lab__actions--sticky">
         <button disabled={!ready} type="button" onClick={() => onAction("/execution/start", "Start Bot", { battleDeckId: selectedBattleDeck?.id, confirm: "START_LIVE" })}>Start Bot</button>
         <button type="button" onClick={() => setActivePanel("Livestream")}>Open Livestream</button>
+        <button type="button" onClick={onForceSync}>Force Sync</button>
         <button type="button" onClick={() => onAction("/execution/pause", "Pause Bot")}>Pause Bot</button>
         <button type="button" onClick={() => onAction("/execution/resume", "Resume Bot")}>Resume Bot</button>
         <button type="button" onClick={() => onAction("/execution/stop", "Stop Bot")}>Stop Bot</button>
@@ -3011,22 +3201,25 @@ function CrisisPanel({
   message,
   onCrisisOff,
   onCrisisOn,
+  onForceSync,
   onManualAction,
   pendingAction,
+  result,
   setForm,
   setMessage,
   setPendingAction,
   symbol,
 }) {
   const positions = livestream?.positions ?? [];
+  const summary = livestream?.accountSummary ?? {};
   const activePosition = positions.find((position) => compact(position.symbol) === compact(form.symbol || symbol)) ?? positions[0];
   const actions = [
     ["MARKET_LONG", "Market Long", "Sends a real market long with the quantity below."],
     ["MARKET_SHORT", "Market Short", "Sends a real market short with the quantity below."],
-    ["MOVE_SL", "Move SL", "Places a new stop-loss order for the open BingX position."],
-    ["MOVE_TP", "Move TP", "Places a new take-profit order for the open BingX position."],
-    ["CLOSE_POSITION", "Close Position", "Requests BingX to close the full symbol position."],
-    ["CLOSE_PARTIAL", "Close Partial", "Sends a reduce-only market order for the quantity below."],
+    ["MOVE_SL", "Move SL", "Cancels the current hedge-side SL if present, then places the replacement."],
+    ["MOVE_TP", "Move TP", "Cancels the current hedge-side TP if present, then places the replacement."],
+    ["CLOSE_POSITION", "Close Position", "Closes the selected BingX hedge-side position."],
+    ["CLOSE_PARTIAL", "Close Partial", "Sends a hedge-side market close for the quantity below."],
     ["CANCEL_ALL", "Cancel All Orders", "Cancels open orders for this symbol."],
   ];
   const positionOnlyActions = new Set(["MOVE_SL", "MOVE_TP", "CLOSE_POSITION", "CLOSE_PARTIAL", "CANCEL_ALL"]);
@@ -3034,7 +3227,12 @@ function CrisisPanel({
   function chooseAction(action) {
     setMessage("");
     setPendingAction(action);
-    setForm((current) => ({ ...current, symbol: current.symbol || symbol || "SOLUSDT" }));
+    setForm((current) => ({
+      ...current,
+      positionId: positionIdentifier(activePosition) ?? current.positionId ?? "",
+      positionSide: activePosition?.positionSide ?? activePosition?.side ?? current.positionSide ?? "",
+      symbol: current.symbol || activePosition?.symbol || symbol || "SOLUSDT",
+    }));
   }
 
   function confirmAction() {
@@ -3042,6 +3240,8 @@ function CrisisPanel({
     onManualAction({
       action: pendingAction,
       apiProfile: form.apiProfile ?? activePosition?.apiProfile ?? "main",
+      positionId: form.positionId || positionIdentifier(activePosition) || undefined,
+      positionSide: form.positionSide || activePosition?.positionSide || activePosition?.side || undefined,
       quantity: Number(form.quantity),
       stopPrice: Number(form.stopPrice),
       symbol: form.symbol || symbol || "SOLUSDT",
@@ -3062,6 +3262,8 @@ function CrisisPanel({
             <Metric label="Entry" value={fmt(activePosition.entryPrice)} />
             <Metric label="Mark" value={fmt(activePosition.currentPrice)} />
             <Metric label="Quantity" value={fmt(activePosition.quantity, 3)} />
+            <Metric label="Position ID" value={positionIdentifier(activePosition) ?? "BingX did not provide one"} />
+            <Metric label="Position side" value={activePosition.positionSide ?? activePosition.side ?? "--"} />
             <Metric label="PnL" value={fmt(activePosition.unrealizedPnl)} />
             <Metric label="SL" value={fmt(activePosition.stopLoss)} />
             <Metric label="TP" value={fmt(activePosition.takeProfit)} />
@@ -3074,7 +3276,11 @@ function CrisisPanel({
       <div className="hubert-lab__actions">
         <button type="button" onClick={onCrisisOn}>Crisis Management ON</button>
         <button type="button" onClick={onCrisisOff}>Crisis Management OFF</button>
+        <button type="button" onClick={onForceSync}>Force Sync</button>
       </div>
+      <MiniStatus tone={dataFreshnessTone(summary.lastBingxSyncAt)}>
+        Source: {summary.source ?? "syncing"}. Last BingX sync: {ageText(summary.lastBingxSyncAt)}. Data age: {summary.dataAgeSeconds ?? "--"}s.
+      </MiniStatus>
       <div className="hubert-lab__grid">
         <TextField label="Symbol" value={form.symbol || symbol || "SOLUSDT"} onChange={(value) => setForm({ ...form, symbol: value.toUpperCase() })} />
         <NumberField label="Quantity" value={form.quantity} step="0.001" onChange={(value) => setForm({ ...form, quantity: value })} />
@@ -3106,6 +3312,16 @@ function CrisisPanel({
         </div>
       )}
       {message && <MiniStatus>{message}</MiniStatus>}
+      {result && (
+        <details className="hubert-details">
+          <summary>Exchange response and payload</summary>
+          <pre>{JSON.stringify({
+            diagnostics: result.diagnostics ?? null,
+            rawExchangeResponse: result.rawExchangeResponse ?? null,
+            result: result.result ?? null,
+          }, null, 2)}</pre>
+        </details>
+      )}
     </section>
   );
 }
@@ -3184,9 +3400,12 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
     maxCombinations: 100,
     objective: "robustness-adjusted return",
   });
+  const [copilotMode, setCopilotMode] = useState("research");
   const [runs, setRuns] = useState([]);
   const [activeRunId, setActiveRunId] = useState("");
   const [manualResult, setManualResult] = useState(null);
+  const [baselineCompareName, setBaselineCompareName] = useState("hubert");
+  const [baselineCompareResult, setBaselineCompareResult] = useState(null);
   const [queueStatus, setQueueStatus] = useState(null);
   const [activeResultIndex, setActiveResultIndex] = useState(0);
   const [collapseAllChat, setCollapseAllChat] = useState(false);
@@ -3233,6 +3452,48 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
   async function startRun() {
     return runAction("ai-agent-run", "Start agent", async () => {
       if (!prompt.trim()) throw new Error("Tell the agent what to analyze first.");
+      if (copilotMode !== "research") {
+        const localRunId = activeRun?.id ?? "platform-evidence";
+        setChatMessages((current) => [
+          ...current,
+          {
+            localOnly: true,
+            role: "user",
+            runId: localRunId,
+            text: prompt.trim(),
+            time: new Date().toISOString(),
+          },
+        ]);
+        const payload = await apiRequest("/ai/agent/chat", {
+          body: {
+            message: prompt.trim(),
+            mode: copilotMode,
+            ...(activeRun?.id ? { runId: activeRun.id } : {}),
+          },
+          method: "POST",
+        });
+        if (!payload.ok) {
+          throw new Error(payload.message ?? "The backend did not generate an evidence answer.");
+        }
+        setManualResult(payload);
+        setChatMessages((current) => [
+          ...current,
+          {
+            confidence: payload.response?.confidence,
+            evidence: payload.response?.evidence ?? [],
+            localOnly: !activeRun?.id,
+            platformEvidence: payload.response?.platformEvidence,
+            risk: payload.response?.risk,
+            role: "assistant",
+            runId: localRunId,
+            sections: payload.response?.sections ?? [],
+            text: payload.response?.answer ?? "No answer came back.",
+            time: new Date().toISOString(),
+          },
+        ]);
+        if (activeRun?.id) await loadRuns();
+        return payload;
+      }
       const payload = await apiRequest("/ai/agent/run", {
         body: {
           options: {
@@ -3375,8 +3636,8 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
   async function askFollowUp(message = followUpText, row = null) {
     return runAction("ai-agent-follow-up", "Ask copilot", async () => {
       if (!message.trim()) throw new Error("Ask a follow-up first.");
-      if (!activeRun?.id) throw new Error("Open an AI run before asking a follow-up.");
-      const runId = activeRun.id;
+      if (!activeRun?.id && copilotMode === "research") throw new Error("Open an AI run before asking a follow-up.");
+      const runId = activeRun?.id ?? "platform-evidence";
       const contextRow = row ?? activeResult;
       const userMessage = { role: "user", runId, text: message.trim(), time: new Date().toISOString() };
       setFollowUpState({ message: "Thinking with the active run context...", state: "thinking" });
@@ -3385,9 +3646,10 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
         const payload = await apiRequest("/ai/agent/chat", {
           body: {
             message: message.trim(),
+            mode: copilotMode,
             rowId: contextRow?.id,
             rowIndex: contextRow?.rank ? Number(contextRow.rank) - 1 : undefined,
-            runId,
+            ...(activeRun?.id ? { runId: activeRun.id } : {}),
           },
           method: "POST",
         });
@@ -3401,6 +3663,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
             confidence: payload.response?.confidence,
             critique: payload.response?.critique,
             evidence: payload.response?.evidence ?? [],
+            platformEvidence: payload.response?.platformEvidence,
             risk: payload.response?.risk,
             role: "assistant",
             row: payload.response?.row,
@@ -3412,8 +3675,10 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
           },
         ]);
         setFollowUpText("");
-        await loadRuns();
-        setChatMessages((current) => current.filter((item) => item.runId !== runId || item.localOnly));
+        if (activeRun?.id) {
+          await loadRuns();
+          setChatMessages((current) => current.filter((item) => item.runId !== runId || item.localOnly));
+        }
         setFollowUpState({ message: "Follow-up answered.", state: "completed" });
         window.setTimeout(() => setFollowUpState((current) => (
           current.state === "completed" ? { message: "", state: "idle" } : current
@@ -3520,6 +3785,42 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
     });
   }
 
+  async function compareToSavedBacktest(row = activeResult, name = baselineCompareName) {
+    return runAction("ai-agent-compare-saved", "Compare to saved backtest", async () => {
+      if (!activeRun?.id) throw new Error("Open an AI run first.");
+      if (!row?.id) throw new Error("Choose an AI result to compare first.");
+      if (!String(name ?? "").trim()) throw new Error("Enter a saved backtest name, for example hubert.");
+      const payload = await apiRequest(`/ai/agent/runs/${encodeURIComponent(activeRun.id)}/compare-backtest`, {
+        body: {
+          backtestNameOrId: String(name).trim(),
+          rowId: row.id,
+        },
+        method: "POST",
+      });
+      setManualResult(payload);
+      setBaselineCompareResult(payload);
+      setChatMessages((current) => [
+        ...current,
+        {
+          baselineComparison: payload,
+          evidence: [
+            `Saved backtest: ${payload.baseline?.name ?? name}`,
+            `AI net: ${payload.metricDiff?.netProfit?.ai ?? "n/a"}`,
+            `Saved net: ${payload.metricDiff?.netProfit?.saved ?? "n/a"}`,
+            `Context match: ${payload.parity?.allContextMatch ? "yes" : "no"}`,
+          ],
+          role: "assistant",
+          runId: activeRun.id,
+          row: payload.row,
+          text: payload.explanation ?? "Saved backtest comparison completed.",
+          time: new Date().toISOString(),
+          verifiedFrom: verifiedFromFor(row),
+        },
+      ]);
+      return payload;
+    });
+  }
+
   async function callManualTool(toolName, input = {}) {
     return runAction(`ai-manual-${toolName}`, toolName, async () => {
       const payload = await apiRequest("/ai/tool", {
@@ -3591,7 +3892,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
             <button type="button" onClick={() => verifyIntegrity(row)}>Verify integrity</button>
             <button type="button" onClick={() => rerunExact(row)}>Re-run exact</button>
             <button type="button" onClick={() => rerunExact(row, { openPanel: true })}>Open Backtest</button>
-            <button type="button" onClick={() => rerunExact(row)}>Compare with manual backtest</button>
+            <button type="button" onClick={() => compareToSavedBacktest(row)}>Compare to saved backtest</button>
             <button type="button" onClick={() => rerunExact(row)}>Show metric diff</button>
           </div>
         ) : (
@@ -3616,6 +3917,12 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
           </div>
         )}
         {isAssistant && renderVerifiedFrom(message.verifiedFrom, row)}
+        {isAssistant && message.baselineComparison?.ok && (
+          <details className="hubert-ai-reasoning" open>
+            <summary>Saved baseline comparison · {message.baselineComparison.baseline?.name}</summary>
+            <small>{message.baselineComparison.explanation}</small>
+          </details>
+        )}
         {isAssistant && message.sections?.length > 0 && (
           <details className="hubert-ai-reasoning">
             <summary>Details / reasoning</summary>
@@ -3630,6 +3937,18 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
                 )}
               </section>
             ))}
+          </details>
+        )}
+        {isAssistant && message.platformEvidence && (
+          <details className="hubert-ai-reasoning">
+            <summary>Platform evidence</summary>
+            <small>Confidence: {message.platformEvidence.confidence ?? "unknown"}</small>
+            {message.platformEvidence.inspected?.length > 0 && (
+              <ul>
+                {message.platformEvidence.inspected.slice(0, 10).map((item, itemIndex) => <li key={`${itemIndex}-${item}`}>{item}</li>)}
+              </ul>
+            )}
+            {message.platformEvidence.unknown?.length > 0 && <small>Unknown: {message.platformEvidence.unknown.join(" · ")}</small>}
           </details>
         )}
         {message.evidence?.length > 0 && (
@@ -3668,6 +3987,16 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
         <Metric label="Model" value={aiStatus?.model ?? "not connected"} />
         <Metric label="Trading" value="Blocked for AI" />
       </div>
+      <div className="hubert-lab__actions hubert-ai-mode">
+        <button type="button" data-active={copilotMode === "research"} onClick={() => setCopilotMode("research")}>Research mode</button>
+        <button type="button" data-active={copilotMode === "platform-diagnosis"} onClick={() => setCopilotMode("platform-diagnosis")}>Platform diagnosis mode</button>
+        <button type="button" data-active={copilotMode === "code-evidence"} onClick={() => setCopilotMode("code-evidence")}>Code/data evidence mode</button>
+      </div>
+      <MiniStatus>
+        {copilotMode === "research"
+          ? "Research mode starts queued analysis jobs."
+          : "Evidence mode answers from source files, routes, runtime state, and saved platform data. It is read-only."}
+      </MiniStatus>
 
       <div className="hubert-copilot-grid">
         <div>
@@ -3702,14 +4031,16 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
             <label>
               <span>Ask about current result</span>
               <textarea
-                placeholder={activeRun?.id ? "Ask a follow-up, for example: would you trust this live first?" : "Open or run research before asking about a result."}
+                placeholder={activeRun?.id || copilotMode !== "research" ? "Ask a follow-up, for example: trace the Move SL button." : "Open or run research before asking about a result."}
                 value={followUpText}
                 onChange={(event) => setFollowUpText(event.target.value)}
               />
             </label>
             <div className="hubert-lab__actions">
-              <button type="button" disabled={!activeRun?.id || ["thinking", "responding"].includes(followUpState.state)} onClick={() => askFollowUp(followUpText)}>Ask About Current Result</button>
-              <button type="button" disabled={!activeRun?.id || ["thinking", "responding"].includes(followUpState.state)} onClick={() => askFollowUp("Give me a deep analysis of the current result: strengths, weaknesses, overfit risk, confidence, and exact next tests.", activeResult)}>Deep Analysis</button>
+              <button type="button" disabled={(copilotMode === "research" && !activeRun?.id) || ["thinking", "responding"].includes(followUpState.state)} onClick={() => askFollowUp(followUpText)}>
+                {copilotMode === "research" ? "Ask About Current Result" : "Ask with Evidence"}
+              </button>
+              <button type="button" disabled={(copilotMode === "research" && !activeRun?.id) || ["thinking", "responding"].includes(followUpState.state)} onClick={() => askFollowUp(copilotMode === "research" ? "Give me a deep analysis of the current result: strengths, weaknesses, overfit risk, confidence, and exact next tests." : "Answer from platform evidence: inspect files, routes, runtime state, unknowns, and verification steps.", activeResult)}>Deep Analysis</button>
               <button type="button" onClick={startNewChat}>Start New Chat</button>
             </div>
           </div>
@@ -3726,7 +4057,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
             </MiniStatus>
           )}
           <div className="hubert-lab__actions">
-            <button type="button" onClick={startRun}>Run Research</button>
+            <button type="button" onClick={startRun}>{copilotMode === "research" ? "Run Research" : "Ask from Platform Evidence"}</button>
             <button type="button" onClick={() => runAction("ai-agent-refresh", "Refresh agent runs", loadRuns)}>Refresh</button>
             {running && <button type="button" onClick={() => cancelRun(activeRun.id)}>Cancel</button>}
             {["interrupted", "stalled", "cancelled", "failed"].includes(activeRun?.status) && (
@@ -3847,7 +4178,7 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
                         <button type="button" onClick={() => rerunExact(activeResult)}>Re-run exact</button>
                         <button type="button" onClick={() => verifyIntegrity(activeResult)}>Verify integrity</button>
                         <button type="button" onClick={() => rerunExact(activeResult, { openPanel: true })}>Open Backtest</button>
-                        <button type="button" onClick={() => rerunExact(activeResult)}>Compare with manual backtest</button>
+                        <button type="button" onClick={() => compareToSavedBacktest(activeResult)}>Compare to saved backtest</button>
                         <button type="button" onClick={() => rerunExact(activeResult)}>Show metric diff</button>
                         <button type="button" onClick={() => {
                           setStrategyForm?.(rowStrategyDraft(activeResult));
@@ -3855,6 +4186,33 @@ function AiAgentPanel({ aiStatus, apiRequest, onBacktestResult, onOpenAiBacktest
                         }}>Open Strategy Draft</button>
                         <button type="button" onClick={() => askFollowUp(`Explain current result #${activeResult.rank ?? activeResultIndex + 1}.`, activeResult)}>Ask about this</button>
                       </div>
+                      <div className="hubert-inline-form">
+                        <label>
+                          <span>Saved baseline</span>
+                          <input value={baselineCompareName} onChange={(event) => setBaselineCompareName(event.target.value)} placeholder="hubert" />
+                        </label>
+                        <button type="button" onClick={() => compareToSavedBacktest(activeResult)}>Compare</button>
+                      </div>
+                      {baselineCompareResult?.ok && baselineCompareResult.runId === activeRun.id && (
+                        <details className="hubert-advanced" open>
+                          <summary>Saved backtest comparison: {baselineCompareResult.baseline?.name}</summary>
+                          <MiniStatus tone={baselineCompareResult.parity?.allContextMatch ? "good" : "warn"}>
+                            {baselineCompareResult.explanation}
+                          </MiniStatus>
+                          <div className="hubert-lab__metrics">
+                            <Metric label="AI net" value={metricText(baselineCompareResult.metricDiff?.netProfit?.ai, 2, " USDT")} />
+                            <Metric label="Saved net" value={metricText(baselineCompareResult.metricDiff?.netProfit?.saved, 2, " USDT")} />
+                            <Metric label="AI PF" value={metricText(baselineCompareResult.metricDiff?.profitFactor?.ai)} />
+                            <Metric label="Saved PF" value={metricText(baselineCompareResult.metricDiff?.profitFactor?.saved)} />
+                            <Metric label="Context" value={baselineCompareResult.parity?.allContextMatch ? "Match" : "Different"} />
+                          </div>
+                          <pre className="hubert-ai-json">{JSON.stringify({
+                            contextDiff: baselineCompareResult.contextDiff,
+                            metricDiff: baselineCompareResult.metricDiff,
+                            resolution: baselineCompareResult.baseline?.resolved,
+                          }, null, 2).slice(0, 7000)}</pre>
+                        </details>
+                      )}
                     </article>
                   )}
                 </>

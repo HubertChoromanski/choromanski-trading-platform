@@ -34,6 +34,24 @@ function clone(value) {
   return value ? structuredClone(value) : value;
 }
 
+function uniqueNumbers(values = [], { integer = false, positive = false } = {}) {
+  return [...new Set(values
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value))
+    .map((value) => (integer ? Math.round(value) : Number(value.toFixed(8))))
+    .filter((value) => (!positive || value > 0)))]
+    .sort((left, right) => left - right);
+}
+
+function baselineNeighbors(value, { integer = false, min = 0, step = 1 } = {}) {
+  const base = Number(value);
+  if (!Number.isFinite(base)) return [];
+  const values = integer
+    ? [base - step, base, base + step]
+    : [base - step, base, base + step];
+  return uniqueNumbers(values.map((item) => Math.max(min, item)), { integer, positive: min > 0 });
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -135,12 +153,13 @@ function runPreparedBacktestInWorker(prepared, { label, timeoutMs }) {
 export function buildSweepCombinations(plan) {
   const parameters = plan.parameters ?? {};
   const sizingMode = plan.sizingMode ?? "position-percent";
-  const bandwidths = parseList(parameters.bandwidthValues, [6, 7, 8, 9, 10], { positive: true });
-  const envelopes = parseList(parameters.envelopeMultiplierValues, [2, 2.5, 3, 3.5, 4], { positive: true });
-  const atrLengths = parseList(parameters.atrLengthValues, [10, 14], { integer: true, positive: true });
-  const atrMultipliers = parseList(parameters.atrMultiplierValues, [0.8, 1, 1.2, 1.4, 1.6], { positive: true });
-  const maxFailures = parseList(parameters.maxSameSideFailuresValues, [1, 2, 3], { integer: true });
-  const sizingValues = parseList(parameters.sizingValues, sizingMode === "fixed-risk" ? [0.5, 1, 2] : [5, 10], { positive: true });
+  const baseline = plan.baselineParams ?? {};
+  const bandwidths = parseList(parameters.bandwidthValues, baseline.bandwidth ? baselineNeighbors(baseline.bandwidth, { min: 0.1, step: 1 }) : [6, 7, 8, 9, 10], { positive: true });
+  const envelopes = parseList(parameters.envelopeMultiplierValues, baseline.envelopeMultiplier ? baselineNeighbors(baseline.envelopeMultiplier, { min: 0.1, step: 0.3 }) : [2, 2.5, 3, 3.5, 4], { positive: true });
+  const atrLengths = parseList(parameters.atrLengthValues, baseline.atrLength ? baselineNeighbors(baseline.atrLength, { integer: true, min: 1, step: 2 }) : [10, 14], { integer: true, positive: true });
+  const atrMultipliers = parseList(parameters.atrMultiplierValues, baseline.atrMultiplier ? baselineNeighbors(baseline.atrMultiplier, { min: 0.1, step: 0.2 }) : [0.8, 1, 1.2, 1.4, 1.6], { positive: true });
+  const maxFailures = parseList(parameters.maxSameSideFailuresValues, baseline.maxSameSideFailures !== undefined ? baselineNeighbors(baseline.maxSameSideFailures, { integer: true, min: 0, step: 1 }) : [1, 2, 3], { integer: true });
+  const sizingValues = parseList(parameters.sizingValues, baseline.sizingValue ? baselineNeighbors(baseline.sizingValue, { min: 0.01, step: sizingMode === "fixed-risk" ? 0.25 : 10 }) : (sizingMode === "fixed-risk" ? [0.5, 1, 2] : [5, 10]), { positive: true });
   const combos = [];
 
   bandwidths.forEach((bandwidth) => {
@@ -164,7 +183,32 @@ export function buildSweepCombinations(plan) {
     });
   });
 
-  return combos;
+  if (baseline.bandwidth && baseline.envelopeMultiplier && baseline.atrLength && baseline.atrMultiplier && baseline.maxSameSideFailures !== undefined) {
+    combos.unshift({
+      atrLength: baseline.atrLength,
+      atrMultiplier: baseline.atrMultiplier,
+      bandwidth: baseline.bandwidth,
+      envelopeMultiplier: baseline.envelopeMultiplier,
+      maxSameSideFailures: baseline.maxSameSideFailures,
+      sizingValue: baseline.sizingValue ?? sizingValues[0],
+      source: "baseline",
+    });
+  }
+
+  const seen = new Set();
+  return combos.filter((combo) => {
+    const key = cacheKey({
+      atrLength: combo.atrLength,
+      atrMultiplier: combo.atrMultiplier,
+      bandwidth: combo.bandwidth,
+      envelopeMultiplier: combo.envelopeMultiplier,
+      maxSameSideFailures: combo.maxSameSideFailures,
+      sizingValue: combo.sizingValue,
+    });
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 export function createAgentToolRegistry({ tools }) {
@@ -175,6 +219,45 @@ export function createAgentToolRegistry({ tools }) {
   const combinationTimeoutMs = Math.max(5000, Number(process.env.AI_AGENT_COMBINATION_TIMEOUT_MS ?? 45000));
   const batchTimeoutMs = Math.max(combinationTimeoutMs, Number(process.env.AI_AGENT_BATCH_TIMEOUT_MS ?? combinationTimeoutMs * Math.max(2, batchSize)));
   const isolateBacktests = process.env.AI_AGENT_ISOLATE_BACKTESTS !== "false";
+
+  function paramsFromBacktestDetail(detail = {}) {
+    const strategy = detail.strategyParams ?? {};
+    return {
+      atrLength: strategy.atrLength,
+      atrMultiplier: strategy.atrMultiplier,
+      bandwidth: strategy.bandwidth,
+      envelopeMultiplier: strategy.envelopeMultiplier,
+      maxSameSideFailures: strategy.maxSameSideFailures,
+      sizingMode: detail.sizingMode,
+      sizingValue: detail.sizingValue,
+    };
+  }
+
+  async function hydrateBaseline(plan = {}) {
+    if (!plan.baselineQuery || typeof tools.getBacktestDetail !== "function") return plan;
+    const detail = await tools.getBacktestDetail(plan.baselineQuery);
+    if (!detail?.ok) {
+      return {
+        ...plan,
+        baselineWarning: detail?.message ?? `Could not resolve baseline "${plan.baselineQuery}".`,
+      };
+    }
+    const baselineParams = paramsFromBacktestDetail(detail);
+    return {
+      ...plan,
+      baselineDetail: {
+        id: detail.id,
+        metrics: detail.metrics,
+        name: detail.name,
+        provenance: detail.provenance,
+        range: detail.range,
+        resolved: detail.resolved,
+        strategyParams: detail.strategyParams,
+      },
+      baselineParams,
+      sizingMode: plan.sizingModeExplicit ? (plan.sizingMode ?? "position-percent") : (detail.sizingMode ?? plan.sizingMode ?? "position-percent"),
+    };
+  }
 
   async function runBacktest(plan, overrides = {}, meta = {}) {
     const input = {
@@ -245,8 +328,9 @@ export function createAgentToolRegistry({ tools }) {
   }
 
   async function runLargeSweepBatched({ isCancelled, jobId = "agent-job", onProgress, plan }) {
-    const allCombinations = buildSweepCombinations(plan);
-    const combinations = allCombinations.slice(0, Number(plan.maxCombinations ?? 1000));
+    const hydratedPlan = await hydrateBaseline(plan);
+    const allCombinations = buildSweepCombinations(hydratedPlan);
+    const combinations = allCombinations.slice(0, Number(hydratedPlan.maxCombinations ?? 1000));
     const total = combinations.length;
     const rows = [];
     const startingBalance = Number(plan.startingBalance ?? 10000);
@@ -305,7 +389,7 @@ export function createAgentToolRegistry({ tools }) {
     async function processCombination(combo, index, batchInfo, workerIndex = 0) {
       const combinationStartedAt = Date.now();
       const oneBasedIndex = index + 1;
-      const sizingMode = plan.sizingMode ?? "position-percent";
+      const sizingMode = hydratedPlan.sizingMode ?? "position-percent";
       const workerId = `${jobId}:batch-${batchInfo.batchNumber}:worker-${workerIndex}`;
       activePromiseCount += 1;
       logWorker("combination:start", {
@@ -334,7 +418,7 @@ export function createAgentToolRegistry({ tools }) {
         }
 
         const resultPromise = runBacktest(
-          plan,
+          hydratedPlan,
           {
             ...combo,
             positionPercent: sizingMode === "position-percent" ? combo.sizingValue : undefined,
@@ -358,13 +442,13 @@ export function createAgentToolRegistry({ tools }) {
         else cacheStats.misses += 1;
         const row = {
           candlesUsed: result.candlesUsed,
-          fillMode: result.fillMode ?? plan.fillMode ?? "legacy",
+          fillMode: result.fillMode ?? hydratedPlan.fillMode ?? "legacy",
           id: `agent-sweep-row-${Date.now()}-${index}`,
           longResult: sideValue(result, "LONG"),
           metrics: result.metrics ?? {},
           params: {
             ...combo,
-            fillMode: result.fillMode ?? plan.fillMode ?? "legacy",
+            fillMode: result.fillMode ?? hydratedPlan.fillMode ?? "legacy",
             sizingMode,
           },
           provenance: {
@@ -534,7 +618,9 @@ export function createAgentToolRegistry({ tools }) {
           failedCombinationsCount: failedCombinations.length,
           generatedCombinations: allCombinations.length,
           rankedResults: rankSweepResults(rows),
-          requestedCombinations: plan.requestedCombinations ?? plan.maxCombinations ?? total,
+          baseline: hydratedPlan.baselineDetail ?? null,
+          baselineWarning: hydratedPlan.baselineWarning,
+          requestedCombinations: hydratedPlan.requestedCombinations ?? hydratedPlan.maxCombinations ?? total,
           processedCombinations: completed,
           testedCombinations: rows.length,
           totalCombinations: total,
@@ -548,7 +634,19 @@ export function createAgentToolRegistry({ tools }) {
       failedCombinationsCount: failedCombinations.length,
       generatedCombinations: allCombinations.length,
       rankedResults: rankSweepResults(rows),
-      requestedCombinations: plan.requestedCombinations ?? plan.maxCombinations ?? total,
+      baseline: hydratedPlan.baselineDetail ?? null,
+      baselineComparison: hydratedPlan.baselineDetail ? rankSweepResults(rows).slice(0, 5).map((row) => ({
+        aiConfigId: row.id,
+        aiRank: row.rank,
+        baselineBacktestId: hydratedPlan.baselineDetail.id,
+        baselineName: hydratedPlan.baselineDetail.name,
+        maxDrawdownDelta: Number(row.metrics?.maxDrawdown ?? 0) - Number(hydratedPlan.baselineDetail.metrics?.maxDrawdown ?? 0),
+        netProfitDelta: Number(row.metrics?.netProfit ?? 0) - Number(hydratedPlan.baselineDetail.metrics?.netProfit ?? 0),
+        profitFactorDelta: Number(row.metrics?.profitFactor ?? 0) - Number(hydratedPlan.baselineDetail.metrics?.profitFactor ?? 0),
+        tradesDelta: Number(row.metrics?.totalTrades ?? 0) - Number(hydratedPlan.baselineDetail.metrics?.totalTrades ?? 0),
+      })) : [],
+      baselineWarning: hydratedPlan.baselineWarning,
+      requestedCombinations: hydratedPlan.requestedCombinations ?? hydratedPlan.maxCombinations ?? total,
       processedCombinations: completed,
       testedCombinations: rows.length,
       totalCombinations: total,
@@ -577,11 +675,13 @@ export function createAgentToolRegistry({ tools }) {
     diagnoseIssue: tools.diagnoseIssue,
     explainCurrentSetup: tools.explainCurrentSetup,
     exportReport: tools.exportReport,
+    getBacktestDetail: tools.getBacktestDetail,
     getPlatformStatus: tools.getPlatformStatus,
     rankSweepResults,
     runBacktest,
     runLargeSweepBatched,
     runHistoricalBacktest: tools.runHistoricalBacktest,
     runSweepAnalysis: tools.runSweepAnalysis,
+    resolveLibraryItem: tools.resolveLibraryItem,
   };
 }

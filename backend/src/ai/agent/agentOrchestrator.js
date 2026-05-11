@@ -215,6 +215,87 @@ export function createAgentOrchestrator({ store, tools }) {
     };
   }
 
+  function extractBaselineName(message = "") {
+    const source = String(message);
+    const patterns = [
+      /\b(?:compare|porownaj|porównaj)\s+(?:config\s*#?\s*\d+\s+)?(?:with|to|z|do)\s+["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,
+      /\b(?:worse|better|gorszy|gorsze|lepszy|lepsze)\s+(?:than|niz|niż)\s+["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,
+      /\b(?:baseline|baz[ae]|punkt odniesienia)\s*[:=]?\s*["“]?([a-z0-9][a-z0-9 _.-]{1,60})["”]?/i,
+    ];
+    for (const pattern of patterns) {
+      const match = source.match(pattern);
+      if (match?.[1]) {
+        return match[1]
+          .replace(/\b(?:and|oraz|i|please|prosze|proszę|why|czemu|dlaczego)\b.*$/i, "")
+          .trim();
+      }
+    }
+    return "";
+  }
+
+  function comparableValue(value) {
+    if (value === undefined || value === null || value === "") return null;
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+    return String(value);
+  }
+
+  function metricComparison(aiRow = {}, baseline = {}) {
+    const normalized = aiRow.canonical ? aiRow : normalizeResearchResult(aiRow);
+    const metrics = baseline.metrics ?? {};
+    const pairs = {
+      maxDrawdown: [normalized.canonical?.metrics?.maxDrawdown, metrics.maxDrawdown],
+      netProfit: [normalized.canonical?.metrics?.netPnl, metrics.netProfit],
+      profitFactor: [normalized.canonical?.metrics?.profitFactor, metrics.profitFactor],
+      trades: [normalized.canonical?.metrics?.trades, metrics.totalTrades],
+      winRate: [normalized.canonical?.metrics?.winRate, metrics.winRate],
+      expectancy: [normalized.canonical?.metrics?.expectancy, metrics.expectancy],
+    };
+    return Object.fromEntries(Object.entries(pairs).map(([key, [ai, saved]]) => [
+      key,
+      {
+        ai: comparableValue(ai),
+        delta: Number.isFinite(Number(ai)) && Number.isFinite(Number(saved)) ? Number((Number(ai) - Number(saved)).toFixed(8)) : null,
+        match: Number.isFinite(Number(ai)) && Number.isFinite(Number(saved)) ? Math.abs(Number(ai) - Number(saved)) < 0.000001 : ai === saved,
+        saved: comparableValue(saved),
+      },
+    ]));
+  }
+
+  function fieldComparison(aiValue, savedValue) {
+    const left = comparableValue(aiValue);
+    const right = comparableValue(savedValue);
+    return {
+      ai: left,
+      match: left === right || (Number.isFinite(Number(left)) && Number.isFinite(Number(right)) && Math.abs(Number(left) - Number(right)) < 0.000001),
+      saved: right,
+    };
+  }
+
+  function explainBacktestDiff({ baseline, contextDiff, metricDiff, row }) {
+    const blockers = Object.entries(contextDiff).filter(([, value]) => !value.match).map(([key]) => key);
+    const aiNet = metricDiff.netProfit.ai;
+    const savedNet = metricDiff.netProfit.saved;
+    const aiPf = metricDiff.profitFactor.ai;
+    const savedPf = metricDiff.profitFactor.saved;
+    const verdict = blockers.length
+      ? `This is not an exact apples-to-apples comparison because ${blockers.join(", ")} differ.`
+      : "This is an apples-to-apples comparison by stored context fields.";
+    const performance = Number(aiNet) < Number(savedNet)
+      ? `The AI config is weaker on net PnL (${aiNet} vs ${savedNet}) and should admit that against this baseline.`
+      : Number(aiNet) > Number(savedNet)
+        ? `The AI config is stronger on net PnL (${aiNet} vs ${savedNet}), but PF/DD still need review.`
+        : "Net PnL is equal or unavailable between the two records.";
+
+    return [
+      verdict,
+      performance,
+      `PF comparison: AI ${aiPf ?? "unavailable"} vs ${savedPf ?? "unavailable"}.`,
+      row?.integrity?.warnings?.length ? `AI row integrity notes: ${row.integrity.warnings.slice(0, 3).join("; ")}` : "",
+      baseline.dataCompleteness?.missing?.length ? `Saved backtest is missing: ${baseline.dataCompleteness.missing.join(", ")}.` : "",
+    ].filter(Boolean).join(" ");
+  }
+
   function verifiedFrom(run, row) {
     if (!row) {
       return {
@@ -323,12 +404,158 @@ export function createAgentOrchestrator({ store, tools }) {
     };
   }
 
+  async function compareAgentResultToBacktest(id, body = {}) {
+    const run = runStore.get(id);
+    if (!run) {
+      return { ok: false, message: "That agent run was not found.", statusCode: 404 };
+    }
+    const row = resolveRow(run, body);
+    if (!row) {
+      return { ok: false, message: "Choose an AI result row to compare first.", statusCode: 400 };
+    }
+    const backtestNameOrId = String(body.backtestNameOrId ?? body.query ?? "").trim();
+    if (!backtestNameOrId) {
+      return { ok: false, message: "Enter a saved backtest name or id, for example hubert.", statusCode: 400 };
+    }
+    if (typeof toolRegistry.getBacktestDetail !== "function") {
+      return { ok: false, message: "Saved backtest detail tool is not available.", statusCode: 500 };
+    }
+
+    const baseline = await toolRegistry.getBacktestDetail(backtestNameOrId, { tradeLimit: body.tradeLimit ?? 500 });
+    if (!baseline?.ok) {
+      return { ok: false, message: baseline?.message ?? "Saved backtest could not be resolved.", resolution: baseline, statusCode: 404 };
+    }
+
+    const normalizedRow = normalizeResearchResult(row, {
+      output: run.resultSummary ?? {},
+      plan: run.plan,
+      run,
+    });
+    const contextDiff = {
+      atrLength: fieldComparison(normalizedRow.params?.atrLength, baseline.strategyParams?.atrLength),
+      atrMultiplier: fieldComparison(normalizedRow.params?.atrMultiplier, baseline.strategyParams?.atrMultiplier),
+      bandwidth: fieldComparison(normalizedRow.params?.bandwidth, baseline.strategyParams?.bandwidth),
+      candlesUsed: fieldComparison(normalizedRow.canonical?.candlesUsed, baseline.provenance?.candlesUsed),
+      envelopeMultiplier: fieldComparison(normalizedRow.params?.envelopeMultiplier, baseline.strategyParams?.envelopeMultiplier),
+      fillMode: fieldComparison(normalizedRow.canonical?.fillMode, baseline.fillMode),
+      maxSameSideFailures: fieldComparison(normalizedRow.params?.maxSameSideFailures, baseline.strategyParams?.maxSameSideFailures),
+      provider: fieldComparison(normalizedRow.canonical?.provider, baseline.provenance?.provider),
+      rangeFrom: fieldComparison(normalizedRow.canonical?.range?.from, baseline.range?.from),
+      rangeTo: fieldComparison(normalizedRow.canonical?.range?.to, baseline.range?.to),
+      sizingMode: fieldComparison(normalizedRow.canonical?.sizingMode, baseline.sizingMode),
+      timeframe: fieldComparison(normalizedRow.canonical?.timeframe, baseline.timeframe),
+    };
+    const metricDiff = metricComparison(normalizedRow, baseline);
+    const allContextMatch = Object.values(contextDiff).every((item) => item.match);
+    const allMetricMatch = Object.values(metricDiff).every((item) => item.match || item.ai === null || item.saved === null);
+
+    return {
+      baseline,
+      contextDiff,
+      explanation: explainBacktestDiff({ baseline, contextDiff, metricDiff, row: normalizedRow }),
+      metricDiff,
+      ok: true,
+      parity: {
+        allContextMatch,
+        allMetricMatch,
+        exactExperiment: allContextMatch,
+        warnings: [
+          ...(!allContextMatch ? ["Context differs. Do not treat metrics as exact parity."] : []),
+          ...(!allMetricMatch ? ["Metrics differ between AI row and saved backtest."] : []),
+          ...(baseline.dataCompleteness?.missing?.length ? [`Saved baseline missing ${baseline.dataCompleteness.missing.join(", ")}.`] : []),
+        ],
+      },
+      row: compactRow(normalizedRow),
+      runId: run.id,
+      savedBacktestNameOrId: backtestNameOrId,
+    };
+  }
+
   async function chat(body = {}) {
     const message = String(body.message ?? "").trim();
     if (!message) {
       return { ok: false, message: "Ask a follow-up first.", statusCode: 400 };
     }
+    const mode = String(body.mode ?? body.copilotMode ?? "research").toLowerCase();
     const run = body.runId ? runStore.get(body.runId) : runStore.list().find((item) => item.status === "completed");
+    const wantsPlatformEvidence = (
+      mode === "platform-diagnosis" ||
+      mode === "code-evidence" ||
+      mode === "platform" ||
+      body.evidenceMode === true
+    );
+
+    if (wantsPlatformEvidence && typeof tools.answerFromPlatformEvidence === "function") {
+      const platformEvidence = await tools.answerFromPlatformEvidence({
+        mode,
+        question: message,
+        runId: run?.id ?? null,
+      });
+      const confidenceLabel = platformEvidence.confidence ?? "medium";
+      const response = {
+        answer: platformEvidence.answer,
+        confidence: {
+          label: confidenceLabel,
+          reason: "Answer generated from backend code/runtime evidence tools.",
+          score: confidenceLabel === "high" ? 82 : confidenceLabel === "medium" ? 62 : 38,
+        },
+        evidence: [
+          ...(platformEvidence.inspected ?? []).map((item) => `Inspected: ${item}`),
+          ...(platformEvidence.evidence ?? []),
+        ].slice(0, 36),
+        intent: "platform-evidence",
+        nextAction: platformEvidence.suggestedVerification?.[0] ?? "Verify the traced path in the relevant platform panel.",
+        recommendation: "Use this as read-only platform diagnosis. AI cannot place orders or modify execution.",
+        risk: {
+          label: platformEvidence.confidence === "high" ? "low" : "moderate",
+          reasons: platformEvidence.unknown ?? [],
+        },
+        sections: [
+          {
+            title: "Files/functions/routes inspected",
+            bullets: platformEvidence.inspected ?? [],
+          },
+          {
+            title: "What is unknown",
+            bullets: platformEvidence.unknown ?? [],
+          },
+          {
+            title: "Suggested verification",
+            bullets: platformEvidence.suggestedVerification ?? [],
+          },
+        ],
+        platformEvidence,
+        runId: run?.id ?? null,
+      };
+
+      if (run) {
+        await runStore.update(run.id, {
+          messages: [
+            ...(run.messages ?? []),
+            {
+              role: "user",
+              text: message,
+              time: new Date().toISOString(),
+            },
+            {
+              evidence: response.evidence,
+              confidence: response.confidence,
+              role: "assistant",
+              sections: response.sections,
+              text: response.answer,
+              time: new Date().toISOString(),
+              platformEvidence,
+            },
+          ].slice(-40),
+        });
+      }
+
+      return {
+        ok: true,
+        response,
+      };
+    }
+
     if (!run) {
       return {
         ok: true,
@@ -361,15 +588,26 @@ export function createAgentOrchestrator({ store, tools }) {
       })
       : null;
     const reasoning = buildReasoningResponse({ question: message, row: normalizedRow, rows: normalizedRows, run });
+    const baselineName = extractBaselineName(message);
+    const baselineComparison = baselineName
+      ? await compareAgentResultToBacktest(run.id, { backtestNameOrId: baselineName, rowId: row?.id, rowIndex })
+      : null;
     const evidence = [
       `Run: ${run.id}`,
       `Intent: ${run.parsedIntent}`,
       `Range: ${run.plan?.range?.from} to ${run.plan?.range?.to}`,
       `Provider: ${run.plan?.provider}`,
       normalizedRow ? `Selected row: rank ${normalizedRow.rank ?? rowIndex + 1}` : "No ranked row available.",
+      ...(baselineComparison?.ok ? [
+        `Compared with saved backtest: ${baselineComparison.baseline?.name}`,
+        `Baseline PF: ${baselineComparison.metricDiff?.profitFactor?.saved}`,
+        `AI PF: ${baselineComparison.metricDiff?.profitFactor?.ai}`,
+      ] : baselineComparison ? [`Baseline comparison failed: ${baselineComparison.message}`] : []),
       ...(reasoning.evidence ?? []),
     ];
-    const answer = reasoning.answer ?? run.resultSummary?.message ?? "This run completed, but no compact summary is available.";
+    const answer = baselineComparison?.ok
+      ? `${baselineComparison.explanation} ${reasoning.answer ?? ""}`.trim()
+      : reasoning.answer ?? run.resultSummary?.message ?? "This run completed, but no compact summary is available.";
     const responseRow = compactRow(reasoning.row ?? normalizedRow);
     const responseVerifiedFrom = verifiedFrom(run, reasoning.row ?? normalizedRow);
 
@@ -393,6 +631,7 @@ export function createAgentOrchestrator({ store, tools }) {
         sections: reasoning.sections,
         text: answer,
         time: new Date().toISOString(),
+        baselineComparison: baselineComparison?.ok ? baselineComparison : null,
         row: responseRow,
         verifiedFrom: responseVerifiedFrom,
       },
@@ -413,6 +652,7 @@ export function createAgentOrchestrator({ store, tools }) {
         row: responseRow,
         runId: run.id,
         sections: reasoning.sections,
+        baselineComparison: baselineComparison?.ok ? baselineComparison : null,
         verifiedFrom: responseVerifiedFrom,
       },
     };
@@ -511,6 +751,7 @@ export function createAgentOrchestrator({ store, tools }) {
     rerunExact,
     restartRun,
     startRun,
+    compareAgentResultToBacktest,
     verifyIntegrity,
   };
 }

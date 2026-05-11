@@ -71,6 +71,13 @@ function toolEvidence(toolName, result) {
       `Best score: ${result.best?.score ?? "none"}`,
     ];
   }
+  if (toolName === "answerFromPlatformEvidence") {
+    return [
+      `Inspected: ${result.inspected?.slice(0, 4).join(", ") || "platform evidence"}`,
+      `Confidence: ${result.confidence ?? "unknown"}`,
+      `Evidence lines: ${result.evidence?.length ?? 0}`,
+    ];
+  }
   return [`Tool used: ${toolName}`];
 }
 
@@ -184,6 +191,20 @@ export function createAiService({ buildAiContext, memory, provider = process.env
     if (lower.includes("sweep")) toolName = "runSweepAnalysis";
     if (lower.includes("status") || lower.includes("data") || lower.includes("live")) toolName = "getPlatformStatus";
     if (lower.includes("error") || lower.includes("issue") || lower.includes("can't") || lower.includes("cannot")) toolName = "diagnoseIssue";
+    if (
+      body.mode === "platform-diagnosis" ||
+      body.mode === "code-evidence" ||
+      lower.includes("trace") ||
+      lower.includes("where is") ||
+      lower.includes("which file") ||
+      lower.includes("function") ||
+      lower.includes("route") ||
+      lower.includes("move sl") ||
+      lower.includes("profit factor") ||
+      lower.includes(" pf ")
+    ) {
+      toolName = "answerFromPlatformEvidence";
+    }
 
     let toolResult;
     try {
@@ -191,6 +212,8 @@ export function createAiService({ buildAiContext, memory, provider = process.env
         toolResult = await tools.runSweepAnalysis({ maxCombinations: 20 });
       } else if (toolName === "diagnoseIssue") {
         toolResult = await tools.diagnoseIssue({ question: message });
+      } else if (toolName === "answerFromPlatformEvidence") {
+        toolResult = await tools.answerFromPlatformEvidence({ mode: body.mode, question: message });
       } else {
         toolResult = await tools[toolName]();
       }
