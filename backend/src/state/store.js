@@ -105,6 +105,24 @@ const defaultExecutionConfig = {
 };
 
 const SZTAB_INTERVALS = ["10m", "15m", "20m", "30m", "1h"];
+const STALE_SAFETY_MS = 180_000;
+
+function clearSafetyState(reason = "cleared") {
+  return {
+    blocked: false,
+    clearedAt: new Date().toISOString(),
+    clearReason: reason,
+    lastCheckAt: null,
+    status: "NOT_CHECKED",
+    warnings: [],
+  };
+}
+
+function isStaleSafetyForStoppedRuntime(state = {}) {
+  if (!state.safety?.blocked || ["LIVE_RUNNING", "PAPER_RUNNING"].includes(state.botStatus)) return false;
+  const checkedAt = state.safety?.lastCheckAt ? new Date(state.safety.lastCheckAt).getTime() : 0;
+  return !Number.isFinite(checkedAt) || Date.now() - checkedAt > STALE_SAFETY_MS;
+}
 
 const collectionDefaults = {
   aiAlertDrafts: [],
@@ -168,15 +186,44 @@ function createDefaultSztabInterval(interval) {
     mmLocked: false,
     mmSavedAt: null,
     runtime: {
+      candlesLoaded: 0,
+      candlesRequested: 0,
+      closedCandlesUsed: 0,
+      crisisModeOn: false,
+      crisisManualLock: false,
+      dataAgeSeconds: null,
       error: "",
+      executionAllowed: true,
+      globalBlockers: [],
+      globalExecutionState: "enabled",
+      heartbeatAt: null,
+      intervalBlockers: [],
       lastCandle: null,
+      lastClosedCandleTime: null,
       lastDecision: "",
+      lastDecisionReason: "",
+      lastError: "",
+      lastExchangeResponse: null,
+      lastLoopDurationMs: null,
+      lastTickAt: null,
+      lastBlockedReason: "",
       lastOrderAttempt: null,
+      latestEntryEvent: null,
+      latestSetupEvent: null,
       lastSignal: null,
       lastSyncAt: null,
+      profileConnected: false,
       startedAt: null,
       status: "stopped",
       stoppedAt: null,
+      tickCount: 0,
+      tradingEnabled: true,
+      tradingBlockedForAI: false,
+      legacySafetyAgeSeconds: null,
+      legacySafetyStale: false,
+      legacySafetyStatus: "NOT_CHECKED",
+      legacySafetyWarnings: [],
+      validNweBandCount: 0,
     },
     strategy: {
       atrLength: 14,
@@ -322,6 +369,14 @@ export async function createStateStore() {
       ...store.state,
       botStatus: "STOPPED",
       lastError: "",
+    };
+    await writeJson("state.json", store.state);
+  }
+
+  if (isStaleSafetyForStoppedRuntime(store.state)) {
+    store.state = {
+      ...store.state,
+      safety: clearSafetyState("stale legacy safety cleared on backend startup"),
     };
     await writeJson("state.json", store.state);
   }

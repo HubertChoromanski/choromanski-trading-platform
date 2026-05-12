@@ -111,15 +111,44 @@ function createDefaultSztabIntervalConfig(timeframe) {
     strategySavedAt: null,
     symbol: "SOLUSDT",
     runtime: {
+      candlesLoaded: 0,
+      candlesRequested: 0,
+      closedCandlesUsed: 0,
+      crisisModeOn: false,
+      crisisManualLock: false,
+      dataAgeSeconds: null,
       error: "",
+      executionAllowed: true,
+      globalBlockers: [],
+      globalExecutionState: "enabled",
+      heartbeatAt: null,
+      intervalBlockers: [],
       lastCandle: null,
+      lastClosedCandleTime: null,
       lastDecision: "",
+      lastDecisionReason: "",
       lastOrderAttempt: null,
+      lastBlockedReason: "",
+      lastError: "",
+      lastExchangeResponse: null,
+      lastLoopDurationMs: null,
+      lastTickAt: null,
+      latestEntryEvent: null,
+      latestSetupEvent: null,
       lastSignal: null,
       lastSyncAt: null,
+      profileConnected: false,
       startedAt: null,
       status: "stopped",
       stoppedAt: null,
+      tickCount: 0,
+      tradingEnabled: true,
+      tradingBlockedForAI: false,
+      legacySafetyAgeSeconds: null,
+      legacySafetyStale: false,
+      legacySafetyStatus: "NOT_CHECKED",
+      legacySafetyWarnings: [],
+      validNweBandCount: 0,
     },
     validation: {
       checkedAt: "",
@@ -485,6 +514,15 @@ function ageText(time) {
   if (seconds < 60) return `${seconds}s ago`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
   return `${Math.floor(seconds / 3600)}h ago`;
+}
+
+function eventText(event) {
+  if (!event) return "--";
+  const side = event.direction ? `${event.direction} ` : "";
+  const type = event.type ?? "event";
+  const id = event.setupId ? ` ${event.setupId}` : "";
+  const time = event.time ? ` @ ${dateText(event.time)}` : "";
+  return `${side}${type}${id}${time}`;
 }
 
 function dataFreshnessTone(time) {
@@ -2910,6 +2948,35 @@ export default function ControlCenter({
           onSaveConfig={saveSztabIntervalConfig}
           onStartInterval={(interval) => runAction(`sztab-start-${interval}`, `Start ${intervalDisplayLabel(interval)} runner`, () => startSztabInterval(interval))}
           onRestartInterval={(interval) => runAction(`sztab-restart-${interval}`, `Restart ${intervalDisplayLabel(interval)} runner`, () => restartSztabInterval(interval))}
+          onCheckSignalParity={(interval) => runAction(`sztab-signal-parity-${interval}`, `Check ${intervalDisplayLabel(interval)} signal parity`, () => apiFetch(`/sztab/signal-parity/${interval}`, {
+            body: {
+              chart: {
+                candles: rawCandles.slice(-3000),
+                fullCandles: fullHistoryDataset?.length ?? chartDiagnostics?.fullCandles ?? 0,
+                lastCandleTime: rawCandles.at(-1)?.time ?? null,
+                markerSource: activeBacktestSession
+                  ? "backtest analysis marker"
+                  : selectedHistoricalWindow?.mode === "historical"
+                    ? "historical chart signal"
+                    : "live/latest chart signal window",
+                provider: chartDiagnostics?.provider ?? "binance-futures",
+                rawCandleCount: rawCandles.length,
+                selectedInterval,
+                settings,
+                window: selectedHistoricalWindow,
+              },
+              latestBacktest: activeBacktestSession
+                ? {
+                    candlesUsed: activeBacktestSession.result?.candlesUsed ?? activeBacktestSession.backtestCandles?.length ?? null,
+                    fillMode: activeBacktestSession.fillMode ?? activeBacktestSession.result?.fillMode ?? null,
+                    provider: activeBacktestSession.provider ?? null,
+                    range: activeBacktestSession.range ?? activeBacktestSession.result?.range ?? null,
+                    trades: activeBacktestSession.result?.trades?.length ?? null,
+                  }
+                : null,
+            },
+            method: "POST",
+          }))}
           onStopAll={() => runAction("sztab-stop-all", "Stop all Sztab runners", async () => {
             await apiFetch("/sztab/stop-all", { method: "POST" });
             await apiFetch("/execution/stop", { method: "POST" }).catch(() => null);
@@ -4925,6 +4992,7 @@ function SztabGeneralnyPanel({
   onEmergencyStop,
   onForceSync,
   onOpenAdvanced,
+  onCheckSignalParity,
   onPositionAction,
   onPositionRefresh,
   onRestartInterval,
@@ -5086,6 +5154,14 @@ function SztabGeneralnyPanel({
     onStopInterval(interval);
   }
 
+  async function checkSignalParity(interval) {
+    if (!onCheckSignalParity) return;
+    const result = await onCheckSignalParity(interval);
+    if (result?.summary || result?.explanation) {
+      setLocalMessage(result.summary ?? result.explanation);
+    }
+  }
+
   const warnings = sztabWarnings({
     accountProfiles,
     botStatus,
@@ -5150,6 +5226,7 @@ function SztabGeneralnyPanel({
           mmDecks={mmDecks}
           onAction={onAction}
           onApply={() => applyInterval(activeTab)}
+          onCheckSignalParity={() => checkSignalParity(activeTab)}
           onForceSync={onForceSync}
           onOpenAdvanced={onOpenAdvanced}
           onPositionAction={onPositionAction}
@@ -5317,6 +5394,7 @@ function SztabIntervalPanel({
   mmDecks = [],
   onAction,
   onApply,
+  onCheckSignalParity,
   onForceSync,
   onOpenAdvanced,
   onPositionAction,
@@ -5346,6 +5424,8 @@ function SztabIntervalPanel({
   const profile = accountProfiles.find((item) => item.id === config.apiProfile);
   const positions = positionsForInterval(livestream?.positions ?? [], config, interval);
   const orders = ordersForInterval(livestream?.openOrders ?? [], config);
+  const globalBlockers = runtime.globalBlockers ?? [];
+  const intervalBlockers = runtime.intervalBlockers ?? [];
   const latestCandle = selectedInterval === interval ? rawCandles.at(-1) : null;
   const logs = (system?.logs ?? []).filter((log) => {
     const haystack = JSON.stringify(log).toLowerCase();
@@ -5417,9 +5497,9 @@ function SztabIntervalPanel({
           <NumberField disabled={locked} label="Max same-side failures" value={config.strategy.maxSameSideFailures} onChange={(value) => onUpdateStrategy("maxSameSideFailures", value)} />
           <label>
             <span>Strategy source</span>
-            <select disabled={locked} value={config.strategy.strategySource ?? "pine-ha"} onChange={(event) => onUpdateStrategy("strategySource", event.target.value)}>
+            <select disabled={locked} value={config.strategy.strategySource === "raw" ? "raw-exchange" : config.strategy.strategySource ?? "pine-ha"} onChange={(event) => onUpdateStrategy("strategySource", event.target.value)}>
               <option value="pine-ha">Pine HA</option>
-              <option value="raw">Raw candles</option>
+              <option value="raw-exchange">Raw candles</option>
             </select>
           </label>
         </div>
@@ -5505,6 +5585,68 @@ function SztabIntervalPanel({
           <button type="button" onClick={() => onAction(`latest-candle-${interval}`, "Latest candle", async () => runtime.lastCandle ?? latestCandle ?? { message: "No latest candle in Sztab runtime yet." })}>View latest candle</button>
           <button type="button" onClick={() => onAction(`latest-decision-${interval}`, "Latest decision", async () => runtime.lastDecision || { message: "No latest decision reason in Sztab runtime yet." })}>View last decision reason</button>
         </div>
+      </section>
+
+      <section className="hubert-sztab-card hubert-sztab-card--span">
+        <div className="hubert-lab__subhead">
+          <strong>Runner diagnostics</strong>
+          <button type="button" onClick={onCheckSignalParity}>Check signal parity</button>
+        </div>
+        <div className="hubert-lab__metrics">
+          <Metric label="Tick count" value={runtime.tickCount ?? 0} />
+          <Metric label="Last loop" value={compactDateText(runtime.lastTickAt)} />
+          <Metric label="Loop duration" value={runtime.lastLoopDurationMs !== null && runtime.lastLoopDurationMs !== undefined ? `${runtime.lastLoopDurationMs}ms` : "--"} />
+          <Metric label="Candles requested" value={runtime.candlesRequested ?? "--"} />
+          <Metric label="Candles loaded" value={runtime.candlesLoaded ?? "--"} />
+          <Metric label="Closed candles used" value={runtime.closedCandlesUsed ?? "--"} />
+          <Metric label="Last closed candle" value={runtime.lastClosedCandleTime ? dateText(runtime.lastClosedCandleTime) : "--"} />
+          <Metric label="Valid NWE bands" value={runtime.validNweBandCount ?? "--"} />
+          <Metric label="Profile connected" value={runtime.profileConnected ? "yes" : "no"} />
+          <Metric label="Data age" value={runtime.dataAgeSeconds !== null && runtime.dataAgeSeconds !== undefined ? `${runtime.dataAgeSeconds}s` : ageText(runtime.lastSyncAt)} />
+          <Metric label="Global execution" value={runtime.globalExecutionState ?? (runtime.executionAllowed ? "enabled" : "blocked")} />
+          <Metric label="Crisis mode" value={runtime.crisisModeOn ? "on" : "off"} />
+          <Metric label="Manual lock" value={runtime.crisisManualLock ? "active" : "off"} />
+          <Metric label="Trading enabled" value={(runtime.tradingEnabled ?? runtime.executionAllowed) ? "true" : "false"} />
+          <Metric label="Legacy safety" value={`${runtime.legacySafetyStatus ?? "NOT_CHECKED"}${runtime.legacySafetyStale ? " stale" : ""}`} />
+        </div>
+        <div className="hubert-lab__metrics">
+          <Metric label="Latest setup event" value={eventText(runtime.latestSetupEvent)} />
+          <Metric label="Latest entry event" value={eventText(runtime.latestEntryEvent)} />
+          <Metric label="Latest executable signal" value={eventText(runtime.lastSignal)} />
+          <Metric label="Decision reason" value={runtime.lastDecisionReason || runtime.lastDecision || "--"} />
+          <Metric label="Blocked reason" value={runtime.lastBlockedReason || "--"} />
+          <Metric label="Interval blocker" value={intervalBlockers.map((blocker) => blocker.type ?? blocker.source).join(", ") || "--"} />
+          <Metric label="Last exchange response" value={runtime.lastExchangeResponse ? compactDateText(runtime.lastExchangeResponse.time) : "--"} />
+        </div>
+        {globalBlockers.length > 0 && (
+          <MiniStatus tone="bad">
+            Global execution blocker active: {globalBlockers.map((blocker) => blocker.reason).join("; ")}.
+          </MiniStatus>
+        )}
+        {intervalBlockers.length > 0 && (
+          <MiniStatus tone={isRunning ? "bad" : "neutral"}>
+            Interval blocker: {intervalBlockers.map((blocker) => blocker.reason).join("; ")}.
+          </MiniStatus>
+        )}
+        {runtime.legacySafetyStale && (
+          <MiniStatus>
+            Legacy Safety Guardian state is stale and is shown for audit only; it is not treated as an active Sztab blocker.
+          </MiniStatus>
+        )}
+        <details className="hubert-advanced">
+          <summary>Raw runner debug</summary>
+          <pre>{JSON.stringify({
+            globalBlockers,
+            intervalBlockers,
+            lastError: runtime.lastError || runtime.error || "",
+            lastExchangeResponse: runtime.lastExchangeResponse ?? null,
+            lastOrderAttempt: runtime.lastOrderAttempt ?? null,
+            legacySafetyWarnings: runtime.legacySafetyWarnings ?? [],
+            latestEntryEvent: runtime.latestEntryEvent ?? null,
+            latestSetupEvent: runtime.latestSetupEvent ?? null,
+            latestSignal: runtime.lastSignal ?? null,
+          }, null, 2)}</pre>
+        </details>
       </section>
 
       <section className="hubert-sztab-card">

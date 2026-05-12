@@ -67,6 +67,18 @@ function providerBaseUrl(provider = "binance-futures") {
   return provider === "binance-spot" ? BINANCE_SPOT_BASE_URL : BINANCE_FUTURES_BASE_URL;
 }
 
+function isRawExchangeSource(source) {
+  return source === "raw-exchange" || source === "raw";
+}
+
+function isFiniteBand(band) {
+  return Number.isFinite(band?.upper) && Number.isFinite(band?.lower);
+}
+
+function latestEventOfTypes(events = [], types = []) {
+  return [...events].reverse().find((event) => types.includes(event.type)) ?? null;
+}
+
 async function requestKlines({ endTime, interval, limit, provider = "binance-futures", symbol }) {
   const params = new URLSearchParams({
     symbol,
@@ -162,28 +174,23 @@ export async function fetchCandles({
   return candles.slice(-requestedLimit);
 }
 
-export async function runStrategyForProfile(profile) {
-  const rawCandles = await fetchCandles({
-    limit: 1000,
-    symbol: profile.symbol,
-    timeframe: profile.timeframe,
-  });
+export function runStrategyOnCandles({ rawCandles = [], strategyParameters = {} } = {}) {
   const closedRaw = rawCandles.filter((candle) => candle.isClosed !== false);
   const sourceCandles =
-    profile.strategyParameters.strategySource === "raw-exchange"
+    isRawExchangeSource(strategyParameters.strategySource)
       ? closedRaw
       : toHeikenAshi(closedRaw);
   const envelope = calculateNadarayaEnvelope(sourceCandles, {
-    bandwidth: profile.strategyParameters.bandwidth,
-    multiplier: profile.strategyParameters.envelopeMultiplier,
+    bandwidth: strategyParameters.bandwidth,
+    multiplier: strategyParameters.envelopeMultiplier,
   });
   const strategy = evaluateChoromanskiStrategy({
     sourceCandles,
     envelope,
     inputs: {
-      atrLength: profile.strategyParameters.atrLength,
-      atrMultiplier: profile.strategyParameters.atrMultiplier,
-      maxSameSideFailures: profile.strategyParameters.maxSameSideFailures,
+      atrLength: strategyParameters.atrLength,
+      atrMultiplier: strategyParameters.atrMultiplier,
+      maxSameSideFailures: strategyParameters.maxSameSideFailures,
     },
   });
   const lastClosedIndex = sourceCandles.length - 1;
@@ -194,11 +201,56 @@ export async function runStrategyForProfile(profile) {
         event.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED &&
         event.index >= lastClosedIndex - 1,
     );
+  const latestEntryEvent = latestEventOfTypes(strategy.events, [STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED]);
+  const latestSetupEvent = latestEventOfTypes(strategy.events, [
+    STRATEGY_EVENT_TYPES.BAND_SIGNAL,
+    STRATEGY_EVENT_TYPES.BENCHMARK_CONFIRMED,
+    STRATEGY_EVENT_TYPES.SETUP_ACTIVE,
+    STRATEGY_EVENT_TYPES.SETUP_BLOCKED,
+    STRATEGY_EVENT_TYPES.SETUP_INVALIDATED,
+  ]);
+  const validNweBandCount = envelope.reduce((count, band) => count + (isFiniteBand(band) ? 1 : 0), 0);
 
   return {
+    diagnostics: {
+      closedCandlesUsed: sourceCandles.length,
+      lastClosedCandleTime: sourceCandles.at(-1)?.time ?? null,
+      latestEntryEvent,
+      latestExecutableEntryEvent: latestEvent ?? null,
+      latestSetupEvent,
+      rawCandlesLoaded: rawCandles.length,
+      strategySource: strategyParameters.strategySource ?? "pine-ha",
+      validNweBandCount,
+    },
+    envelope,
+    latestEntryEvent,
     latestEvent,
+    latestSetupEvent,
     rawCandles,
     sourceCandles,
     strategy,
+  };
+}
+
+export async function runStrategyForProfile(profile, options = {}) {
+  const requestedLimit = Number(options.limit ?? profile.liveCandleLimit ?? 1000);
+  const rawCandles = await fetchCandles({
+    limit: requestedLimit,
+    symbol: profile.symbol,
+    timeframe: profile.timeframe,
+  });
+  const result = runStrategyOnCandles({
+    rawCandles,
+    strategyParameters: profile.strategyParameters,
+  });
+
+  return {
+    ...result,
+    diagnostics: {
+      ...result.diagnostics,
+      candlesRequested: requestedLimit,
+      symbol: profile.symbol,
+      timeframe: profile.timeframe,
+    },
   };
 }

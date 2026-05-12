@@ -274,7 +274,20 @@ export function createBotRunner({ bingxClient, store }) {
     async stop() {
       stopTimers();
       safetyGuardian.stop();
-      await store.setState({ botStatus: BOT_STATES.STOPPED, liveArmed: false });
+      await store.setState({
+        botStatus: BOT_STATES.STOPPED,
+        crisisMode: false,
+        liveArmed: false,
+        safety: {
+          blocked: false,
+          clearedAt: new Date().toISOString(),
+          clearReason: "global runner stopped",
+          lastCheckAt: null,
+          status: "NOT_CHECKED",
+          warnings: [],
+        },
+        stopNewEntries: false,
+      });
       await log("bot stopped");
       return store.getState();
     },

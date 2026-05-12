@@ -1968,6 +1968,7 @@ const aiAgent = createAgentOrchestrator({
 const sztabRunner = createSztabRunner({
   buildLivestreamPayload,
   getApiProfileClient,
+  maxCandlesPerTimeframe,
   publicApiProfiles,
   store,
 });
@@ -2058,6 +2059,18 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "GET" && pathname === "/sztab/config") {
       sendJson(response, 200, await sztabRunner.getConfig());
+      return;
+    }
+
+    const sztabParityMatch = pathname.match(/^\/sztab\/signal-parity\/([^/]+)$/u);
+    if (request.method === "POST" && sztabParityMatch) {
+      if (!requireDashboardToken(request, response)) return;
+      const interval = normalizeSztabInterval(sztabParityMatch[1]);
+      const body = await readBody(request);
+      const result = interval
+        ? await sztabRunner.checkSignalParity(interval, body)
+        : { ok: false, status: 400, message: "Unsupported Sztab interval." };
+      sendJson(response, result.ok ? 200 : result.status ?? 400, result);
       return;
     }
 
@@ -2285,6 +2298,14 @@ const server = http.createServer(async (request, response) => {
       const state = await store.setState({
         botStatus: "STOPPED",
         crisisMode: false,
+        safety: {
+          blocked: false,
+          clearedAt: new Date().toISOString(),
+          clearReason: "crisis/manual lock disabled",
+          lastCheckAt: null,
+          status: "NOT_CHECKED",
+          warnings: [],
+        },
         stopNewEntries: false,
       });
       await store.appendLog({ context: {}, message: "Crisis Management disabled" });

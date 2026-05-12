@@ -505,7 +505,9 @@ export default function TradingViewChart() {
     cappedMarkers: 0,
     debugMarkers: 0,
     durationMs: 0,
+    markerSource: "No markers rendered yet",
     markers: 0,
+    markerNote: "",
     renderedCandles: 0,
     skippedMarkers: 0,
     slTpLines: 0,
@@ -1134,14 +1136,16 @@ export default function TradingViewChart() {
           ? markers.filter((marker) => String(marker.id ?? "").startsWith("analysis-debug")).length
           : 0;
         const totalTrades = mode.analysisResult?.trades?.length ?? 0;
-	        setChartRenderStats({
-	          cappedMarkers: Math.max(0, totalTrades - visibleTrades),
-	          debugMarkers,
-	          durationMs: Math.round(performance.now() - renderStartedAt),
-	          markers: markers.length,
-	          renderedCandles: chartCandles.length,
-	          skippedMarkers: Math.max(0, totalTrades - visibleTrades),
-	          slTpLines,
+		        setChartRenderStats({
+		          cappedMarkers: Math.max(0, totalTrades - visibleTrades),
+		          debugMarkers,
+		          durationMs: Math.round(performance.now() - renderStartedAt),
+              markerNote: "Backtest analysis markers are visual audit markers, not live executable signals.",
+              markerSource: "backtest analysis marker",
+		          markers: markers.length,
+		          renderedCandles: chartCandles.length,
+		          skippedMarkers: Math.max(0, totalTrades - visibleTrades),
+		          slTpLines,
 	        });
 	      } else {
 	        const closedCandles = chartCandles.filter((candle) => candle.isClosed !== false);
@@ -1192,14 +1196,20 @@ export default function TradingViewChart() {
 
 	        strategyMarkersRef.current?.setMarkers(strategyMarkers);
 	        renderStrategyLines(strategyEvents, closedCandles);
-	        setChartRenderStats({
-	          cappedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
-	          debugMarkers: 0,
-	          durationMs: Math.round(performance.now() - renderStartedAt),
-	          markers: strategyMarkers.length,
-	          renderedCandles: chartCandles.length,
-	          skippedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
-	          slTpLines: strategyLineSeriesRef.current.length,
+		        setChartRenderStats({
+		          cappedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
+		          debugMarkers: 0,
+		          durationMs: Math.round(performance.now() - renderStartedAt),
+              markerNote: selectedHistoricalWindowRef.current?.mode === "historical"
+                ? "Historical chart signals can be older than the live executable candle window."
+                : "Latest chart markers are executable only when they occur on the latest closed candle or one candle back.",
+              markerSource: selectedHistoricalWindowRef.current?.mode === "historical"
+                ? "historical chart signal"
+                : "live/latest chart signal window",
+		          markers: strategyMarkers.length,
+		          renderedCandles: chartCandles.length,
+		          skippedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
+		          slTpLines: strategyLineSeriesRef.current.length,
 	        });
       }
 
@@ -1716,6 +1726,7 @@ export default function TradingViewChart() {
         <strong>{dataDiagnostics.provider ?? "binance-futures"}</strong>
         <span>{rawCandles.length} rendered / {fullHistoryDataset.length || dataDiagnostics.fullCandles || 0} loaded</span>
         <span>{chartRenderStats.markers} markers · {chartRenderStats.slTpLines} lines · {chartRenderStats.durationMs}ms render</span>
+        <span title={chartRenderStats.markerNote}>{chartRenderStats.markerSource}</span>
         <span>{selectedHistoricalWindow.mode === "historical" ? "Viewing historical window" : "Live/latest window"}</span>
         <div>
           <input
