@@ -218,7 +218,7 @@ export async function processLiveProfileExecution({
   const risk = validateOrder({
     apiConfigured: bingxClient.auth.configured,
     availableBalance,
-    liveModeEnabled: store.getState().botStatus === "LIVE_RUNNING",
+    liveModeEnabled: profile.liveModeEnabled === true || store.getState().botStatus === "LIVE_RUNNING",
     openPosition: updatedProfile.live?.openPosition,
     order,
     profile: updatedProfile,

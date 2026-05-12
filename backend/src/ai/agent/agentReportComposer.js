@@ -31,6 +31,8 @@ export function rowsToCsv(rows = []) {
     legacyNetProfit: row.legacy?.metrics?.netProfit,
     maxDrawdown: metricValue(row, "maxDrawdown"),
     maxSameSideFailures: row.params?.maxSameSideFailures,
+    primaryRankingObjective: row.primaryRankingObjective ?? row.params?.primaryRankingObjective ?? row.canonical?.primaryRankingObjective,
+    primaryRankingObjectiveLabel: row.primaryRankingObjectiveLabel ?? row.params?.primaryRankingObjectiveLabel,
     netProfit: metricValue(row, "netProfit"),
     overfitRisk: row.research?.overfit?.label,
     overfitRiskScore: row.research?.overfitRiskScore,

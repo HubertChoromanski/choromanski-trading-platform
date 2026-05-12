@@ -104,6 +104,8 @@ const defaultExecutionConfig = {
   updatedAt: null,
 };
 
+const SZTAB_INTERVALS = ["10m", "15m", "20m", "30m", "1h"];
+
 const collectionDefaults = {
   aiAlertDrafts: [],
   aiAgentRuns: [],
@@ -151,8 +153,95 @@ const collectionDefaults = {
   },
   favorites: [],
   mmDecks: [],
+  sztabConfig: createDefaultSztabConfig(),
   strategyDecks: [],
 };
+
+function createDefaultSztabInterval(interval) {
+  return {
+    apiProfile: "",
+    interval,
+    locked: false,
+    mm: {
+      riskPerSlPercent: 1,
+    },
+    mmLocked: false,
+    mmSavedAt: null,
+    runtime: {
+      error: "",
+      lastCandle: null,
+      lastDecision: "",
+      lastOrderAttempt: null,
+      lastSignal: null,
+      lastSyncAt: null,
+      startedAt: null,
+      status: "stopped",
+      stoppedAt: null,
+    },
+    strategy: {
+      atrLength: 14,
+      atrMultiplier: 1.2,
+      bandwidth: 8,
+      envelopeMultiplier: 3,
+      maxSameSideFailures: 2,
+      strategySource: "pine-ha",
+    },
+    strategyLocked: false,
+    strategySavedAt: null,
+    symbol: "SOLUSDT",
+    validation: {
+      checkedAt: null,
+      errors: [],
+      ok: false,
+      warnings: [],
+    },
+  };
+}
+
+function createDefaultSztabConfig() {
+  return {
+    intervals: Object.fromEntries(SZTAB_INTERVALS.map((interval) => [interval, createDefaultSztabInterval(interval)])),
+    updatedAt: null,
+    version: 1,
+  };
+}
+
+function normalizeSztabConfig(config = {}) {
+  const defaults = createDefaultSztabConfig();
+  const intervals = {};
+
+  for (const interval of SZTAB_INTERVALS) {
+    const current = config.intervals?.[interval] ?? {};
+    const base = defaults.intervals[interval];
+    intervals[interval] = {
+      ...base,
+      ...current,
+      interval,
+      mm: {
+        ...base.mm,
+        ...(current.mm ?? {}),
+      },
+      runtime: {
+        ...base.runtime,
+        ...(current.runtime ?? {}),
+      },
+      strategy: {
+        ...base.strategy,
+        ...(current.strategy ?? {}),
+      },
+      validation: {
+        ...base.validation,
+        ...(current.validation ?? {}),
+      },
+    };
+  }
+
+  return {
+    ...defaults,
+    ...config,
+    intervals,
+  };
+}
 
 async function ensureDataDir() {
   await mkdir(DATA_DIR, { recursive: true });
@@ -212,6 +301,7 @@ export async function createStateStore() {
     orders: await readJson("orders.json", []),
     profiles: (await readJson("profiles.json", defaultProfiles)).map(normalizeProfile),
     state: normalizeState(await readJson("state.json", defaultState)),
+    sztabConfig: normalizeSztabConfig(await readJson("sztab-config.json", collectionDefaults.sztabConfig)),
     strategyDecks: await readJson("strategy-decks.json", collectionDefaults.strategyDecks),
     trades: await readJson("trades.json", []),
   };
@@ -247,6 +337,7 @@ export async function createStateStore() {
       executionConfig: "execution-config.json",
       mmDecks: "mm-decks.json",
       strategyDecks: "strategy-decks.json",
+      sztabConfig: "sztab-config.json",
     };
     await writeJson(fileNames[key] ?? `${key}.json`, store[key]);
   }
@@ -286,6 +377,9 @@ export async function createStateStore() {
     getExecutionConfig() {
       return store.executionConfig;
     },
+    getSztabConfig() {
+      return store.sztabConfig;
+    },
     async setExecutionConfig(config) {
       store.executionConfig = {
         ...store.executionConfig,
@@ -294,6 +388,15 @@ export async function createStateStore() {
       };
       await persist("executionConfig");
       return store.executionConfig;
+    },
+    async setSztabConfig(config) {
+      store.sztabConfig = normalizeSztabConfig({
+        ...store.sztabConfig,
+        ...config,
+        updatedAt: new Date().toISOString(),
+      });
+      await persist("sztabConfig");
+      return store.sztabConfig;
     },
     async setProfiles(profiles) {
       store.profiles = profiles.map(normalizeProfile);

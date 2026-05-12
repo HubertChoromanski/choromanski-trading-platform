@@ -13,6 +13,7 @@ import { createBingxClient } from "./exchanges/bingxClient.js";
 import { reconcileBingxState } from "./execution/reconciliation.js";
 import { createStateStore } from "./state/store.js";
 import { fetchCandles } from "./strategy/strategyRunner.js";
+import { createSztabRunner, SZTAB_INTERVALS } from "./sztab/sztabRunner.js";
 
 const PORT = Number(process.env.PORT || 8787);
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || "";
@@ -1964,6 +1965,18 @@ const aiAgent = createAgentOrchestrator({
   store,
   tools: aiTools,
 });
+const sztabRunner = createSztabRunner({
+  buildLivestreamPayload,
+  getApiProfileClient,
+  publicApiProfiles,
+  store,
+});
+await sztabRunner.initialize();
+
+function normalizeSztabInterval(value) {
+  const interval = String(value ?? "").toLowerCase();
+  return SZTAB_INTERVALS.includes(interval) ? interval : "";
+}
 
 async function readBody(request) {
   const chunks = [];
@@ -2035,6 +2048,86 @@ const server = http.createServer(async (request, response) => {
       const apiProfileRows = await publicApiProfiles({ fresh: url.searchParams.get("fresh") === "1" });
       const payload = buildLivestreamPayload(apiProfileRows);
       sendJson(response, 200, payload);
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/sztab/status") {
+      sendJson(response, 200, await sztabRunner.getStatus());
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/sztab/config") {
+      sendJson(response, 200, await sztabRunner.getConfig());
+      return;
+    }
+
+    const sztabConfigMatch = pathname.match(/^\/sztab\/config\/([^/]+)$/u);
+    if (request.method === "POST" && sztabConfigMatch) {
+      if (!requireDashboardToken(request, response)) return;
+      const interval = normalizeSztabInterval(sztabConfigMatch[1]);
+      const body = await readBody(request);
+      const result = interval
+        ? await sztabRunner.updateConfig(interval, body)
+        : { ok: false, message: "Unsupported Sztab interval." };
+      sendJson(response, result.ok ? 200 : 400, result);
+      return;
+    }
+
+    const sztabStartMatch = pathname.match(/^\/sztab\/start\/([^/]+)$/u);
+    if (request.method === "POST" && sztabStartMatch) {
+      if (!requireDashboardToken(request, response)) return;
+      const interval = normalizeSztabInterval(sztabStartMatch[1]);
+      const body = await readBody(request);
+      const result = interval
+        ? await sztabRunner.start(interval, body)
+        : { ok: false, status: 400, message: "Unsupported Sztab interval." };
+      sendJson(response, result.ok ? 200 : result.status ?? 400, result);
+      return;
+    }
+
+    const sztabStopMatch = pathname.match(/^\/sztab\/stop\/([^/]+)$/u);
+    if (request.method === "POST" && sztabStopMatch) {
+      if (!requireDashboardToken(request, response)) return;
+      const interval = normalizeSztabInterval(sztabStopMatch[1]);
+      const result = interval
+        ? await sztabRunner.stop(interval)
+        : { ok: false, status: 400, message: "Unsupported Sztab interval." };
+      sendJson(response, result.ok ? 200 : result.status ?? 400, result);
+      return;
+    }
+
+    const sztabRestartMatch = pathname.match(/^\/sztab\/restart\/([^/]+)$/u);
+    if (request.method === "POST" && sztabRestartMatch) {
+      if (!requireDashboardToken(request, response)) return;
+      const interval = normalizeSztabInterval(sztabRestartMatch[1]);
+      const body = await readBody(request);
+      const result = interval
+        ? await sztabRunner.restart(interval, body)
+        : { ok: false, status: 400, message: "Unsupported Sztab interval." };
+      sendJson(response, result.ok ? 200 : result.status ?? 400, result);
+      return;
+    }
+
+    const sztabSyncMatch = pathname.match(/^\/sztab\/sync\/([^/]+)$/u);
+    if (request.method === "POST" && sztabSyncMatch) {
+      if (!requireDashboardToken(request, response)) return;
+      const interval = normalizeSztabInterval(sztabSyncMatch[1]);
+      const result = interval
+        ? await sztabRunner.syncInterval(interval)
+        : { ok: false, status: 400, message: "Unsupported Sztab interval." };
+      sendJson(response, result.ok ? 200 : result.status ?? 400, result);
+      return;
+    }
+
+    if (request.method === "POST" && pathname === "/sztab/stop-all") {
+      if (!requireDashboardToken(request, response)) return;
+      sendJson(response, 200, await sztabRunner.stopAll());
+      return;
+    }
+
+    if (request.method === "POST" && pathname === "/sztab/sync-all") {
+      if (!requireDashboardToken(request, response)) return;
+      sendJson(response, 200, await sztabRunner.syncAll());
       return;
     }
 

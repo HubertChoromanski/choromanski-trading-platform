@@ -1590,6 +1590,16 @@ export default function TradingViewChart() {
         </div>
 
         <div className="hubert-toolbar__group hubert-toolbar__group--tools">
+          <button
+            className="hubert-button hubert-button--sztab"
+            data-active={settingsPanel === "Sztab Generalny"}
+            onClick={() => {
+              setSettingsPanel((currentPanel) => (currentPanel === "Sztab Generalny" ? null : "Sztab Generalny"));
+            }}
+            type="button"
+          >
+            Sztab Generalny
+          </button>
           {toolGroups.map((group) => {
             const groupActive = group.items.includes(settingsPanel);
             return (

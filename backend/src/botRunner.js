@@ -53,6 +53,11 @@ export function createBotRunner({ bingxClient, store }) {
       const updatedProfiles = [];
 
       for (const profile of profiles) {
+        if (profile.runner === "sztab" || String(profile.id ?? "").startsWith("sztab-")) {
+          updatedProfiles.push(profile);
+          continue;
+        }
+
         if (!profile.enabled) {
           updatedProfiles.push(profile);
           continue;
@@ -189,7 +194,7 @@ export function createBotRunner({ bingxClient, store }) {
 
       const liveProfiles = store
         .getProfiles()
-        .filter((profile) => profile.enabled && profile.executionMode === "live");
+        .filter((profile) => profile.enabled && profile.executionMode === "live" && profile.runner !== "sztab" && !String(profile.id ?? "").startsWith("sztab-"));
 
       if (liveProfiles.length === 0) {
         return store.setState({
@@ -212,7 +217,7 @@ export function createBotRunner({ bingxClient, store }) {
       await log("emergency stop", { closePositions });
 
       if (closePositions && bingxClient.auth.configured) {
-        for (const profile of store.getProfiles().filter((item) => item.executionMode === "live")) {
+        for (const profile of store.getProfiles().filter((item) => item.executionMode === "live" && item.runner !== "sztab" && !String(item.id ?? "").startsWith("sztab-"))) {
           await bingxClient.closePosition(profile.symbol);
           await bingxClient.cancelOpenOrders(profile.symbol);
         }

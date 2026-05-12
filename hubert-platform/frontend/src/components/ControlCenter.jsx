@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { runBacktest } from "../backtest/backtestEngine";
 import { fetchHistoricalCandles } from "../api/binance";
 
@@ -33,15 +33,28 @@ const TIMEFRAMES = [
   { label: "1H", interval: "1h", minutes: 60 },
   { label: "4H", interval: "4h", minutes: 240 },
 ];
+const SZTAB_TIMEFRAMES = TIMEFRAMES.filter((item) => item.interval !== "4h");
 const PREVIEW_CURVE_POINTS = 420;
 const BACKTEST_CHART_TRADE_LIMIT = 500;
 const TRADE_TABLE_PAGE_SIZE = 50;
 const STORED_BACKTEST_EVENT_LIMIT = 1000;
 const SWEEP_DEFAULT_COMBINATIONS = 200;
 const SWEEP_MAX_COMBINATIONS = 1000;
+const SWEEP_RETAINED_LIMIT = 100;
 const ACTIVE_SWEEP_STORAGE_KEY = "hubert.activeSweepId.v1";
 const RECENT_SWEEPS_STORAGE_KEY = "hubert.recentSweeps.v1";
 const RECENT_SWEEP_LIMIT = 8;
+const SZTAB_STORAGE_KEY = "hubert.sztabGeneralny.v1";
+const SWEEP_RANKING_OBJECTIVES = [
+  ["overall", "Overall score"],
+  ["net", "Net profit"],
+  ["pf", "Profit factor"],
+  ["win", "Win %"],
+  ["rrr", "RRR"],
+  ["streak", "Max wins streak"],
+  ["dd", "Lowest DD"],
+  ["trades", "Trade count"],
+];
 
 const defaultStrategyDeck = {
   allowLong: true,
@@ -76,6 +89,123 @@ const defaultMmDeck = {
   positionPercent: 10,
 };
 
+function createDefaultSztabIntervalConfig(timeframe) {
+  return {
+    apiProfile: "",
+    botStatus: "stopped",
+    lastAppliedAt: "",
+    lastAppliedBy: "",
+    locked: false,
+    mm: {
+      riskPerSlPercent: 1,
+    },
+    mmDirty: false,
+    mmLocked: false,
+    mmSavedAt: null,
+    strategy: {
+      ...defaultStrategyDeck,
+      timeframe: timeframe.interval,
+    },
+    strategyDirty: false,
+    strategyLocked: false,
+    strategySavedAt: null,
+    symbol: "SOLUSDT",
+    runtime: {
+      error: "",
+      lastCandle: null,
+      lastDecision: "",
+      lastOrderAttempt: null,
+      lastSignal: null,
+      lastSyncAt: null,
+      startedAt: null,
+      status: "stopped",
+      stoppedAt: null,
+    },
+    validation: {
+      checkedAt: "",
+      errors: [],
+      message: "Not validated yet.",
+      ok: false,
+      warnings: [],
+    },
+  };
+}
+
+function createDefaultSztabState() {
+  return {
+    activeTab: "general",
+    expanded: false,
+    intervals: Object.fromEntries(
+      SZTAB_TIMEFRAMES.map((timeframe) => [timeframe.interval, createDefaultSztabIntervalConfig(timeframe)]),
+    ),
+    updatedAt: "",
+    version: 1,
+  };
+}
+
+function mergeSztabState(stored) {
+  const defaults = createDefaultSztabState();
+  const storedIntervals = stored?.intervals && typeof stored.intervals === "object" ? stored.intervals : {};
+
+  return {
+    ...defaults,
+    ...stored,
+    activeTab: stored?.activeTab && ["general", ...SZTAB_TIMEFRAMES.map((item) => item.interval)].includes(stored.activeTab)
+      ? stored.activeTab
+      : defaults.activeTab,
+    intervals: Object.fromEntries(
+      SZTAB_TIMEFRAMES.map((timeframe) => {
+        const current = storedIntervals[timeframe.interval] ?? {};
+        const base = createDefaultSztabIntervalConfig(timeframe);
+        return [
+          timeframe.interval,
+          {
+            ...base,
+            ...current,
+            mm: {
+              ...base.mm,
+              ...(current.mm ?? {}),
+            },
+            runtime: {
+              ...base.runtime,
+              ...(current.runtime ?? {}),
+            },
+            strategy: {
+              ...base.strategy,
+              ...(current.strategy ?? {}),
+              timeframe: timeframe.interval,
+            },
+            validation: {
+              ...base.validation,
+              ...(current.validation ?? {}),
+            },
+          },
+        ];
+      }),
+    ),
+  };
+}
+
+function readSztabState() {
+  if (typeof window === "undefined") return createDefaultSztabState();
+
+  try {
+    return mergeSztabState(JSON.parse(window.localStorage.getItem(SZTAB_STORAGE_KEY) ?? "null"));
+  } catch {
+    return createDefaultSztabState();
+  }
+}
+
+function writeSztabState(value) {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.localStorage.setItem(SZTAB_STORAGE_KEY, JSON.stringify(value));
+  } catch {
+    // Sztab persistence is operational convenience only; never block the dashboard.
+  }
+}
+
 const defaultBacktestForm = {
   commissionPercent: 0.04,
   fillMode: "legacy",
@@ -108,6 +238,7 @@ const defaultSweepForm = {
   manualLastDays: 31,
   manualMaxSameSideFailures: "2",
   manualPositionValues: "10",
+  manualPrimaryObjective: "overall",
   manualRangeMode: "rolling",
   manualRiskValues: "1",
   manualSizingMode: "run-position",
@@ -898,11 +1029,44 @@ function sweepRangeForm(backtestForm, form) {
   };
 }
 
-function rankSweepRows(rows) {
+function sweepRankingObjectiveLabel(value) {
+  return SWEEP_RANKING_OBJECTIVES.find(([key]) => key === value)?.[1] ?? "Overall score";
+}
+
+function sweepObjectiveValue(row = {}, objective = "overall") {
+  if (objective === "net") return Number(row.netProfit ?? -Infinity);
+  if (objective === "pf") return Number(row.profitFactor ?? -Infinity);
+  if (objective === "win") return Number(row.winRate ?? -Infinity);
+  if (objective === "rrr") return Number(row.rrr ?? -Infinity);
+  if (objective === "streak") return Number(sweepMaxWins(row) ?? -Infinity);
+  if (objective === "trades") return Number(row.totalTrades ?? -Infinity);
+  if (objective === "dd") {
+    const drawdown = Number(row.maxDrawdown);
+    return Number.isFinite(drawdown) ? -drawdown : -Infinity;
+  }
+  return Number(row.score ?? -Infinity);
+}
+
+function rankSweepRows(rows, objective = "overall") {
+  const normalizedObjective = SWEEP_RANKING_OBJECTIVES.some(([key]) => key === objective) ? objective : "overall";
   return rows
     .slice()
-    .sort((left, right) => right.score - left.score)
-    .map((row, index) => ({ ...row, rank: index + 1 }));
+    .sort((left, right) => {
+      const delta = sweepObjectiveValue(right, normalizedObjective) - sweepObjectiveValue(left, normalizedObjective);
+      if (delta !== 0) return delta;
+      return Number(right.score ?? -Infinity) - Number(left.score ?? -Infinity);
+    })
+    .map((row, index) => ({
+      ...row,
+      primaryRankingObjective: normalizedObjective,
+      primaryRankingObjectiveLabel: sweepRankingObjectiveLabel(normalizedObjective),
+      rank: index + 1,
+      retainedRank: index + 1,
+    }));
+}
+
+function retainedSweepRows(rows, objective = "overall") {
+  return rankSweepRows(rows, objective).slice(0, SWEEP_RETAINED_LIMIT);
 }
 
 function sizingAudit(trades = []) {
@@ -1392,6 +1556,8 @@ export default function ControlCenter({
     takeProfitPrice: "",
   });
   const [pendingManualAction, setPendingManualAction] = useState(null);
+  const [sztabState, setSztabState] = useState(readSztabState);
+  const [sztabStatus, setSztabStatus] = useState(null);
 
   const loadedDays = useMemo(
     () => daysFromCandles(rawCandles, selectedInterval),
@@ -1538,6 +1704,7 @@ export default function ControlCenter({
       nextAnalytics,
       nextCommunication,
       nextAiStatus,
+      nextSztabStatus,
     ] =
       await Promise.all([
         apiFetch("/system/status"),
@@ -1551,6 +1718,7 @@ export default function ControlCenter({
         apiFetch("/analytics"),
         apiFetch("/communication/settings"),
         apiFetch("/ai/status"),
+        apiFetch("/sztab/status"),
       ]);
     setSystem(nextSystem);
     setLivestream(nextLivestream);
@@ -1563,19 +1731,105 @@ export default function ControlCenter({
     setAnalytics(nextAnalytics);
     setCommunication(nextCommunication);
     setAiStatus(nextAiStatus);
+    setSztabStatus(nextSztabStatus);
+    if (nextSztabStatus?.config) {
+      setSztabState((current) => mergeSztabState({
+        ...nextSztabStatus.config,
+        activeTab: current.activeTab,
+        expanded: current.expanded,
+      }));
+    }
     if (!executionDeckId && nextBattle[0]) setExecutionDeckId(nextBattle[0].id);
   }
 
   async function refreshLiveStatus({ fresh = false } = {}) {
     const suffix = fresh ? "?fresh=1" : "";
-    const [nextLivestream, nextAccounts, nextSystem] = await Promise.all([
+    const [nextLivestream, nextAccounts, nextSystem, nextSztabStatus] = await Promise.all([
       apiFetch(`/livestream${suffix}`),
       apiFetch(`/accounts/profiles${suffix}`),
       apiFetch("/system/status"),
+      apiFetch("/sztab/status"),
     ]);
     setLivestream(nextLivestream);
     setAccountProfiles(nextAccounts);
     setSystem(nextSystem);
+    setSztabStatus(nextSztabStatus);
+    if (nextSztabStatus?.config) {
+      setSztabState((current) => mergeSztabState({
+        ...nextSztabStatus.config,
+        activeTab: current.activeTab,
+        expanded: current.expanded,
+      }));
+    }
+  }
+
+  async function refreshSztabStatus() {
+    const nextSztabStatus = await apiFetch("/sztab/status");
+    setSztabStatus(nextSztabStatus);
+    if (nextSztabStatus?.config) {
+      setSztabState((current) => mergeSztabState({
+        ...nextSztabStatus.config,
+        activeTab: current.activeTab,
+        expanded: current.expanded,
+      }));
+    }
+    return nextSztabStatus;
+  }
+
+  async function saveSztabIntervalConfig(interval, body) {
+    const result = await apiFetch(`/sztab/config/${interval}`, { body, method: "POST" });
+    await refreshSztabStatus();
+    return result;
+  }
+
+  async function startSztabInterval(interval, body = {}) {
+    let response = await apiFetchDetailed(`/sztab/start/${interval}`, { body, method: "POST" });
+
+    if (!response.ok && response.payload?.needsConfirmation) {
+      const confirmed = window.confirm(`${response.payload.message}\n\nStart ${intervalDisplayLabel(interval)} anyway?`);
+      if (!confirmed) return response.payload;
+      response = await apiFetchDetailed(`/sztab/start/${interval}`, {
+        body: {
+          ...body,
+          confirmExistingExposure: true,
+          confirmOpenOrders: true,
+        },
+        method: "POST",
+      });
+    }
+
+    await refreshAll();
+
+    if (!response.ok || response.payload?.ok === false) {
+      throw new Error(response.payload?.message ?? "Sztab runner did not start.");
+    }
+
+    return response.payload;
+  }
+
+  async function restartSztabInterval(interval, body = {}) {
+    let response = await apiFetchDetailed(`/sztab/restart/${interval}`, { body, method: "POST" });
+
+    if (!response.ok && response.payload?.needsConfirmation) {
+      const confirmed = window.confirm(`${response.payload.message}\n\nRestart ${intervalDisplayLabel(interval)} anyway?`);
+      if (!confirmed) return response.payload;
+      response = await apiFetchDetailed(`/sztab/start/${interval}`, {
+        body: {
+          ...body,
+          confirmExistingExposure: true,
+          confirmOpenOrders: true,
+        },
+        method: "POST",
+      });
+    }
+
+    await refreshAll();
+
+    if (!response.ok || response.payload?.ok === false) {
+      throw new Error(response.payload?.message ?? "Sztab runner did not restart.");
+    }
+
+    return response.payload;
   }
 
   useEffect(() => {
@@ -1596,6 +1850,10 @@ export default function ControlCenter({
   useEffect(() => {
     writeActiveSweepId(activeSweepId);
   }, [activeSweepId]);
+
+  useEffect(() => {
+    writeSztabState(sztabState);
+  }, [sztabState]);
 
   useEffect(() => {
     if (restoredActiveSweepRef.current) return;
@@ -2084,6 +2342,7 @@ export default function ControlCenter({
         throw new Error("Manual Sweep currently supports SOLUSDT historical candles.");
       }
 
+      const primaryObjective = form.manualPrimaryObjective ?? "overall";
       const failures = parseSweepNumberList(form.manualMaxSameSideFailures, "Max same-side failures", { integer: true, min: 0 });
       const atrLengths = parseSweepNumberList(form.manualAtrLengths, "ATR length values", { integer: true, positive: true });
       const atrMultipliers = parseSweepNumberList(form.manualAtrMultipliers, "ATR multiplier values", { positive: true });
@@ -2128,6 +2387,8 @@ export default function ControlCenter({
                       mode: "manual",
                       fillMode: form.manualFillMode ?? "legacy",
                       positionPercent: sizing.key === "positionPercent" ? sizeValue : null,
+                      primaryRankingObjective: primaryObjective,
+                      primaryRankingObjectiveLabel: sweepRankingObjectiveLabel(primaryObjective),
                       riskPercent: sizing.key === "oneSlPercent" ? sizeValue : null,
                       sizeKey: sizing.key,
                       sizeLabel: sweepSizeLabel(sizing.key),
@@ -2248,18 +2509,22 @@ export default function ControlCenter({
     return snapshot;
   }
 
-  function makeSweepSnapshot({ form, ranked, status = "completed", total = null }) {
+  function makeSweepSnapshot({ executed = null, form, ranked, status = "completed", total = null }) {
     const first = ranked[0] ?? {};
+    const primaryObjective = form.manualPrimaryObjective ?? first.primaryRankingObjective ?? "overall";
     return {
       analysisRange: first.analysisRange ?? null,
       createdAt: new Date().toISOString(),
-      executedCombinations: ranked.length,
+      executedCombinations: executed ?? ranked.length,
       form,
       id: `sweep-set-${Date.now()}`,
       name: `Sweep ${form.manualSymbol ?? "SOLUSDT"} ${form.manualTimeframe ?? ""} ${new Date().toLocaleString()}`,
       plannedCombinations: total ?? ranked.length,
+      primaryRankingObjective: primaryObjective,
+      primaryRankingObjectiveLabel: sweepRankingObjectiveLabel(primaryObjective),
       provider: first.dataDiagnostics?.provider ?? "binance-futures",
-      results: ranked.slice(0, 50),
+      retainedLimit: SWEEP_RETAINED_LIMIT,
+      results: ranked.slice(0, SWEEP_RETAINED_LIMIT),
       status,
       symbol: form.manualSymbol ?? "SOLUSDT",
       timeframe: form.manualTimeframe ?? "15m",
@@ -2275,7 +2540,7 @@ export default function ControlCenter({
     setSweepResults(snapshot.results ?? []);
     setSweepProgress({
       completed: snapshot.executedCombinations ?? snapshot.results?.length ?? 0,
-      message: `Reopened ${snapshot.name ?? "saved sweep"}`,
+      message: `Reopened ${snapshot.name ?? "saved sweep"} · retained ${snapshot.results?.length ?? 0} by ${snapshot.primaryRankingObjectiveLabel ?? sweepRankingObjectiveLabel(snapshot.form?.manualPrimaryObjective)}`,
       running: false,
       total: snapshot.plannedCombinations ?? snapshot.results?.length ?? 0,
     });
@@ -2300,6 +2565,8 @@ export default function ControlCenter({
       snapshot: {
         ...snapshot,
         name: name.trim(),
+        primaryRankingObjective: snapshot.primaryRankingObjective ?? snapshot.form?.manualPrimaryObjective ?? "overall",
+        primaryRankingObjectiveLabel: snapshot.primaryRankingObjectiveLabel ?? sweepRankingObjectiveLabel(snapshot.form?.manualPrimaryObjective),
         status: "saved",
       },
     };
@@ -2318,6 +2585,8 @@ export default function ControlCenter({
 
   async function runSweepBacktest() {
     const manualSweepForm = { ...sweepForm, mode: "manual" };
+    const primaryObjective = manualSweepForm.manualPrimaryObjective ?? "overall";
+    const primaryObjectiveLabel = sweepRankingObjectiveLabel(primaryObjective);
     if (manualSweepForm.manualRangeMode === "explicit" && !String(manualSweepForm.manualFrom ?? "").trim()) {
       throw new Error("Explicit historical range needs a From date/time.");
     }
@@ -2348,7 +2617,7 @@ export default function ControlCenter({
     setSweepResults([]);
     setSweepProgress({
       completed: 0,
-      message: `Running 0 / ${combinations.length}`,
+      message: `Running 0 / ${combinations.length} · retaining top ${Math.min(SWEEP_RETAINED_LIMIT, combinations.length)} by ${primaryObjectiveLabel}`,
       running: true,
       total: combinations.length,
     });
@@ -2394,11 +2663,14 @@ export default function ControlCenter({
         id: `sweep-${Date.now()}-${index}`,
         longResult: sidePnl(result.trades, "LONG"),
         maxDrawdown: metrics.maxDrawdown,
+        maxConsecutiveWins: metrics.consecutiveWins,
         netProfit: metrics.netProfit,
         netProfitPercent: Number(form.startingBalance) > 0
           ? (metrics.netProfit / Number(form.startingBalance)) * 100
           : 0,
         profitFactor: metrics.profitFactor,
+        primaryRankingObjective: primaryObjective,
+        primaryRankingObjectiveLabel: primaryObjectiveLabel,
         rangeForm: form,
         avgR: avgR.value,
         avgRSource: avgR.source,
@@ -2414,10 +2686,10 @@ export default function ControlCenter({
       rows.push(row);
 
       if ((index + 1) % 4 === 0 || index === combinations.length - 1) {
-        setSweepResults(rankSweepRows(rows).slice(0, 50));
+        setSweepResults(retainedSweepRows(rows, primaryObjective));
         setSweepProgress({
           completed: index + 1,
-          message: `Running ${index + 1} / ${combinations.length}`,
+          message: `Running ${index + 1} / ${combinations.length} · retained ${Math.min(SWEEP_RETAINED_LIMIT, rows.length)} by ${primaryObjectiveLabel}`,
           running: true,
           total: combinations.length,
         });
@@ -2425,9 +2697,10 @@ export default function ControlCenter({
       }
     }
 
-    const ranked = rankSweepRows(rows);
-    setSweepResults(ranked.slice(0, 50));
+    const ranked = retainedSweepRows(rows, primaryObjective);
+    setSweepResults(ranked);
     rememberSweep(makeSweepSnapshot({
+      executed: rows.length,
       form: manualSweepForm,
       ranked,
       status: sweepCancelRef.current ? "cancelled" : "completed",
@@ -2435,7 +2708,9 @@ export default function ControlCenter({
     }));
     setSweepProgress({
       completed: rows.length,
-      message: sweepCancelRef.current ? `Cancelled at ${rows.length} / ${combinations.length}` : `Completed ${rows.length} combinations`,
+      message: sweepCancelRef.current
+        ? `Cancelled at ${rows.length} / ${combinations.length} · retained ${ranked.length} by ${primaryObjectiveLabel}`
+        : `Completed ${rows.length} combinations · retained ${ranked.length} by ${primaryObjectiveLabel}`,
       running: false,
       total: combinations.length,
     });
@@ -2514,6 +2789,14 @@ export default function ControlCenter({
       </div>
 
       <div className="hubert-control-tabs">
+        <button
+          className="hubert-tab-main hubert-tab-main--sztab"
+          data-active={panel === "Sztab Generalny"}
+          onClick={() => setActivePanel("Sztab Generalny")}
+          type="button"
+        >
+          Sztab Generalny
+        </button>
         {PANEL_GROUPS.map((group) => {
           const groupActive = group.tabs.includes(panel);
           return (
@@ -2548,6 +2831,101 @@ export default function ControlCenter({
         <MiniStatus tone={action.state === "error" ? "bad" : action.state === "success" ? "good" : "neutral"}>
           {action.message}
         </MiniStatus>
+      )}
+
+      {panel === "Sztab Generalny" && (
+        <SztabGeneralnyPanel
+          accountProfiles={accountProfiles}
+          backendStatus={sztabStatus}
+          battleDecks={battleDecks}
+          livestream={livestream}
+          mmDecks={mmDecks}
+          positionActionState={positionActionState}
+          rawCandles={rawCandles}
+          selectedInterval={selectedInterval}
+          strategyDecks={strategyDecks}
+          system={system}
+          value={sztabState}
+          onAction={runAction}
+          onEmergencyStop={(closePositions) =>
+            runAction("sztab-emergency-stop", closePositions ? "Emergency stop and close positions" : "Stop all bots", async () => {
+              await apiFetch("/sztab/stop-all", { method: "POST" }).catch(() => null);
+              const result = closePositions
+                ? await apiFetch("/execution/emergency-stop", { body: { closePositions: true }, method: "POST" })
+                : await apiFetch("/execution/stop", { method: "POST" });
+              await refreshAll();
+              return result;
+            })
+          }
+          onCancelAllOrders={() =>
+            runAction("sztab-cancel-all-orders", "Cancel all visible orders", async () => {
+              const targets = [
+                ...new Map(
+                  [
+                    ...(livestream?.openOrders ?? []),
+                    ...(livestream?.positions ?? []),
+                  ]
+                    .map((item) => ({
+                      apiProfile: item.apiProfile ?? item.__apiProfileId ?? item.sourceProfileId ?? "main",
+                      symbol: item.symbol ?? "SOLUSDT",
+                    }))
+                    .filter((item) => item.symbol)
+                    .map((item) => [`${item.apiProfile}:${item.symbol}`, item]),
+                ).values(),
+              ];
+
+              if (targets.length === 0) {
+                throw new Error("No visible BingX orders or positions are available to target.");
+              }
+
+              await apiFetch("/execution/crisis/on", { method: "POST" });
+              const responses = [];
+
+              for (const target of targets) {
+                responses.push(await apiFetchDetailed("/manual/action", {
+                  body: {
+                    action: "CANCEL_ALL",
+                    apiProfile: target.apiProfile,
+                    symbol: target.symbol,
+                  },
+                  method: "POST",
+                }));
+              }
+
+              await refreshLiveStatus({ fresh: true });
+              const failed = responses.filter((response) => !response.ok || response.payload?.ok === false);
+              if (failed.length > 0) {
+                throw new Error(`${failed.length} cancel request(s) were rejected. Check diagnostics in Crisis if orders remain.`);
+              }
+              return { ok: true, message: `Cancel requests sent for ${targets.length} visible symbol/profile pair(s).` };
+            })
+          }
+          onForceSync={() => runAction("sztab-force-sync", "Force sync all", async () => {
+            await apiFetch("/sztab/sync-all", { method: "POST" });
+            await refreshLiveStatus({ fresh: true });
+          })}
+          onOpenAdvanced={(nextPanel) => setActivePanel(nextPanel)}
+          onPositionAction={prepareCrisisAction}
+          onPositionRefresh={refreshPositionCard}
+          onSaveConfig={saveSztabIntervalConfig}
+          onStartInterval={(interval) => runAction(`sztab-start-${interval}`, `Start ${intervalDisplayLabel(interval)} runner`, () => startSztabInterval(interval))}
+          onRestartInterval={(interval) => runAction(`sztab-restart-${interval}`, `Restart ${intervalDisplayLabel(interval)} runner`, () => restartSztabInterval(interval))}
+          onStopAll={() => runAction("sztab-stop-all", "Stop all Sztab runners", async () => {
+            await apiFetch("/sztab/stop-all", { method: "POST" });
+            await apiFetch("/execution/stop", { method: "POST" }).catch(() => null);
+            await refreshSztabStatus();
+            await refreshLiveStatus({ fresh: true });
+          })}
+          onStopInterval={(interval) => runAction(`sztab-stop-${interval}`, `Stop ${intervalDisplayLabel(interval)} runner`, async () => {
+            await apiFetch(`/sztab/stop/${interval}`, { method: "POST" });
+            await refreshSztabStatus();
+          })}
+          onSyncInterval={(interval) => runAction(`sztab-sync-${interval}`, `Sync ${intervalDisplayLabel(interval)}`, async () => {
+            await apiFetch(`/sztab/sync/${interval}`, { method: "POST" });
+            await refreshLiveStatus({ fresh: true });
+          })}
+          onUpdate={setSztabState}
+        />
       )}
 
       {panel === "System" && (
@@ -3526,6 +3904,11 @@ function BacktestSweepPanel({
   const previewTone = preview?.error || preview?.tooMany ? "bad" : "neutral";
   const rangeMode = form.manualRangeMode ?? (form.manualFrom || form.manualTo ? "explicit" : "rolling");
   const explicitRange = rangeMode === "explicit";
+  const primaryObjective = form.manualPrimaryObjective ?? "overall";
+  const primaryObjectiveLabel = sweepRankingObjectiveLabel(primaryObjective);
+  const retainedLabel = results.length
+    ? `Generated ${preview?.count ?? progress.total ?? results.length} • Executed ${progress.completed || progress.total || results.length} • Retained ${results.length} by ${primaryObjectiveLabel}`
+    : `Generated ${preview?.count ?? 0} • Executed ${progress.completed ?? 0} • Retained 0 by ${primaryObjectiveLabel}`;
 
   return (
     <section className="hubert-lab__section">
@@ -3571,6 +3954,12 @@ function BacktestSweepPanel({
           ["legacy", "Current / Legacy"],
           ["conservative", "Conservative"],
         ]} />
+        <SelectField
+          label="Primary ranking objective"
+          value={primaryObjective}
+          onChange={(value) => setForm({ ...form, manualPrimaryObjective: value })}
+          options={SWEEP_RANKING_OBJECTIVES}
+        />
         <TextField
           disabled={!explicitRange}
           label="From date/time"
@@ -3588,6 +3977,9 @@ function BacktestSweepPanel({
         {explicitRange
           ? "Explicit historical range is active. Rolling Last X days is ignored for this sweep."
           : "Rolling range is active. Filling Last X days clears explicit From/To dates."}
+      </MiniStatus>
+      <MiniStatus>
+        Primary ranking objective: {primaryObjectiveLabel}. This decides which top {SWEEP_RETAINED_LIMIT} rows are retained before table sorting.
       </MiniStatus>
       <MiniStatus>
         Fill mode: {fillModeLabel(form.manualFillMode)}. Legacy preserves existing results. Conservative assumes worst-case ordering when OHLC cannot prove intrabar sequence.
@@ -3658,6 +4050,7 @@ function BacktestSweepPanel({
           ? preview.error
           : `Generated combinations: ${preview?.count ?? 0}. Planned: ${preview?.tooMany ? 0 : preview?.count ?? 0}. Cap: ${preview?.cap ?? SWEEP_DEFAULT_COMBINATIONS}.${preview?.tooMany ? " Narrow ranges or raise the Advanced cap." : ""}`}
       </MiniStatus>
+      <MiniStatus>{retainedLabel}</MiniStatus>
       {preview?.warning && <MiniStatus tone={preview?.tooMany ? "bad" : "neutral"}>{preview.warning}</MiniStatus>}
       <div className="hubert-lab__actions">
         <button disabled={progress.running || preview?.tooMany || Boolean(preview?.error)} type="button" onClick={onRun}>Run Sweep</button>
@@ -3688,13 +4081,14 @@ function RecentSweeps({ activeSweepId, onOpenResult, onOpenSweepSet, recentSweep
       <div className="hubert-lab__table">
         <table>
           <thead>
-            <tr><th>Name</th><th>Range</th><th>Ranked</th><th>Status</th><th>Updated</th><th>Actions</th></tr>
+            <tr><th>Name</th><th>Range</th><th>Objective</th><th>Ranked</th><th>Status</th><th>Updated</th><th>Actions</th></tr>
           </thead>
           <tbody>
             {recentSweeps.map((sweep) => (
               <tr key={sweep.id} className={sweep.id === activeSweepId ? "hubert-sweep-row--top" : ""}>
                 <td>{sweep.name ?? sweep.id}</td>
                 <td>{sweep.analysisRange ? `${dateText(sweep.analysisRange.from)} → ${dateText(sweep.analysisRange.to)}` : `${sweep.symbol ?? "SOLUSDT"} ${sweep.timeframe ?? ""}`}</td>
+                <td>{sweep.primaryRankingObjectiveLabel ?? sweepRankingObjectiveLabel(sweep.form?.manualPrimaryObjective)}</td>
                 <td>{sweep.results?.length ?? 0} / {sweep.executedCombinations ?? "--"}</td>
                 <td>{sweep.status ?? "completed"}</td>
                 <td>{dateText(sweep.updatedAt ?? sweep.createdAt)}</td>
@@ -3750,6 +4144,48 @@ function sweepHeaderSizingText(row) {
   return `Sizing: ${sweepSizingShortText(row)} · Fixed Risk target: ${riskText} · Position Percent: ${positionText}`;
 }
 
+function sweepCellText(value, digits = 2, options = {}) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "unavailable";
+
+  const text = number.toLocaleString("pl-PL", {
+    maximumFractionDigits: digits,
+    minimumFractionDigits: options.minimumFractionDigits ?? digits,
+  });
+  return text.replace(/\u00A0/g, " ");
+}
+
+function sweepExactTitle(label, value, suffix = "") {
+  if (value === null || value === undefined || value === "") return `${label}: unavailable`;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return `${label}: unavailable`;
+  return `${label}: ${number.toLocaleString("pl-PL", { maximumFractionDigits: 8 })}${suffix}`;
+}
+
+function SweepMetricCell({ digits = 2, label, suffix = "", value }) {
+  if (value === null || value === undefined || value === "") {
+    return <td className="hubert-sweep-number" title={`${label}: unavailable`}>--</td>;
+  }
+  const number = Number(value);
+  const text = Number.isFinite(number) ? `${sweepCellText(number, digits)}${suffix}` : "--";
+  return <td className="hubert-sweep-number" title={sweepExactTitle(label, value, suffix)}>{text}</td>;
+}
+
+function SweepHeaderButton({ active, children, onClick, title }) {
+  return (
+    <button className="hubert-sweep-th-button" data-active={active} onClick={onClick} title={title} type="button">
+      {children}
+    </button>
+  );
+}
+
+function sweepMaxWins(row = {}) {
+  const direct = Number(row.maxConsecutiveWins ?? row.metrics?.maxConsecutiveWins ?? row.metrics?.consecutiveWins);
+  if (Number.isFinite(direct)) return direct;
+  if (Array.isArray(row.trades)) return maxConsecutiveByPnl(row.trades, true);
+  return null;
+}
+
 function SweepResultTable({ onOpenResult, results }) {
   const [sortMode, setSortMode] = useState("overall");
   const sortedResults = useMemo(() => {
@@ -3759,6 +4195,8 @@ function SweepResultTable({ onOpenResult, results }) {
       net: (left, right) => Number(right.netProfit ?? -Infinity) - Number(left.netProfit ?? -Infinity),
       overall: (left, right) => Number(left.rank ?? Infinity) - Number(right.rank ?? Infinity),
       pf: (left, right) => Number(right.profitFactor ?? -Infinity) - Number(left.profitFactor ?? -Infinity),
+      rrr: (left, right) => Number(right.rrr ?? -Infinity) - Number(left.rrr ?? -Infinity),
+      streak: (left, right) => Number(sweepMaxWins(right) ?? -Infinity) - Number(sweepMaxWins(left) ?? -Infinity),
       win: (left, right) => Number(right.winRate ?? -Infinity) - Number(left.winRate ?? -Infinity),
     };
     return source.slice().sort(sorters[sortMode] ?? sorters.overall);
@@ -3782,12 +4220,18 @@ function SweepResultTable({ onOpenResult, results }) {
         {firstResult.analysisRange ? ` Range: ${dateText(firstResult.analysisRange.from)} to ${dateText(firstResult.analysisRange.to)}.` : ""}
       </MiniStatus>
       <MiniStatus>
+        Primary ranking objective used: {firstResult.primaryRankingObjectiveLabel ?? firstResult.params?.primaryRankingObjectiveLabel ?? sweepRankingObjectiveLabel(firstResult.primaryRankingObjective ?? firstResult.params?.primaryRankingObjective)}.
+        Retained leaderboard rows: {results.length}.
+      </MiniStatus>
+      <MiniStatus>
         Fill Mode: {fillModeLabel(firstResult.fillMode ?? firstResult.params?.fillMode)} · ambiguous candles: {firstResult.ambiguousCandlesCount ?? firstResult.ambiguity?.ambiguousCandlesCount ?? 0} · conservative-adjusted trades: {firstResult.conservativeAdjustedTrades ?? firstResult.ambiguity?.conservativeAdjustedTrades ?? 0} · skipped entries: {firstResult.conservativeSkippedEntries ?? firstResult.ambiguity?.conservativeSkippedEntries ?? 0}
       </MiniStatus>
       <MiniStatus>{sweepHeaderSizingText(firstResult)}</MiniStatus>
       <div className="hubert-lab__actions hubert-sweep-filters">
         <button data-active={sortMode === "overall"} type="button" onClick={() => setSortMode("overall")}>Overall</button>
         <button data-active={sortMode === "pf"} type="button" onClick={() => setSortMode("pf")}>Best PF</button>
+        <button data-active={sortMode === "rrr"} type="button" onClick={() => setSortMode("rrr")}>Best RRR</button>
+        <button data-active={sortMode === "streak"} type="button" onClick={() => setSortMode("streak")}>Best streak</button>
         <button data-active={sortMode === "win"} type="button" onClick={() => setSortMode("win")}>Best win%</button>
         <button data-active={sortMode === "net"} type="button" onClick={() => setSortMode("net")}>Best net</button>
         <button data-active={sortMode === "dd"} type="button" onClick={() => setSortMode("dd")}>Best low DD</button>
@@ -3798,16 +4242,32 @@ function SweepResultTable({ onOpenResult, results }) {
             <tr>
               <th>Rank</th>
               <th>Score</th>
-              <th>Net profit</th>
-              <th>Max DD</th>
+              <th>Net</th>
+              <th>DD</th>
               <th>PF</th>
-              <th>Win rate</th>
-              <th>RRR</th>
-              <th>Avg R</th>
+              <th>Win %</th>
+              <th>
+                <SweepHeaderButton
+                  active={sortMode === "rrr"}
+                  onClick={() => setSortMode("rrr")}
+                  title="Sort by highest true RRR"
+                >
+                  RRR
+                </SweepHeaderButton>
+              </th>
+              <th>
+                <SweepHeaderButton
+                  active={sortMode === "streak"}
+                  onClick={() => setSortMode("streak")}
+                  title="Sort by highest max consecutive winning trades"
+                >
+                  Max wins
+                </SweepHeaderButton>
+              </th>
               <th>Trades</th>
               <th>ATR len</th>
-              <th>Max failures</th>
               <th>ATR mult</th>
+              <th>Max failures</th>
               <th>NWE</th>
               <th>BW</th>
               <th>Sizing</th>
@@ -3815,7 +4275,7 @@ function SweepResultTable({ onOpenResult, results }) {
             </tr>
           </thead>
           <tbody>
-            {sortedResults.slice(0, 30).map((row, index) => {
+            {sortedResults.map((row, index) => {
               const badges = [
                 leaders.pf === row.id ? "PF" : "",
                 leaders.win === row.id ? "Win" : "",
@@ -3823,42 +4283,29 @@ function SweepResultTable({ onOpenResult, results }) {
                 leaders.dd === row.id ? "DD" : "",
               ].filter(Boolean);
               return (
-                <Fragment key={row.id}>
-                  <tr className={index < 3 ? "hubert-sweep-row--top" : ""} key={row.id}>
-                    <td>{row.rank}</td>
-                    <td title={badges.length ? `Category leader: ${badges.join(", ")}` : ""}>{fmt(row.score)}</td>
-                    <td>{fmt(row.netProfit)}</td>
-                    <td>{fmt(row.maxDrawdown)}%</td>
-                    <td>{fmt(row.profitFactor)}</td>
-                    <td>{fmt(row.winRate)}%</td>
-                    <td title="RRR = average winning trade divided by absolute average losing trade.">{Number.isFinite(row.rrr) ? fmt(row.rrr) : "unavailable"}</td>
-                    <td title="Avg R / trade = average trade result in risk units.">{Number.isFinite(row.avgR) ? fmt(row.avgR) : "unavailable"}</td>
-                    <td>{row.totalTrades}</td>
-                    <td>{row.params?.atrLength ?? "--"}</td>
-                    <td>{row.params?.maxSameSideFailures ?? "--"}</td>
-                    <td>{fmt(row.params?.atrMultiplier, 2)}</td>
-                    <td>{fmt(row.params?.envelopeMultiplier, 2)}</td>
-                    <td>{fmt(row.params?.bandwidth, 2)}</td>
-                    <td className="hubert-sweep-params" title={sweepParamDetails(row)}>{sweepSizingShortText(row)}</td>
-                    <td><button className="hubert-sweep-open" type="button" onClick={() => onOpenResult(row)}>Open</button></td>
-                  </tr>
-                  <tr className="hubert-sweep-detail-row" key={`${row.id}-details`}>
-                    <td colSpan={16}>
-                      <details>
-                        <summary>Full config {badges.length ? `· best ${badges.join(" / ")}` : ""}</summary>
-                        <span>{sweepParamDetails(row)} · RRR {Number.isFinite(row.rrr) ? fmt(row.rrr) : "unavailable"} · Avg R / trade {Number.isFinite(row.avgR) ? fmt(row.avgR) : "unavailable"} · expectancy {fmt(row.expectancy)} · avg trade {fmt(row.averageTrade)}.</span>
-                      </details>
-                    </td>
-                  </tr>
-                </Fragment>
+                <tr className={index < 3 ? "hubert-sweep-row--top" : ""} key={row.id}>
+                  <td>{row.rank}</td>
+                  <SweepMetricCell label={badges.length ? `Score · category leader: ${badges.join(", ")}` : "Score"} value={row.score} />
+                  <SweepMetricCell digits={Math.abs(Number(row.netProfit)) >= 1000 ? 0 : 2} label="Net profit" value={row.netProfit} />
+                  <SweepMetricCell label="Max drawdown" suffix="%" value={row.maxDrawdown} />
+                  <SweepMetricCell label="Profit factor" value={row.profitFactor} />
+                  <SweepMetricCell label="Win rate" suffix="%" value={row.winRate} />
+                  <SweepMetricCell label="RRR = average winning trade divided by absolute average losing trade" value={row.rrr} />
+                  <SweepMetricCell digits={0} label="Max consecutive winning trades" value={sweepMaxWins(row)} />
+                  <SweepMetricCell digits={0} label="Trades" value={row.totalTrades} />
+                  <SweepMetricCell digits={0} label="ATR length" value={row.params?.atrLength} />
+                  <SweepMetricCell label="ATR multiplier" value={row.params?.atrMultiplier} />
+                  <SweepMetricCell digits={0} label="Max same-side failures" value={row.params?.maxSameSideFailures} />
+                  <SweepMetricCell label="NWE multiplier" value={row.params?.envelopeMultiplier} />
+                  <SweepMetricCell label="Bandwidth" value={row.params?.bandwidth} />
+                  <td className="hubert-sweep-params" title={sweepParamDetails(row)}>{sweepSizingShortText(row)}</td>
+                  <td><button className="hubert-sweep-open" type="button" onClick={() => onOpenResult(row)}>Open</button></td>
+                </tr>
               );
             })}
           </tbody>
         </table>
       </div>
-      {results.length > 30 && (
-        <MiniStatus>Showing top 30 of {results.length} combinations. Narrow the range if you want a smaller comparison.</MiniStatus>
-      )}
     </div>
   );
 }
@@ -4465,6 +4912,845 @@ function CrisisPanel({
       </details>
     </section>
   );
+}
+
+function SztabGeneralnyPanel({
+  accountProfiles = [],
+  backendStatus,
+  battleDecks = [],
+  livestream,
+  mmDecks = [],
+  onAction,
+  onCancelAllOrders,
+  onEmergencyStop,
+  onForceSync,
+  onOpenAdvanced,
+  onPositionAction,
+  onPositionRefresh,
+  onRestartInterval,
+  onSaveConfig,
+  onStartInterval,
+  onStopAll,
+  onStopInterval,
+  onSyncInterval,
+  onUpdate,
+  positionActionState = {},
+  rawCandles = [],
+  selectedInterval,
+  strategyDecks = [],
+  system,
+  value,
+}) {
+  const [localMessage, setLocalMessage] = useState("");
+  const state = mergeSztabState(value);
+  const activeTab = state.activeTab ?? "general";
+  const botStatus = system?.state?.botStatus ?? "STOPPED";
+  const intervalRuntimes = backendStatus?.intervals ?? {};
+  const globalRunning = Object.values(intervalRuntimes).some((item) => item.runtime?.status === "running") ||
+    botStatus === "LIVE_RUNNING" ||
+    botStatus === "PAPER_RUNNING";
+  const intervalRunnerWired = true;
+  const summary = livestream?.accountSummary ?? {};
+  const positions = livestream?.positions ?? [];
+  const openOrders = livestream?.openOrders ?? [];
+  const profileOptions = accountProfiles.map((profile) => [profile.id, `${profile.label ?? profile.id} (${profile.status ?? "unknown"})`]);
+
+  function commit(nextState) {
+    onUpdate({
+      ...nextState,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  function setActiveTab(tab) {
+    commit({ ...state, activeTab: tab });
+  }
+
+  function setExpanded(expanded) {
+    commit({ ...state, expanded });
+  }
+
+  function patchInterval(interval, updater) {
+    const current = state.intervals[interval] ?? createDefaultSztabIntervalConfig(SZTAB_TIMEFRAMES.find((item) => item.interval === interval) ?? SZTAB_TIMEFRAMES[0]);
+    const next = typeof updater === "function" ? updater(current) : { ...current, ...updater };
+    commit({
+      ...state,
+      intervals: {
+        ...state.intervals,
+        [interval]: next,
+      },
+    });
+  }
+
+  function updateStrategy(interval, key, nextValue) {
+    patchInterval(interval, (current) => ({
+      ...current,
+      strategy: {
+        ...current.strategy,
+        [key]: nextValue,
+      },
+      strategyDirty: true,
+      validation: {
+        ...current.validation,
+        message: "Settings changed. Validate before applying.",
+        ok: false,
+      },
+    }));
+  }
+
+  function updateMm(interval, key, nextValue) {
+    patchInterval(interval, (current) => ({
+      ...current,
+      mm: {
+        ...current.mm,
+        [key]: nextValue,
+      },
+      mmDirty: true,
+      validation: {
+        ...current.validation,
+        message: "Risk settings changed. Validate before applying.",
+        ok: false,
+      },
+    }));
+  }
+
+  function updateProfile(interval, apiProfile) {
+    patchInterval(interval, (current) => ({
+      ...current,
+      apiProfile,
+      validation: {
+        ...current.validation,
+        message: "Profile mapping changed. Validate before applying.",
+        ok: false,
+      },
+    }));
+  }
+
+  async function validateInterval(interval) {
+    const config = state.intervals[interval];
+    await onSaveConfig(interval, {
+      apiProfile: config.apiProfile,
+      mm: config.mm,
+      strategy: config.strategy,
+      symbol: config.symbol ?? "SOLUSDT",
+    });
+    setLocalMessage(`Validation refreshed for ${intervalDisplayLabel(interval)}.`);
+  }
+
+  async function saveStrategy(interval) {
+    const config = state.intervals[interval];
+    await onSaveConfig(interval, {
+      apiProfile: config.apiProfile,
+      saveStrategy: true,
+      strategy: config.strategy,
+      symbol: config.symbol ?? "SOLUSDT",
+      strategyLocked: config.strategyLocked,
+    });
+    patchInterval(interval, (current) => ({ ...current, strategyDirty: false }));
+    setLocalMessage(`Strategy saved for ${intervalDisplayLabel(interval)}.`);
+  }
+
+  async function saveMm(interval) {
+    const config = state.intervals[interval];
+    await onSaveConfig(interval, {
+      apiProfile: config.apiProfile,
+      mm: config.mm,
+      mmLocked: config.mmLocked,
+      saveMm: true,
+    });
+    patchInterval(interval, (current) => ({ ...current, mmDirty: false }));
+    setLocalMessage(`MM saved for ${intervalDisplayLabel(interval)}.`);
+  }
+
+  async function applyInterval(interval) {
+    const config = state.intervals[interval];
+    if (config.strategyDirty || config.mmDirty) {
+      setLocalMessage("Save Strategy and Save MM before applying to the bot.");
+      return;
+    }
+    await onSaveConfig(interval, {
+      apiProfile: config.apiProfile,
+      locked: config.strategyLocked && config.mmLocked,
+      mmLocked: config.mmLocked,
+      strategyLocked: config.strategyLocked,
+      symbol: config.symbol ?? "SOLUSDT",
+    });
+    setLocalMessage("Saved Sztab config is applied to backend. Start uses these direct settings.");
+  }
+
+  function startInterval(interval) {
+    onStartInterval(interval);
+  }
+
+  function stopInterval(interval) {
+    onStopInterval(interval);
+  }
+
+  const warnings = sztabWarnings({
+    accountProfiles,
+    botStatus,
+    intervals: state.intervals,
+    positions,
+    summary,
+  });
+
+  return (
+    <section className="hubert-sztab" data-expanded={state.expanded ? "true" : "false"}>
+      <div className="hubert-sztab__header">
+        <div>
+          <strong>Sztab Generalny</strong>
+          <span>Main operational command center · {intervalRunnerWired ? "interval runner wired" : "backend interval runner not wired yet"}</span>
+        </div>
+        <div>
+          <button type="button" onClick={() => setExpanded(!state.expanded)}>
+            {state.expanded ? "Compact" : "Expand fullscreen"}
+          </button>
+          <button type="button" onClick={() => onOpenAdvanced("Strategy Decks")}>Open Decks / Advanced configuration</button>
+        </div>
+      </div>
+
+      <div className="hubert-sztab-tabs" role="tablist" aria-label="Sztab Generalny tabs">
+        <button data-active={activeTab === "general"} type="button" onClick={() => setActiveTab("general")}>Ogólne</button>
+        {SZTAB_TIMEFRAMES.map((timeframe) => (
+          <button
+            data-active={activeTab === timeframe.interval}
+            key={timeframe.interval}
+            type="button"
+            onClick={() => setActiveTab(timeframe.interval)}
+          >
+            {timeframe.label}
+          </button>
+        ))}
+      </div>
+
+      {localMessage && <MiniStatus>{localMessage}</MiniStatus>}
+
+      {activeTab === "general" ? (
+        <SztabGeneralOverview
+          accountProfiles={accountProfiles}
+          botStatus={botStatus}
+          intervals={state.intervals}
+          onCancelAllOrders={onCancelAllOrders}
+          onEmergencyStop={onEmergencyStop}
+          onForceSync={onForceSync}
+          onStopAll={onStopAll}
+          openOrders={openOrders}
+          positions={positions}
+          summary={summary}
+          warnings={warnings}
+        />
+      ) : (
+        <SztabIntervalPanel
+          accountProfiles={accountProfiles}
+          battleDecks={battleDecks}
+          config={state.intervals[activeTab]}
+          globalRunning={globalRunning}
+          interval={activeTab}
+          livestream={livestream}
+          mmDecks={mmDecks}
+          onAction={onAction}
+          onApply={() => applyInterval(activeTab)}
+          onForceSync={onForceSync}
+          onOpenAdvanced={onOpenAdvanced}
+          onPositionAction={onPositionAction}
+          onPositionRefresh={onPositionRefresh}
+          onSaveMm={() => saveMm(activeTab)}
+          onSaveStrategy={() => saveStrategy(activeTab)}
+          onStart={() => startInterval(activeTab)}
+          onStop={() => stopInterval(activeTab)}
+          onRestart={() => onRestartInterval(activeTab)}
+          onSyncInterval={onSyncInterval}
+          onToggleLock={async (locked) => {
+            patchInterval(activeTab, (current) => ({
+              ...current,
+              locked,
+              mmLocked: locked,
+              strategyLocked: locked,
+            }));
+            const config = state.intervals[activeTab];
+            await onSaveConfig(activeTab, {
+              apiProfile: config.apiProfile,
+              locked,
+              mmLocked: locked,
+              strategyLocked: locked,
+            });
+          }}
+          onUpdateMm={(key, nextValue) => updateMm(activeTab, key, nextValue)}
+          onUpdateProfile={(nextValue) => updateProfile(activeTab, nextValue)}
+          onUpdateStrategy={(key, nextValue) => updateStrategy(activeTab, key, nextValue)}
+          onValidate={() => validateInterval(activeTab)}
+          positionActionState={positionActionState}
+          profileOptions={profileOptions}
+          rawCandles={rawCandles}
+          selectedInterval={selectedInterval}
+          strategyDecks={strategyDecks}
+          summary={summary}
+          system={system}
+        />
+      )}
+    </section>
+  );
+}
+
+function SztabGeneralOverview({
+  accountProfiles = [],
+  botStatus,
+  intervals,
+  onCancelAllOrders,
+  onEmergencyStop,
+  onForceSync,
+  onStopAll,
+  openOrders = [],
+  positions = [],
+  summary = {},
+  warnings = [],
+}) {
+  const mappedIntervals = Object.values(intervals).filter((config) => config.apiProfile).length;
+  const totalBalance = hasKnownProfileBalance(accountProfiles)
+    ? totalProfileBalance(accountProfiles)
+    : Number(summary.totalCombinedFuturesBalance ?? 0);
+
+  function confirmCancelAll() {
+    if (!window.confirm("Cancel all visible BingX open orders for the synced profiles/symbols?")) return;
+    onCancelAllOrders();
+  }
+
+  function confirmCloseAll() {
+    const text = window.prompt("Type CLOSE ALL POSITIONS to emergency stop and request closing all backend-known live positions.");
+    if (text !== "CLOSE ALL POSITIONS") return;
+    onEmergencyStop(true);
+  }
+
+  return (
+    <div className="hubert-sztab-layout hubert-sztab-layout--general">
+      <section className="hubert-sztab-card">
+        <div className="hubert-lab__subhead">
+          <strong>Global overview</strong>
+          <span>{displayBotStatus(botStatus)}</span>
+        </div>
+        <div className="hubert-lab__metrics">
+          <Metric label="Bot global status" value={displayBotStatus(botStatus)} />
+          <Metric label="Active intervals" value={`${mappedIntervals}/${SZTAB_TIMEFRAMES.length} mapped`} />
+          <Metric label="Total futures balance" value={fmt(totalBalance)} />
+          <Metric label="Open positions" value={summary.totalOpenPositions ?? positions.length} />
+          <Metric label="Open orders" value={openOrders.length || accountProfiles.reduce((sum, profile) => sum + Number(profile.openOrders ?? 0), 0)} />
+          <Metric label="Live data age" value={summary.dataAgeSeconds !== null && summary.dataAgeSeconds !== undefined ? `${summary.dataAgeSeconds}s` : ageText(summary.lastBingxSyncAt)} />
+          <Metric label="Source" value={summary.source ?? "syncing"} />
+          <Metric label="Last sync" value={compactDateText(summary.lastBingxSyncAt)} />
+          <Metric label="Profiles" value={accountProfiles.length || "--"} />
+        </div>
+        <MiniStatus tone={dataFreshnessTone(summary.lastBingxSyncAt)}>
+          Source: {summary.source ?? "syncing"}. Last successful sync: {ageText(summary.lastBingxSyncAt)}.
+        </MiniStatus>
+      </section>
+
+      <section className="hubert-sztab-card">
+        <div className="hubert-lab__subhead">
+          <strong>Emergency controls</strong>
+          <span>global runner</span>
+        </div>
+        <div className="hubert-sztab-emergency">
+          <button type="button" onClick={onStopAll}>Stop all bots</button>
+          <button type="button" onClick={onForceSync}>Force sync all</button>
+          <button type="button" onClick={confirmCancelAll}>Cancel all orders</button>
+          <button className="hubert-danger-button" type="button" onClick={confirmCloseAll}>Close all positions</button>
+        </div>
+        <MiniStatus tone="neutral">
+          Stop all stops Sztab interval runners and the existing global runner. Close all positions still uses the existing emergency-stop path.
+        </MiniStatus>
+      </section>
+
+      <section className="hubert-sztab-card">
+        <div className="hubert-lab__subhead">
+          <strong>API profile mapping</strong>
+          <span>no secrets shown</span>
+        </div>
+        <div className="hubert-lab__table">
+          <table>
+            <thead>
+              <tr><th>Interval</th><th>Profile</th><th>Lock</th><th>Validated</th></tr>
+            </thead>
+            <tbody>
+              {SZTAB_TIMEFRAMES.map((timeframe) => {
+                const config = intervals[timeframe.interval];
+                const profile = accountProfiles.find((item) => item.id === config.apiProfile);
+                return (
+                  <tr key={timeframe.interval}>
+                    <td>{timeframe.label}</td>
+                    <td>{profile?.label || config.apiProfile || "Missing"}</td>
+                    <td>{config.locked ? "Locked" : "Editable"}</td>
+                    <td>{config.validation?.ok ? "OK" : "Needs check"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="hubert-sztab-card">
+        <div className="hubert-lab__subhead">
+          <strong>System warnings</strong>
+          <span>{warnings.length ? `${warnings.length} warning(s)` : "clear"}</span>
+        </div>
+        {warnings.length ? (
+          <div className="hubert-sztab-warnings">
+            {warnings.map((warning) => (
+              <MiniStatus key={warning} tone="bad">{warning}</MiniStatus>
+            ))}
+          </div>
+        ) : (
+          <MiniStatus tone="good">No current Sztab-level warnings from the visible backend state.</MiniStatus>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function SztabIntervalPanel({
+  accountProfiles = [],
+  battleDecks = [],
+  config,
+  globalRunning,
+  interval,
+  livestream,
+  mmDecks = [],
+  onAction,
+  onApply,
+  onForceSync,
+  onOpenAdvanced,
+  onPositionAction,
+  onPositionRefresh,
+  onSaveMm,
+  onSaveStrategy,
+  onStart,
+  onStop,
+  onRestart,
+  onSyncInterval,
+  onToggleLock,
+  onUpdateMm,
+  onUpdateProfile,
+  onUpdateStrategy,
+  onValidate,
+  positionActionState = {},
+  profileOptions = [],
+  rawCandles = [],
+  selectedInterval,
+  strategyDecks = [],
+  summary = {},
+  system,
+}) {
+  const runtime = config.runtime ?? {};
+  const isRunning = runtime.status === "running";
+  const locked = isRunning || config.locked || (config.strategyLocked && config.mmLocked);
+  const profile = accountProfiles.find((item) => item.id === config.apiProfile);
+  const positions = positionsForInterval(livestream?.positions ?? [], config, interval);
+  const orders = ordersForInterval(livestream?.openOrders ?? [], config);
+  const latestCandle = selectedInterval === interval ? rawCandles.at(-1) : null;
+  const logs = (system?.logs ?? []).filter((log) => {
+    const haystack = JSON.stringify(log).toLowerCase();
+    return haystack.includes(interval.toLowerCase()) || (config.apiProfile && haystack.includes(String(config.apiProfile).toLowerCase()));
+  }).slice(-20);
+  const validationTone = config.validation?.ok ? "good" : "neutral";
+  const validationMessage = validationText(config.validation);
+  const startReady = Boolean(config.apiProfile && config.strategySavedAt && config.mmSavedAt && config.strategyLocked && config.mmLocked && config.validation?.ok);
+  const strategySaveStatus = config.strategyDirty
+    ? "Unsaved changes"
+    : config.strategySavedAt
+      ? `Strategy saved ${compactDateText(config.strategySavedAt)}`
+      : "Strategy not saved";
+  const mmSaveStatus = config.mmDirty
+    ? "Unsaved changes"
+    : config.mmSavedAt
+      ? `MM saved ${compactDateText(config.mmSavedAt)}`
+      : "MM not saved";
+
+  function lockedStart() {
+    onStart();
+  }
+
+  return (
+    <div className="hubert-sztab-layout">
+      <section className="hubert-sztab-card hubert-sztab-card--span">
+        <div className="hubert-sztab-interval-head">
+          <div>
+          <strong>{intervalDisplayLabel(interval)} interval command</strong>
+          <span>
+              Status: {runtime.status ?? "stopped"} · Source: {summary.source ?? "syncing"} · {ageText(summary.lastBingxSyncAt)}
+          </span>
+          </div>
+          <div className="hubert-sztab-badges">
+            <em>{profile?.label ?? "Missing profile"}</em>
+            <em>{locked ? "🔒 Locked" : "🔓 Unlocked"}</em>
+            <em>{dataFreshnessTone(summary.lastBingxSyncAt) === "bad" ? "Stale data" : "Fresh enough"}</em>
+          </div>
+        </div>
+        <div className="hubert-lab__metrics">
+          <Metric label="Bot status" value={runtime.status ?? "stopped"} />
+          <Metric label="API profile" value={profile?.label || config.apiProfile || "Missing"} />
+          <Metric label="Exchange source" value="BingX futures" />
+          <Metric label="Live sync" value={ageText(summary.lastBingxSyncAt)} />
+          <Metric label="Lock state" value={locked ? "Locked" : "Unlocked"} />
+          <Metric label="Started" value={compactDateText(runtime.startedAt)} />
+          <Metric label="Last sync" value={compactDateText(runtime.lastSyncAt)} />
+          <Metric label="Last order attempt" value={runtime.lastOrderAttempt ? compactDateText(runtime.lastOrderAttempt.time) : "--"} />
+          <Metric label="Last error" value={runtime.error || "--"} />
+        </div>
+        <MiniStatus tone={validationTone}>
+          {validationMessage}
+        </MiniStatus>
+      </section>
+
+      <section className="hubert-sztab-card">
+        <div className="hubert-lab__subhead">
+          <strong>Strategy settings</strong>
+          <button type="button" onClick={() => onOpenAdvanced("Strategy Decks")}>Advanced Decks</button>
+        </div>
+        <MiniStatus tone={config.strategyDirty ? "bad" : config.strategySavedAt ? "good" : "neutral"}>
+          {strategySaveStatus}
+        </MiniStatus>
+        <div className="hubert-lab__grid">
+          <NumberField disabled={locked} label="ATR length" value={config.strategy.atrLength} onChange={(value) => onUpdateStrategy("atrLength", value)} />
+          <NumberField disabled={locked} label="ATR multiplier" step="0.1" value={config.strategy.atrMultiplier} onChange={(value) => onUpdateStrategy("atrMultiplier", value)} />
+          <NumberField disabled={locked} label="NWE / envelope multiplier" step="0.1" value={config.strategy.envelopeMultiplier} onChange={(value) => onUpdateStrategy("envelopeMultiplier", value)} />
+          <NumberField disabled={locked} label="Bandwidth" step="0.1" value={config.strategy.bandwidth} onChange={(value) => onUpdateStrategy("bandwidth", value)} />
+          <NumberField disabled={locked} label="Max same-side failures" value={config.strategy.maxSameSideFailures} onChange={(value) => onUpdateStrategy("maxSameSideFailures", value)} />
+          <label>
+            <span>Strategy source</span>
+            <select disabled={locked} value={config.strategy.strategySource ?? "pine-ha"} onChange={(event) => onUpdateStrategy("strategySource", event.target.value)}>
+              <option value="pine-ha">Pine HA</option>
+              <option value="raw">Raw candles</option>
+            </select>
+          </label>
+        </div>
+        <details className="hubert-advanced">
+          <summary>Optional deck import reference</summary>
+          <p>{strategyDecks.length ? `${strategyDecks.length} Strategy Deck(s) are available in Advanced mode.` : "No saved Strategy Decks are available yet."}</p>
+        </details>
+        <div className="hubert-lab__actions">
+          <button disabled={isRunning} type="button" onClick={onSaveStrategy}>Save Strategy</button>
+        </div>
+      </section>
+
+      <section className="hubert-sztab-card">
+        <div className="hubert-lab__subhead">
+          <strong>MM / risk settings</strong>
+          <button type="button" onClick={() => onOpenAdvanced("MM Decks")}>Advanced MM</button>
+        </div>
+        <MiniStatus tone={config.mmDirty ? "bad" : config.mmSavedAt ? "good" : "neutral"}>
+          {mmSaveStatus}
+        </MiniStatus>
+        <div className="hubert-lab__grid">
+          <NumberField
+            disabled={locked}
+            help="Position size is adjusted so that a stop-loss hit risks this % of account equity. This does not mean entering with the full account balance."
+            label="Risk per SL (% of account equity)"
+            step="0.1"
+            value={config.mm.riskPerSlPercent ?? config.mm.oneSlPercent ?? 1}
+            onChange={(value) => onUpdateMm("riskPerSlPercent", value)}
+          />
+          <ReadOnly label="Operational futures capital allocation" value="100% of this subaccount balance" />
+        </div>
+        <MiniStatus>
+          Fixed risk per SL only: position size is adjusted so that a stop-loss hit risks the selected % of account equity. This does not mean entering with the full account balance.
+        </MiniStatus>
+        <details className="hubert-advanced">
+          <summary>Optional MM deck reference</summary>
+          <p>{mmDecks.length ? `${mmDecks.length} MM Deck(s) are available in Advanced mode.` : "No saved MM Decks are available yet."}</p>
+        </details>
+        <div className="hubert-lab__actions">
+          <button disabled={isRunning} type="button" onClick={onSaveMm}>Save MM</button>
+        </div>
+      </section>
+
+      <section className="hubert-sztab-card">
+        <div className="hubert-lab__subhead">
+          <strong>Save / validate / apply</strong>
+          <span>{isRunning ? "Bot running: config edit locked" : "Stopped/editable"}</span>
+        </div>
+        <div className="hubert-lab__grid">
+          <label>
+            <span>Assigned API profile / subaccount</span>
+            <select disabled={isRunning} value={config.apiProfile ?? ""} onChange={(event) => onUpdateProfile(event.target.value)}>
+              <option value="">Choose API profile</option>
+              {profileOptions.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+            </select>
+          </label>
+          <ReadOnly label="Profile status" value={profile?.status ?? "missing"} />
+          <ReadOnly label="Balance" value={profileBalanceText(profile)} />
+          <ReadOnly label="Open orders" value={profile?.openOrders ?? "--"} />
+        </div>
+        <div className="hubert-lab__actions">
+          <button type="button" onClick={onValidate}>Validate settings</button>
+          <button type="button" onClick={onApply}>Apply to bot</button>
+          <button disabled={isRunning} type="button" onClick={() => onToggleLock(!(config.strategyLocked && config.mmLocked))}>
+            {config.strategyLocked && config.mmLocked ? "🔒 Locked" : "🔓 Unlocked"}
+          </button>
+        </div>
+        {!config.apiProfile && <MiniStatus tone="bad">Missing API profile mapping blocks Start bot.</MiniStatus>}
+        {!startReady && <MiniStatus tone="bad">Start requires Strategy saved, MM saved, validation OK, API profile selected, and 🔒 Locked state.</MiniStatus>}
+      </section>
+
+      <section className="hubert-sztab-card">
+        <div className="hubert-lab__subhead">
+          <strong>Bot controls</strong>
+          <span>backend Sztab interval runner</span>
+        </div>
+        <div className="hubert-sztab-controls">
+          <button disabled={!startReady || isRunning} type="button" onClick={lockedStart}>Start bot</button>
+          <button type="button" onClick={() => onStop(interval)}>Stop bot</button>
+          <button disabled={!startReady} type="button" onClick={onRestart}>Restart bot</button>
+          <button type="button" onClick={() => onSyncInterval(interval)}>Force sync</button>
+          <button type="button" onClick={() => onAction(`latest-signal-${interval}`, "Latest signal", async () => runtime.lastSignal ?? { message: "No latest signal in Sztab runtime." })}>View latest signal</button>
+          <button type="button" onClick={() => onAction(`latest-candle-${interval}`, "Latest candle", async () => runtime.lastCandle ?? latestCandle ?? { message: "No latest candle in Sztab runtime yet." })}>View latest candle</button>
+          <button type="button" onClick={() => onAction(`latest-decision-${interval}`, "Latest decision", async () => runtime.lastDecision || { message: "No latest decision reason in Sztab runtime yet." })}>View last decision reason</button>
+        </div>
+      </section>
+
+      <section className="hubert-sztab-card">
+        <div className="hubert-lab__subhead">
+          <strong>Live account / subaccount state</strong>
+          <span>{profile?.label ?? "No profile selected"}</span>
+        </div>
+        <div className="hubert-lab__metrics">
+          <Metric label="Balance" value={profileBalanceText(profile)} />
+          <Metric label="Available margin" value={profile?.availableMargin !== undefined ? fmt(profile.availableMargin) : "Unavailable"} />
+          <Metric label="Unrealized PnL" value={fmt(summary.totalUnrealizedPnl ?? 0)} />
+          <Metric label="Current positions" value={positions.length} />
+          <Metric label="Open orders" value={orders.length || profile?.openOrders || "--"} />
+          <Metric label="SL/TP state" value={positions.some((position) => Number(position.stopLoss) > 0) ? "protected" : positions.length ? "missing SL" : "no position"} />
+          <Metric label="Data age" value={summary.dataAgeSeconds !== null && summary.dataAgeSeconds !== undefined ? `${summary.dataAgeSeconds}s` : ageText(summary.lastBingxSyncAt)} />
+          <Metric label="Last sync" value={compactDateText(summary.lastBingxSyncAt)} />
+        </div>
+      </section>
+
+      <section className="hubert-sztab-card hubert-sztab-card--span">
+        <div className="hubert-lab__subhead">
+          <strong>Position management</strong>
+          <span>uses exact displayed positionId / positionSide / qty</span>
+        </div>
+        {positions.length ? (
+          <div className="hubert-live-stack">
+            {positions.map((position) => (
+              <SztabPositionCard
+                key={positionCardKey(position)}
+                onPositionAction={onPositionAction}
+                onPositionRefresh={onPositionRefresh}
+                position={position}
+                state={positionActionState[positionCardKey(position)]}
+              />
+            ))}
+          </div>
+        ) : (
+          <MiniStatus>No open BingX position is currently mapped to this interval/profile.</MiniStatus>
+        )}
+      </section>
+
+      <section className="hubert-sztab-card hubert-sztab-card--span">
+        <div className="hubert-lab__subhead">
+          <strong>Transaction / decision history</strong>
+          <span>latest interval/profile messages</span>
+        </div>
+        <div className="hubert-lab__table">
+          <table>
+            <thead><tr><th>Time</th><th>Reason/source</th><th>Context</th></tr></thead>
+            <tbody>
+              {logs.length ? logs.slice().reverse().map((log) => (
+                <tr key={log.id ?? `${log.time}-${log.message}`}>
+                  <td>{dateText(log.time)}</td>
+                  <td>{log.message}</td>
+                  <td>{log.context ? JSON.stringify(log.context).slice(0, 140) : "--"}</td>
+                </tr>
+              )) : (
+                <tr><td colSpan="3">No interval-specific decisions in backend logs yet.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function SztabPositionCard({ onPositionAction, onPositionRefresh, position, state }) {
+  const [controls, setControls] = useState({
+    stopPrice: position.stopLoss ? String(position.stopLoss) : "",
+    takeProfitPrice: position.takeProfit ? String(position.takeProfit) : "",
+  });
+  const busy = Boolean(state?.loading);
+  const attachedOrders = position.attachedOrders ?? [];
+  const hasProtection = attachedOrders.length > 0 || Number(position.stopLoss) > 0 || Number(position.takeProfit) > 0;
+  const slValue = controls.stopPrice ?? (position.stopLoss ? String(position.stopLoss) : "");
+  const tpValue = controls.takeProfitPrice ?? (position.takeProfit ? String(position.takeProfit) : "");
+
+  useEffect(() => {
+    setControls((current) => ({
+      stopPrice: current.stopPrice || (position.stopLoss ? String(position.stopLoss) : ""),
+      takeProfitPrice: current.takeProfitPrice || (position.takeProfit ? String(position.takeProfit) : ""),
+    }));
+  }, [position.stopLoss, position.takeProfit]);
+
+  return (
+    <div className="hubert-live-card">
+      <div className="hubert-live-card__head">
+        <strong>{position.symbol} {position.side}</strong>
+        <span>{position.apiProfileLabel ?? position.apiProfile} · {position.timeframe ?? "exchange"} · id {positionIdentifier(position) ?? "none"}</span>
+      </div>
+      {!Number(position.stopLoss) && <MiniStatus tone="bad">Warning: this position has no active SL reported by fresh sync.</MiniStatus>}
+      <div className="hubert-lab__metrics">
+        <Metric label="Entry" value={fmt(position.entryPrice)} />
+        <Metric label="Mark" value={fmt(position.currentPrice)} />
+        <Metric label="Quantity" value={fmt(position.quantity, 3)} />
+        <Metric label="Notional" value={fmt(position.notionalSize)} />
+        <Metric label="PnL" value={fmt(position.unrealizedPnl)} />
+        <Metric label="Position side" value={position.positionSide ?? position.side ?? "--"} />
+        <Metric label="SL" value={fmt(position.stopLoss)} />
+        <Metric label="TP" value={fmt(position.takeProfit)} />
+        <Metric label="Protection source" value={position.protectionSource ?? "none"} />
+      </div>
+      <div className="hubert-position-sources">
+        <span><strong>Active SL</strong>{fmt(position.stopLoss)} · {protectionSourceText(position, "SL")}</span>
+        <span><strong>Active TP</strong>{fmt(position.takeProfit)} · {protectionSourceText(position, "TP")}</span>
+      </div>
+      <OrderTable orders={attachedOrders} />
+      <div className="hubert-position-controls">
+        <label>
+          <span>SL</span>
+          <input
+            inputMode="decimal"
+            placeholder="Stop price"
+            type="number"
+            value={slValue}
+            onChange={(event) => setControls((current) => ({ ...current, stopPrice: event.target.value }))}
+          />
+        </label>
+        <button
+          disabled={busy || !Number.isFinite(Number(slValue)) || Number(slValue) <= 0}
+          type="button"
+          onClick={() => onPositionAction(position, "MOVE_SL", { direct: true, stopPrice: slValue })}
+        >
+          {busy && state?.action === "MOVE_SL" ? "Moving..." : "Move SL"}
+        </button>
+        <label>
+          <span>TP</span>
+          <input
+            inputMode="decimal"
+            placeholder="Take profit"
+            type="number"
+            value={tpValue}
+            onChange={(event) => setControls((current) => ({ ...current, takeProfitPrice: event.target.value }))}
+          />
+        </label>
+        <button
+          disabled={busy || !Number.isFinite(Number(tpValue)) || Number(tpValue) <= 0}
+          type="button"
+          onClick={() => onPositionAction(position, "MOVE_TP", { direct: true, takeProfitPrice: tpValue })}
+        >
+          {busy && state?.action === "MOVE_TP" ? "Moving..." : "Move TP"}
+        </button>
+        <button
+          disabled={busy}
+          type="button"
+          onClick={() => onPositionAction(position, "CLOSE_POSITION", {
+            confirm: true,
+            confirmMessage: `Close ${position.symbol} ${position.side} position ${positionIdentifier(position) ?? ""}?`,
+            direct: true,
+          })}
+        >
+          {busy && state?.action === "CLOSE_POSITION" ? "Closing..." : "Close Position"}
+        </button>
+        <button
+          disabled={busy || !hasProtection}
+          title={!hasProtection ? "No attached protection/orders reported for this position." : "Cancel protection/orders attached to this exact position."}
+          type="button"
+          onClick={() => onPositionAction(position, "CANCEL_ATTACHED_ORDERS", {
+            confirm: true,
+            confirmMessage: `Cancel attached protective/orders for ${position.symbol} ${position.side}?`,
+            direct: true,
+          })}
+        >
+          {busy && state?.action === "CANCEL_ATTACHED_ORDERS" ? "Cancelling..." : "Cancel Protection/Orders"}
+        </button>
+        <button disabled={busy} type="button" onClick={() => onPositionRefresh?.(position)}>
+          {busy && state?.action === "FORCE_SYNC" ? "Syncing..." : "Force Sync"}
+        </button>
+      </div>
+      {state?.message && (
+        <MiniStatus tone={state.ok === false ? "bad" : state.ok === true ? "good" : "neutral"}>
+          {state.message} {state.updatedAt ? `· ${compactDateText(state.updatedAt)}` : ""}
+        </MiniStatus>
+      )}
+      {state?.result && (
+        <details className="hubert-details">
+          <summary>Position diagnostics</summary>
+          <pre>{JSON.stringify({
+            action: state.action,
+            diagnostics: state.result?.diagnostics ?? state.diagnostics ?? null,
+            message: state.result?.message ?? state.message,
+            ok: state.result?.ok ?? state.ok,
+            result: state.result?.result ?? null,
+          }, null, 2)}</pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function intervalDisplayLabel(interval) {
+  return SZTAB_TIMEFRAMES.find((item) => item.interval === interval)?.label ?? interval;
+}
+
+function validationText(validation = {}) {
+  if (validation.errors?.length) return validation.errors.join(" ");
+  if (validation.ok) return `Validation OK${validation.checkedAt ? ` · ${compactDateText(validation.checkedAt)}` : ""}`;
+  return validation.message ?? "Not validated yet.";
+}
+
+function positionsForInterval(positions = [], config = {}, interval) {
+  return positions.filter((position) => {
+    const profileMatch = config.apiProfile ? position.apiProfile === config.apiProfile || position.sourceProfileId === config.apiProfile : true;
+    const timeframeMatch = position.timeframe ? position.timeframe === interval : true;
+    return profileMatch && timeframeMatch;
+  });
+}
+
+function ordersForInterval(orders = [], config = {}) {
+  return orders.filter((order) => {
+    if (!config.apiProfile) return true;
+    return order.apiProfile === config.apiProfile || order.__apiProfileId === config.apiProfile || order.sourceProfileId === config.apiProfile;
+  });
+}
+
+function sztabWarnings({ accountProfiles = [], botStatus, intervals = {}, positions = [], summary = {} }) {
+  const warnings = [];
+  const mappedProfileIds = new Set(accountProfiles.map((profile) => profile.id));
+  const missingMappings = SZTAB_TIMEFRAMES
+    .filter((timeframe) => {
+      const config = intervals[timeframe.interval];
+      return !config?.apiProfile || !mappedProfileIds.has(config.apiProfile);
+    })
+    .map((timeframe) => timeframe.label);
+
+  if (secondsSince(summary.lastBingxSyncAt) === null || secondsSince(summary.lastBingxSyncAt) > 120) {
+    warnings.push(`Live data is stale or unavailable. Last successful sync: ${ageText(summary.lastBingxSyncAt)}.`);
+  }
+  if (accountProfiles.some((profile) => !profile.configured || String(profile.status ?? "").includes("missing"))) {
+    warnings.push("At least one API profile is missing keys/configuration.");
+  }
+  if (accountProfiles.some((profile) => String(profile.status ?? "").includes("sync delayed"))) {
+    warnings.push("At least one API profile has delayed BingX sync.");
+  }
+  if (missingMappings.length > 0) {
+    warnings.push(`Missing/invalid API profile mapping: ${missingMappings.join(", ")}.`);
+  }
+  if (["LIVE_RUNNING", "PAPER_RUNNING"].includes(botStatus) && Object.values(intervals).some((config) => !config.locked)) {
+    warnings.push("A config is marked unlocked while the bot is running; fields are locked in Sztab until stop.");
+  }
+  if (positions.some((position) => !Number(position.stopLoss))) {
+    warnings.push("One or more open positions have no active SL reported by BingX sync.");
+  }
+
+  return warnings;
 }
 
 function AnalyticsPanel({ analytics }) {
