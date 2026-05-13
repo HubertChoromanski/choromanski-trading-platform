@@ -16,6 +16,7 @@ import { fetchCandles } from "./strategy/strategyRunner.js";
 import { createSztabRunner, SZTAB_INTERVALS } from "./sztab/sztabRunner.js";
 
 const PORT = Number(process.env.PORT || 8787);
+const HOST = process.env.HOST || "127.0.0.1";
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || "";
 const STARTED_AT = new Date().toISOString();
 
@@ -588,8 +589,60 @@ function publicStatusPayload() {
         ? Math.floor((Date.now() - Date.parse(state.runtime.startedAt)) / 1000)
         : null,
     },
+    production: productionStatusPayload(),
     trades: trades.slice(-120),
   };
+}
+
+function productionStatusPayload() {
+  const state = store.getState();
+  const sztabConfig = store.getSztabConfig();
+  const intervalRows = Object.values(sztabConfig.intervals ?? {});
+  const memory = process.memoryUsage();
+  const runningIntervals = intervalRows.filter((item) => item.runtime?.status === "running").length;
+  const staleIntervals = intervalRows.filter((item) => item.runtime?.status === "running" && secondsSinceIso(item.runtime?.heartbeatAt ?? item.runtime?.lastTickAt) > Number(process.env.SZTAB_RUNNER_STALE_SECONDS || 120)).length;
+
+  return {
+    backendBind: `${HOST}:${PORT}`,
+    dataDir: process.env.DATA_DIR || "backend/data",
+    deploymentMode: process.env.NODE_ENV === "production" ? "production" : "local/dev",
+    hostname: process.env.HOSTNAME ?? null,
+    memory: {
+      heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024),
+      rssMb: Math.round(memory.rss / 1024 / 1024),
+    },
+    pm2: {
+      id: process.env.pm_id ?? null,
+      instance: process.env.NODE_APP_INSTANCE ?? null,
+      name: process.env.pm_name ?? process.env.name ?? null,
+      restartCount: process.env.restart_time ?? null,
+      watch: process.env.PM2_WATCH ?? process.env.watch ?? "unknown",
+    },
+    processManager: process.env.pm_id !== undefined ? "pm2" : "node",
+    restartRecovery: {
+      maxConsecutiveRunnerErrors: Number(process.env.SZTAB_MAX_CONSECUTIVE_ERRORS || 5),
+      sztabAutoResumeOnStart: process.env.SZTAB_AUTO_RESUME_ON_START === "true",
+      staleThresholdSeconds: Number(process.env.SZTAB_RUNNER_STALE_SECONDS || 120),
+    },
+    startedAt: STARTED_AT,
+    sztab: {
+      configuredIntervals: intervalRows.filter((item) => item.apiProfile).length,
+      runningIntervals,
+      staleIntervals,
+      totalIntervals: intervalRows.length,
+    },
+    uptimeSeconds: Math.floor(process.uptime()),
+    vpsMode: process.env.NODE_ENV === "production" || process.env.pm_id !== undefined,
+    websocketStatus: "browser-chart-websocket-only",
+    lastBackendError: state.lastError ?? "",
+  };
+}
+
+function secondsSinceIso(value) {
+  if (!value) return Number.POSITIVE_INFINITY;
+  const timestamp = typeof value === "number" ? value * 1000 : new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return Number.POSITIVE_INFINITY;
+  return Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
 }
 
 function firstFiniteNumber(...values) {
@@ -2003,7 +2056,7 @@ const server = http.createServer(async (request, response) => {
       : url.pathname === "/api" ? "/" : url.pathname;
 
     if (request.method === "GET" && pathname === "/health") {
-      sendJson(response, 200, { ok: true, service: "choromanski-trading-backend" });
+      sendJson(response, 200, { ok: true, service: "choromanski-trading-backend", production: productionStatusPayload() });
       return;
     }
 
@@ -2021,6 +2074,15 @@ const server = http.createServer(async (request, response) => {
         communication: safePublicCommunication(store.getCollection("communication")),
         dataAvailability: await dataAvailability(),
         equity: store.getEquity().slice(-200),
+      });
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/production/status") {
+      sendJson(response, 200, {
+        ok: true,
+        production: productionStatusPayload(),
+        sztab: await sztabRunner.getStatus(),
       });
       return;
     }
@@ -2135,6 +2197,19 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "POST" && pathname === "/sztab/stop-all") {
       if (!requireDashboardToken(request, response)) return;
       sendJson(response, 200, await sztabRunner.stopAll());
+      return;
+    }
+
+    if (request.method === "POST" && pathname === "/sztab/recover-interrupted") {
+      if (!requireDashboardToken(request, response)) return;
+      const body = await readBody(request);
+      sendJson(response, 200, await sztabRunner.recoverInterrupted(body));
+      return;
+    }
+
+    if (request.method === "POST" && pathname === "/sztab/cancel-pending-triggers") {
+      if (!requireDashboardToken(request, response)) return;
+      sendJson(response, 200, await sztabRunner.cancelPendingTriggers("operator_cancel_all_pending_triggers"));
       return;
     }
 
@@ -2752,10 +2827,11 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
   logRuntimeEvent("startup", {
+    host: HOST,
     maxMemoryRestart: process.env.max_memory_restart ?? process.env.PM2_MAX_MEMORY_RESTART ?? "configured-by-pm2",
     port: PORT,
   });
-  console.log(`Choromański Trading Platform backend listening on http://127.0.0.1:${PORT}`);
+  console.log(`Choromański Trading Platform backend listening on http://${HOST}:${PORT}`);
 });

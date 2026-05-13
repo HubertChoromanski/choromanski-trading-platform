@@ -25,6 +25,17 @@ const BACKEND_URL = normalizeBackendUrl(
   import.meta.env.VITE_BACKEND_URL ?? (import.meta.env.PROD ? "/api" : "http://127.0.0.1:8787"),
 );
 const DASHBOARD_TOKEN = import.meta.env.VITE_DASHBOARD_TOKEN ?? "";
+const DISPLAY_TIME_ZONE = import.meta.env.VITE_DISPLAY_TIME_ZONE || "Europe/Warsaw";
+const DISPLAY_LOCALE = import.meta.env.VITE_DISPLAY_LOCALE || "pl-PL";
+const DATE_TIME_FORMATTER = new Intl.DateTimeFormat(DISPLAY_LOCALE, {
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  month: "2-digit",
+  second: "2-digit",
+  timeZone: DISPLAY_TIME_ZONE,
+  year: "numeric",
+});
 const TIMEFRAMES = [
   { label: "10m", interval: "10m", minutes: 10 },
   { label: "15m", interval: "15m", minutes: 15 },
@@ -492,8 +503,11 @@ function normalizeBacktestForm(form) {
 
 function dateText(time) {
   if (!time) return "--";
-  const value = typeof time === "number" ? time * 1000 : time;
-  return new Date(value).toLocaleString();
+  const value = typeof time === "number"
+    ? time > 10_000_000_000 ? time : time * 1000
+    : time;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? DATE_TIME_FORMATTER.format(date) : "--";
 }
 
 function compactDateText(time) {
@@ -2942,6 +2956,12 @@ export default function ControlCenter({
               return { ok: true, message: `Cancel requests sent for ${targets.length} visible symbol/profile pair(s).` };
             })
           }
+          onCancelPendingTriggers={() => runAction("sztab-cancel-pending-triggers", "Cancel Sztab pending trigger orders", async () => {
+            await apiFetch("/sztab/cancel-pending-triggers", { method: "POST" });
+            await refreshSztabStatus();
+            await refreshLiveStatus({ fresh: true });
+            return { ok: true, message: "Sztab pending trigger cancel requested for all intervals." };
+          })}
           onForceSync={() => runAction("sztab-force-sync", "Force sync all", async () => {
             await apiFetch("/sztab/sync-all", { method: "POST" });
             await refreshLiveStatus({ fresh: true });
@@ -3332,6 +3352,7 @@ function SystemPanel({
 }) {
   const status = system?.state ?? {};
   const bingx = status.bingx ?? {};
+  const production = system?.production ?? {};
   const hasSystemBalance = bingx.activeExecutionBalance !== null &&
     bingx.activeExecutionBalance !== undefined &&
     Number.isFinite(Number(bingx.activeExecutionBalance));
@@ -3387,6 +3408,17 @@ function SystemPanel({
         <Metric label="Futures USDT" value={hasKnownProfileBalance(accountProfiles) || hasSystemBalance ? fmt(futuresBalance) : "Syncing"} />
         <Metric label="BingX sync" value={compactDateText(bingx.lastSyncAt)} />
         <Metric label="Backend uptime" value={system?.summary?.uptimeSeconds ? `${Math.floor(system.summary.uptimeSeconds / 60)} min` : "Unavailable"} />
+        <Metric label="Runtime mode" value={production.deploymentMode ?? "unknown"} />
+        <Metric label="VPS/local mode" value={production.vpsMode ? "VPS/production-style" : "local/dev"} />
+        <Metric label="Process manager" value={production.processManager ?? "unknown"} />
+        <Metric label="Backend bind" value={production.backendBind ?? "--"} />
+        <Metric label="PM2 restart count" value={production.pm2?.restartCount ?? "--"} />
+        <Metric label="Memory RSS" value={production.memory?.rssMb !== undefined ? `${production.memory.rssMb} MB` : "--"} />
+        <Metric label="Sztab runners" value={production.sztab ? `${production.sztab.runningIntervals}/${production.sztab.totalIntervals}` : "--"} />
+        <Metric label="Stale runners" value={production.sztab?.staleIntervals ?? "--"} />
+        <Metric label="Websocket" value={production.websocketStatus ?? "unknown"} />
+        <Metric label="Auto recovery" value={production.restartRecovery?.sztabAutoResumeOnStart ? "enabled" : "disabled"} />
+        <Metric label="Display time" value={DISPLAY_TIME_ZONE} />
         <Metric label="Open orders" value={system?.summary?.openOrdersCount ?? 0} />
         <Metric label="Active Battle Deck" value={system?.summary?.activeBattleDeck?.name ?? "None"} />
         <Metric label="Chart candles" value={`${rawCandles.length} / ${fullHistoryDataset?.length ?? chartDiagnostics?.fullCandles ?? 0}`} />
@@ -5001,6 +5033,7 @@ function SztabGeneralnyPanel({
   mmDecks = [],
   onAction,
   onCancelAllOrders,
+  onCancelPendingTriggers,
   onEmergencyStop,
   onForceSync,
   onOpenAdvanced,
@@ -5220,6 +5253,7 @@ function SztabGeneralnyPanel({
           botStatus={botStatus}
           intervals={state.intervals}
           onCancelAllOrders={onCancelAllOrders}
+          onCancelPendingTriggers={onCancelPendingTriggers}
           onEmergencyStop={onEmergencyStop}
           onForceSync={onForceSync}
           onStopAll={onStopAll}
@@ -5317,6 +5351,7 @@ function SztabGeneralOverview({
   botStatus,
   intervals,
   onCancelAllOrders,
+  onCancelPendingTriggers,
   onEmergencyStop,
   onForceSync,
   onStopAll,
@@ -5357,6 +5392,7 @@ function SztabGeneralOverview({
           <Metric label="Live data age" value={summary.dataAgeSeconds !== null && summary.dataAgeSeconds !== undefined ? `${summary.dataAgeSeconds}s` : ageText(summary.lastBingxSyncAt)} />
           <Metric label="Source" value={summary.source ?? "syncing"} />
           <Metric label="Last sync" value={compactDateText(summary.lastBingxSyncAt)} />
+          <Metric label="Time" value={DISPLAY_TIME_ZONE} />
           <Metric label="Profiles" value={accountProfiles.length || "--"} />
         </div>
         <MiniStatus tone={dataFreshnessTone(summary.lastBingxSyncAt)}>
@@ -5372,6 +5408,7 @@ function SztabGeneralOverview({
         <div className="hubert-sztab-emergency">
           <button type="button" onClick={onStopAll}>Stop all bots</button>
           <button type="button" onClick={onForceSync}>Force sync all</button>
+          <button type="button" onClick={onCancelPendingTriggers}>Cancel Sztab triggers</button>
           <button type="button" onClick={confirmCancelAll}>Cancel all orders</button>
           <button className="hubert-danger-button" type="button" onClick={confirmCloseAll}>Close all positions</button>
         </div>
@@ -5658,6 +5695,8 @@ function SztabIntervalPanel({
         <div className="hubert-lab__metrics">
           <Metric label="Tick count" value={runtime.tickCount ?? 0} />
           <Metric label="Last loop" value={compactDateText(runtime.lastTickAt)} />
+          <Metric label="Heartbeat age" value={runtime.heartbeatAgeSeconds !== null && runtime.heartbeatAgeSeconds !== undefined ? `${runtime.heartbeatAgeSeconds}s` : "--"} />
+          <Metric label="Watchdog" value={runtime.watchdogStatus ?? (runtime.runnerStale ? "stale" : "--")} />
           <Metric label="Loop duration" value={runtime.lastLoopDurationMs !== null && runtime.lastLoopDurationMs !== undefined ? `${runtime.lastLoopDurationMs}ms` : "--"} />
           <Metric label="Candles requested" value={runtime.candlesRequested ?? "--"} />
           <Metric label="Candles loaded" value={runtime.candlesLoaded ?? "--"} />

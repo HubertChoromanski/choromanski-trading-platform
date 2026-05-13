@@ -23,6 +23,25 @@ import {
 } from "../utils/persistence";
 import "../styles/chart.css";
 
+const DISPLAY_TIME_ZONE = import.meta.env.VITE_DISPLAY_TIME_ZONE || "Europe/Warsaw";
+const DISPLAY_LOCALE = import.meta.env.VITE_DISPLAY_LOCALE || "pl-PL";
+const FULL_TIME_FORMATTER = new Intl.DateTimeFormat(DISPLAY_LOCALE, {
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  month: "2-digit",
+  second: "2-digit",
+  timeZone: DISPLAY_TIME_ZONE,
+  year: "numeric",
+});
+const AXIS_TIME_FORMATTER = new Intl.DateTimeFormat(DISPLAY_LOCALE, {
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  month: "2-digit",
+  timeZone: DISPLAY_TIME_ZONE,
+});
+
 const timeframes = [
   { label: "10m", interval: "10m" },
   { label: "15m", interval: "15m" },
@@ -138,7 +157,31 @@ function formatExitReason(reason) {
 function formatChartTime(value) {
   if (!value) return "--";
 
-  return new Date(Number(value) * 1000).toLocaleString();
+  const date = dateFromChartTime(value);
+  return date ? FULL_TIME_FORMATTER.format(date) : "--";
+}
+
+function formatChartAxisTime(value) {
+  const date = dateFromChartTime(value);
+  return date ? AXIS_TIME_FORMATTER.format(date) : "";
+}
+
+function dateFromChartTime(value) {
+  if (typeof value === "object" && value !== null && "year" in value) {
+    return new Date(Date.UTC(Number(value.year), Number(value.month) - 1, Number(value.day)));
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  const milliseconds = numeric > 10_000_000_000 ? numeric : numeric * 1000;
+  const date = new Date(milliseconds);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+function localDateInputToSeconds(value) {
+  const match = String(value ?? "").match(/^(\d{4})-(\d{2})-(\d{2})$/u);
+  if (!match) return NaN;
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12, 0, 0);
+  return Math.floor(date.getTime() / 1000);
 }
 
 function chartTimeValue(value) {
@@ -992,14 +1035,12 @@ export default function TradingViewChart() {
   async function jumpToHistoricalDate() {
     const jumpRequestId = jumpRequestIdRef.current + 1;
     jumpRequestIdRef.current = jumpRequestId;
-    const targetMs = new Date(jumpDate).getTime();
+    const targetSeconds = localDateInputToSeconds(jumpDate);
 
-    if (!Number.isFinite(targetMs)) {
+    if (!Number.isFinite(targetSeconds)) {
       setError("Choose a valid jump date.");
       return;
     }
-
-    const targetSeconds = Math.floor(targetMs / 1000);
 
     if (activeBacktestSession?.backtestCandles?.length) {
       viewBacktestTradeOnChart({ entryTime: targetSeconds, id: `jump-${targetSeconds}` });
@@ -1465,6 +1506,7 @@ export default function TradingViewChart() {
       },
       localization: {
         priceFormatter: (price) => price.toFixed(2),
+        timeFormatter: formatChartTime,
       },
       rightPriceScale: {
         visible: true,
@@ -1488,6 +1530,7 @@ export default function TradingViewChart() {
         timeVisible: true,
         secondsVisible: false,
         shiftVisibleRangeOnNewBar: false,
+        tickMarkFormatter: formatChartAxisTime,
       },
       crosshair: {
         mode: CrosshairMode.Normal,
@@ -1890,7 +1933,7 @@ export default function TradingViewChart() {
 
       <div className="hubert-save-status">
         <strong>{saveStatus.state}</strong>
-        <span>{saveStatus.lastSavedAt ? `Last saved at ${new Date(saveStatus.lastSavedAt).toLocaleString()}` : "Autosave ready"}</span>
+        <span>{saveStatus.lastSavedAt ? `Last saved at ${formatChartTime(Math.floor(new Date(saveStatus.lastSavedAt).getTime() / 1000))}` : "Autosave ready"}</span>
       </div>
 
       {settingsPanel && (
@@ -1955,6 +1998,7 @@ export default function TradingViewChart() {
         <span>{chartRenderStats.markers} markers · {chartRenderStats.slTpLines} lines · {chartRenderStats.durationMs}ms render</span>
         <span title={chartRenderStats.markerNote}>{chartRenderStats.markerSource}</span>
         <span>{selectedHistoricalWindow.mode === "historical" ? "Viewing historical window" : "Live/latest window"}</span>
+        <span>Time: {DISPLAY_TIME_ZONE}</span>
         <div>
           <input
             aria-label="Jump to date"
@@ -1973,6 +2017,7 @@ export default function TradingViewChart() {
           return (
             <>
               <strong>{selectedInterval.toUpperCase()} live trigger</strong>
+              <span>Time: {DISPLAY_TIME_ZONE}</span>
               <span>State: {runtime?.triggerOrderState ?? pending?.status ?? "none"}</span>
               <span>Setup: {pending?.setupId ?? runtime?.latestSetupEvent?.setupId ?? "--"} · {pending?.direction ?? runtime?.latestSetupEvent?.direction ?? "--"}</span>
               <span>Trigger: {formatChartPrice(pending?.triggerPrice ?? runtime?.latestSetupEvent?.trigger)}</span>

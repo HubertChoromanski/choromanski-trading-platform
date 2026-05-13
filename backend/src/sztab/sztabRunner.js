@@ -102,6 +102,7 @@ function defaultIntervalConfig(interval) {
       candlesLoaded: 0,
       candlesRequested: 0,
       closedCandlesUsed: 0,
+      consecutiveErrors: 0,
       crisisModeOn: false,
       crisisManualLock: false,
       dataAgeSeconds: null,
@@ -110,6 +111,7 @@ function defaultIntervalConfig(interval) {
       globalBlockers: [],
       globalExecutionState: "enabled",
       heartbeatAt: null,
+      heartbeatAgeSeconds: null,
       intervalBlockers: [],
       lastCandle: null,
       lastClosedCandleTime: null,
@@ -139,11 +141,13 @@ function defaultIntervalConfig(interval) {
       lastSignal: null,
       lastSyncAt: null,
       profileConnected: false,
+      runnerStale: false,
       startedAt: null,
       status: "stopped",
       stoppedAt: null,
       tickCount: 0,
       tradingEnabled: true,
+      watchdogStatus: "idle",
       tradingBlockedForAI: false,
       legacySafetyAgeSeconds: null,
       legacySafetyStale: false,
@@ -329,13 +333,23 @@ function statusFromConfig(config) {
   return Object.fromEntries(
     SZTAB_INTERVALS.map((interval) => {
       const current = config.intervals[interval];
+      const heartbeatAgeSeconds = secondsSinceIso(current.runtime?.heartbeatAt ?? current.runtime?.lastTickAt);
+      const staleThreshold = Number(process.env.SZTAB_RUNNER_STALE_SECONDS || 120);
+      const runnerStale = current.runtime?.status === "running" && heartbeatAgeSeconds !== null && heartbeatAgeSeconds > staleThreshold;
       return [
         interval,
         {
           apiProfile: current.apiProfile,
           interval,
           mmSavedAt: current.mmSavedAt,
-          runtime: current.runtime,
+          runtime: {
+            ...current.runtime,
+            heartbeatAgeSeconds,
+            runnerStale,
+            watchdogStatus: current.runtime?.status === "running"
+              ? runnerStale ? "stale" : "healthy"
+              : current.runtime?.status ?? "idle",
+          },
           strategySavedAt: current.strategySavedAt,
           symbol: current.symbol,
           validation: current.validation,
@@ -433,25 +447,41 @@ export function createSztabRunner({
 
   async function initialize() {
     const config = normalizeConfig(store.getSztabConfig());
+    const autoResume = process.env.SZTAB_AUTO_RESUME_ON_START === "true";
+    const intervalsToResume = [];
     let changed = false;
 
     for (const interval of SZTAB_INTERVALS) {
       const runtime = config.intervals[interval].runtime;
       if (runtime.status === "running" || runtime.status === "starting") {
-        runtime.status = "interrupted";
-        runtime.error = "Backend restarted while this interval runner was active.";
-        runtime.globalBlockers = [];
-        runtime.globalExecutionState = "enabled";
-        runtime.intervalBlockers = [{
-          reason: "Backend restarted while this interval runner was active",
-          source: "stale_runtime_lock",
-          type: "stale_runtime_lock",
-        }];
-        runtime.lastBlockedReason = "";
-        runtime.lastDecisionReason = "runtime_interrupted";
-        runtime.stoppedAt = nowIso();
-        runtime.tradingBlockedForAI = false;
-        runtime.tradingEnabled = false;
+        if (autoResume) {
+          runtime.status = "recovering";
+          runtime.error = "";
+          runtime.globalBlockers = [];
+          runtime.globalExecutionState = "enabled";
+          runtime.intervalBlockers = [];
+          runtime.lastBlockedReason = "";
+          runtime.lastDecision = "Backend restarted; auto-resume is enabled and Sztab will attempt safe recovery.";
+          runtime.lastDecisionReason = "startup_auto_recovery_pending";
+          runtime.tradingBlockedForAI = false;
+          runtime.tradingEnabled = true;
+          intervalsToResume.push(interval);
+        } else {
+          runtime.status = "interrupted";
+          runtime.error = "Backend restarted while this interval runner was active.";
+          runtime.globalBlockers = [];
+          runtime.globalExecutionState = "enabled";
+          runtime.intervalBlockers = [{
+            reason: "Backend restarted while this interval runner was active",
+            source: "stale_runtime_lock",
+            type: "stale_runtime_lock",
+          }];
+          runtime.lastBlockedReason = "";
+          runtime.lastDecisionReason = "runtime_interrupted";
+          runtime.stoppedAt = nowIso();
+          runtime.tradingBlockedForAI = false;
+          runtime.tradingEnabled = false;
+        }
         changed = true;
       } else if (runtime.status !== "running") {
         runtime.globalBlockers = [];
@@ -474,6 +504,48 @@ export function createSztabRunner({
 
     if (changed) {
       await store.setSztabConfig(config);
+    }
+
+    if (intervalsToResume.length) {
+      for (const interval of intervalsToResume) {
+        try {
+          const result = await start(interval, {
+            confirmExistingExposure: true,
+            confirmOpenOrders: true,
+            recoveredAfterRestart: true,
+          });
+          if (!result?.ok) {
+            await persistRuntime(interval, {
+              error: result?.message ?? "Auto-resume did not pass startup validation.",
+              intervalBlockers: [{
+                reason: result?.message ?? "Auto-resume did not pass startup validation",
+                source: "startup_auto_recovery",
+                type: "startup_auto_recovery_blocked",
+              }],
+              lastDecision: "Auto-resume after backend startup was blocked. Manual restart required.",
+              lastDecisionReason: "startup_auto_recovery_blocked",
+              status: "interrupted",
+              tradingEnabled: false,
+            });
+          }
+          await appendLog("Sztab interval auto-resume attempted after backend startup", { interval, result });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          await persistRuntime(interval, {
+            error: message,
+            intervalBlockers: [{
+              reason: "Auto-resume after backend startup failed",
+              source: "startup_auto_recovery",
+              type: "startup_auto_recovery_failed",
+            }],
+            lastDecision: "Auto-resume after backend startup failed. Manual restart required.",
+            lastDecisionReason: "startup_auto_recovery_failed",
+            status: "interrupted",
+            tradingEnabled: false,
+          });
+          await appendLog("Sztab interval auto-resume failed after backend startup", { error: message, interval });
+        }
+      }
     }
 
     const profiles = store.getProfiles();
@@ -624,6 +696,7 @@ export function createSztabRunner({
       if (exchangePositions.length > 0 && !profile.live?.openPosition && !profile.live?.pendingTriggerOrder) {
         await persistRuntime(interval, {
           ...executionDiagnostics,
+          consecutiveErrors: 0,
           intervalBlockers: [],
           lastBlockedReason: "Exchange position exists; Sztab skipped new entry to avoid duplicate exposure.",
           lastDecision: "Exchange position exists; Sztab skipped new entry to avoid duplicate exposure.",
@@ -651,6 +724,7 @@ export function createSztabRunner({
           candlesLoaded: strategyResult.rawCandles.length,
           candlesRequested,
           closedCandlesUsed: strategyResult.sourceCandles.length,
+          consecutiveErrors: 0,
           error: "",
           intervalBlockers: [],
           lastBlockedReason: blockedReason,
@@ -723,6 +797,7 @@ export function createSztabRunner({
         candlesLoaded: strategyResult.rawCandles.length,
         candlesRequested,
         closedCandlesUsed: strategyResult.sourceCandles.length,
+        consecutiveErrors: 0,
         dataAgeSeconds: accountDataAgeSeconds({ lastRefreshAt: profileSyncAt ?? nowIso() }),
         error: "",
         intervalBlockers: [],
@@ -783,22 +858,33 @@ export function createSztabRunner({
       return updatedProfile;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const consecutiveErrors = Number(current.runtime?.consecutiveErrors ?? 0) + 1;
+      const maxConsecutiveErrors = Number(process.env.SZTAB_MAX_CONSECUTIVE_ERRORS || 5);
+      const terminalError = consecutiveErrors >= maxConsecutiveErrors;
       await persistRuntime(interval, {
+        consecutiveErrors,
         intervalBlockers: [{
-          reason: "Sztab interval runner failed",
-          source: "runner_error",
-          type: "runner_error",
+          reason: terminalError
+            ? "Sztab interval runner failed repeatedly"
+            : "Sztab interval runner tick failed; retry is scheduled",
+          source: terminalError ? "runner_error" : "runner_retry",
+          type: terminalError ? "runner_error" : "runner_retry",
         }],
         lastError: message,
         lastLoopDurationMs: Date.now() - loopStartedAt,
         error: message,
-        lastDecision: "Sztab interval runner failed.",
-        lastDecisionReason: "runner_error",
-        status: "error",
+        lastDecision: terminalError
+          ? "Sztab interval runner failed repeatedly and was stopped."
+          : `Sztab interval tick failed (${consecutiveErrors}/${maxConsecutiveErrors}); retrying next cycle.`,
+        lastDecisionReason: terminalError ? "runner_error" : "runner_retry",
+        status: terminalError ? "error" : "running",
       });
-      clearTimer(interval);
-      await appendLog("Sztab interval runner error", { error: message, interval });
-      throw error;
+      await appendLog("Sztab interval runner error", { consecutiveErrors, error: message, interval, terminalError });
+      if (terminalError) {
+        clearTimer(interval);
+        throw error;
+      }
+      return null;
     }
   }
 
@@ -1104,6 +1190,33 @@ export function createSztabRunner({
     return { ok: true, results, status: await getStatus() };
   }
 
+  async function recoverInterrupted(body = {}) {
+    const config = normalizeConfig(store.getSztabConfig());
+    const results = {};
+
+    for (const interval of SZTAB_INTERVALS) {
+      const runtime = config.intervals[interval]?.runtime ?? {};
+      if (!["interrupted", "stalled", "recovering"].includes(String(runtime.status ?? "").toLowerCase())) {
+        continue;
+      }
+      results[interval] = await start(interval, {
+        confirmExistingExposure: body.confirmExistingExposure === true,
+        confirmOpenOrders: body.confirmOpenOrders === true,
+        recoveredAfterRestart: true,
+      });
+    }
+
+    return { ok: true, results, status: await getStatus() };
+  }
+
+  async function cancelPendingTriggers(reason = "operator_cancel_all_pending_triggers") {
+    const results = {};
+    for (const interval of SZTAB_INTERVALS) {
+      results[interval] = await cancelPendingTriggerForInterval(interval, reason);
+    }
+    return { ok: true, results, status: await getStatus() };
+  }
+
   async function getStatus() {
     const config = normalizeConfig(store.getSztabConfig());
     return {
@@ -1218,6 +1331,8 @@ export function createSztabRunner({
     getStatus,
     initialize,
     restart,
+    recoverInterrupted,
+    cancelPendingTriggers,
     start,
     stop,
     stopAll,
