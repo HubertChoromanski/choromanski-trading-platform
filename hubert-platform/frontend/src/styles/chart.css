@@ -1900,32 +1900,231 @@ button {
   pointer-events: auto;
 }
 
-.hubert-live-trigger-panel {
+.hubert-operational-panel {
   position: fixed;
   left: 18px;
-  top: 152px;
+  top: 118px;
   z-index: 15;
   display: grid;
-  gap: 4px;
-  min-width: 240px;
-  max-width: 320px;
-  padding: 10px 12px;
-  border: 1px solid rgba(245, 245, 245, 0.18);
-  background: rgba(8, 10, 12, 0.82);
+  gap: 9px;
+  width: min(430px, calc(100vw - 36px));
+  max-height: calc(100vh - 162px);
+  overflow: auto;
+  padding: 11px;
+  box-sizing: border-box;
+  border: 1px solid rgba(245, 245, 245, 0.16);
+  border-radius: 8px;
+  background: rgba(8, 10, 12, 0.9);
   color: rgba(245, 245, 245, 0.88);
   font-size: 11px;
   line-height: 1.35;
   backdrop-filter: blur(14px);
+  box-shadow: 0 20px 54px rgba(0, 0, 0, 0.22);
 }
 
-.hubert-live-trigger-panel strong {
+.hubert-operational-panel[data-dock="right"] {
+  right: 18px;
+  left: auto;
+}
+
+.hubert-operational-panel[data-compact="true"] {
+  width: min(320px, calc(100vw - 36px));
+}
+
+.hubert-operational-panel__head,
+.hubert-operational-card,
+.hubert-operational-section {
+  display: grid;
+  gap: 7px;
+}
+
+.hubert-operational-panel__head {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+}
+
+.hubert-operational-panel__head > div:first-child {
+  display: grid;
+  gap: 2px;
+}
+
+.hubert-operational-panel__head > div:last-child {
+  display: flex;
+  gap: 5px;
+}
+
+.hubert-operational-panel button {
+  min-height: 26px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(245, 245, 245, 0.88);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.hubert-operational-panel strong {
   color: #f5f5f5;
   font-size: 12px;
   letter-spacing: 0;
 }
 
-.hubert-live-trigger-panel span {
+.hubert-operational-panel span,
+.hubert-operational-panel p {
+  margin: 0;
   overflow-wrap: anywhere;
+}
+
+.hubert-operational-intervals {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.hubert-operational-intervals button {
+  display: grid;
+  gap: 3px;
+  min-height: 54px;
+  padding: 6px;
+  text-align: left;
+}
+
+.hubert-operational-intervals button[data-active="true"] {
+  outline: 2px solid rgba(255, 255, 255, 0.45);
+}
+
+.hubert-operational-intervals b {
+  color: #ffffff;
+  font-size: 10px;
+}
+
+.hubert-operational-intervals span {
+  color: rgba(245, 245, 245, 0.68);
+  font-size: 9px;
+  line-height: 1.15;
+}
+
+.hubert-operational-card,
+.hubert-operational-section {
+  padding: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.hubert-operational-card[data-tone="live"],
+.hubert-operational-intervals button[data-tone="live"] {
+  border-color: rgba(27, 203, 142, 0.45);
+  background: rgba(24, 156, 113, 0.16);
+}
+
+.hubert-operational-card[data-tone="pending"],
+.hubert-operational-intervals button[data-tone="pending"] {
+  border-color: rgba(245, 179, 65, 0.5);
+  background: rgba(203, 136, 32, 0.16);
+}
+
+.hubert-operational-card[data-tone="critical"],
+.hubert-operational-intervals button[data-tone="critical"] {
+  border-color: rgba(255, 83, 83, 0.54);
+  background: rgba(190, 45, 45, 0.18);
+}
+
+.hubert-operational-card[data-tone="blocked"],
+.hubert-operational-intervals button[data-tone="blocked"] {
+  border-color: rgba(245, 125, 52, 0.5);
+  background: rgba(194, 87, 31, 0.16);
+}
+
+.hubert-operational-card[data-tone="stale"],
+.hubert-operational-intervals button[data-tone="stale"] {
+  border-color: rgba(175, 175, 175, 0.34);
+  background: rgba(150, 150, 150, 0.12);
+}
+
+.hubert-operational-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.hubert-operational-tags em {
+  display: inline-flex;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #f5f5f5;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 900;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.hubert-operational-tags em[data-tone="live"],
+.hubert-operational-section span[data-tone="live"] b {
+  color: #68f5bc;
+}
+
+.hubert-operational-tags em[data-tone="pending"],
+.hubert-operational-section span[data-tone="pending"] b {
+  color: #ffd166;
+}
+
+.hubert-operational-tags em[data-tone="critical"],
+.hubert-operational-section span[data-tone="critical"] b {
+  color: #ff7a7a;
+}
+
+.hubert-operational-tags em[data-tone="blocked"],
+.hubert-operational-section span[data-tone="blocked"] b {
+  color: #ffb06b;
+}
+
+.hubert-operational-tags em[data-tone="simulated"],
+.hubert-operational-tags em[data-tone="stale"],
+.hubert-operational-section span[data-tone="simulated"] b,
+.hubert-operational-section span[data-tone="stale"] b {
+  color: #d7d7d7;
+}
+
+.hubert-operational-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.hubert-operational-grid span,
+.hubert-operational-section span {
+  display: grid;
+  gap: 2px;
+}
+
+.hubert-operational-grid b,
+.hubert-operational-section b {
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 9px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.hubert-operational-grid i,
+.hubert-operational-section i {
+  color: rgba(255, 255, 255, 0.86);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 760;
+}
+
+.hubert-operational-section {
+  gap: 8px;
+}
+
+.hubert-operational-section > strong {
+  font-size: 10px;
+  text-transform: uppercase;
 }
 
 .hubert-window-panel strong {

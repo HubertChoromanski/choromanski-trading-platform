@@ -149,6 +149,11 @@ function formatChartPnl(value) {
   return `${prefix}${Number(value).toFixed(2)}`;
 }
 
+function compactId(value = "") {
+  const text = String(value || "");
+  return text.length > 10 ? `${text.slice(0, 6)}…${text.slice(-3)}` : text;
+}
+
 function formatExitReason(reason) {
   if (reason === "END") return "END / open until test end";
   return reason ?? "EXIT";
@@ -170,6 +175,10 @@ function dateFromChartTime(value) {
   if (typeof value === "object" && value !== null && "year" in value) {
     return new Date(Date.UTC(Number(value.year), Number(value.month) - 1, Number(value.day)));
   }
+  if (typeof value === "string" && Number.isNaN(Number(value))) {
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? date : null;
+  }
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return null;
   const milliseconds = numeric > 10_000_000_000 ? numeric : numeric * 1000;
@@ -182,6 +191,411 @@ function localDateInputToSeconds(value) {
   if (!match) return NaN;
   const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12, 0, 0);
   return Math.floor(date.getTime() / 1000);
+}
+
+function normalizeProfileId(value = "") {
+  return String(value || "").toLowerCase();
+}
+
+function compactSymbol(value = "") {
+  return String(value || "").replace("-", "").toUpperCase();
+}
+
+function positionSide(position = {}) {
+  const raw = String(position.positionSide ?? position.side ?? position.direction ?? "").toUpperCase();
+  if (raw.includes("LONG")) return "LONG";
+  if (raw.includes("SHORT")) return "SHORT";
+  const amount = Number(position.positionAmt ?? position.positionAmount ?? position.quantity ?? 0);
+  return amount < 0 ? "SHORT" : "LONG";
+}
+
+function positionAmount(position = {}) {
+  return Math.abs(Number(position.positionAmt ?? position.positionAmount ?? position.quantity ?? position.availableAmt ?? 0));
+}
+
+function positionEntry(position = {}) {
+  return Number(position.entryPrice ?? position.avgPrice ?? position.averagePrice ?? position.positionAvgPrice ?? 0);
+}
+
+function positionPnl(position = {}) {
+  return Number(position.unrealizedPnl ?? position.unrealizedProfit ?? position.pnl ?? 0);
+}
+
+function positionsForOperationalState(livestream, config = {}) {
+  const positions = livestream?.positions ?? [];
+  return positions.filter((position) => {
+    const profile = normalizeProfileId(position.apiProfile ?? position.__apiProfileId ?? position.sourceProfileId ?? "");
+    const configured = normalizeProfileId(config.apiProfile ?? "");
+    return (!configured || profile === configured) &&
+      compactSymbol(position.symbol ?? config.symbol) === compactSymbol(config.symbol ?? "SOLUSDT") &&
+      positionAmount(position) > 0;
+  });
+}
+
+function isActivePendingStatus(status) {
+  return ["accepted", "placed", "new", "partially_filled", "pending_sync"].includes(String(status ?? "").toLowerCase());
+}
+
+function isTerminalExchangeStatus(status) {
+  return [
+    "terminal_failed",
+    "canceled",
+    "cancelled",
+    "expired",
+    "rejected",
+    "missing",
+    "filled_but_position_missing",
+    "cancel_failed",
+  ].includes(String(status ?? "").toLowerCase());
+}
+
+function classifyMarkerReality({ activeAnalysisSession, markerSource, selectedHistoricalWindow }) {
+  if (activeAnalysisSession) {
+    return {
+      label: "SIMULATED BACKTEST TRADE",
+      note: "Backtest markers are simulated analysis objects, not exchange positions.",
+      tone: "simulated",
+    };
+  }
+  if (selectedHistoricalWindow?.mode === "historical" || String(markerSource ?? "").includes("historical")) {
+    return {
+      label: "HISTORICAL MARKER",
+      note: "This setup exists in chart history only. The bot may not have been online or armed then.",
+      tone: "stale",
+    };
+  }
+  return {
+    label: "SIMULATED ENTRY",
+    note: "Chart strategy markers show calculated signals. Live execution requires the Sztab runner and BingX order state.",
+    tone: "simulated",
+  };
+}
+
+function timelineFromRuntime(runtime = {}) {
+  const journal = (runtime.setupOrderJournal ?? []).slice(-8).map((item) => ({
+    time: item.timestamp,
+    text: readableJournalText(item),
+  }));
+  const lifecycle = (runtime.pendingTriggerOrder?.orderLifecycle ?? []).slice(-5).map((item) => ({
+    time: item.time,
+    text: item.message ?? item.status ?? "Trigger order update",
+  }));
+  const setup = runtime.latestSetupEvent
+    ? [{
+        time: runtime.latestSetupEvent.time,
+        text: `${runtime.latestSetupEvent.direction ?? ""} setup observed (${runtime.latestSetupEvent.setupId ?? "no id"})`,
+      }]
+    : [];
+  return [...setup, ...journal, ...lifecycle]
+    .filter((item) => item.text)
+    .sort((left, right) => {
+      const leftTime = typeof left.time === "number" ? left.time * 1000 : new Date(left.time ?? 0).getTime();
+      const rightTime = typeof right.time === "number" ? right.time * 1000 : new Date(right.time ?? 0).getTime();
+      return rightTime - leftTime;
+    })
+    .slice(0, 7);
+}
+
+function readableJournalText(item = {}) {
+  const setup = item.setupId ? ` ${compactId(item.setupId)}` : "";
+  const trigger = Number.isFinite(Number(item.triggerPrice)) ? ` @ ${formatChartPrice(item.triggerPrice)}` : "";
+  const side = item.side ? ` ${item.side}` : "";
+  switch (item.event) {
+    case "order_accepted":
+      return `BingX accepted${side} trigger order${setup}${trigger}.`;
+    case "order_terminal":
+      return `Exchange ended trigger order${setup}: ${item.reason ?? item.status ?? "terminal"}.`;
+    case "order_missing":
+      return `Trigger order${setup} is missing on exchange.`;
+    case "order_canceled":
+      return `Pending trigger${setup} canceled: ${item.reason ?? "operator/replacement"}.`;
+    case "fill_detected_sl_placed":
+      return `Position fill detected${setup}; SL protection requested.`;
+    case "fill_detected_sl_failed":
+      return `Position fill detected${setup}; SL placement failed.`;
+    case "filled_but_position_missing":
+      return `Exchange reports fill${setup}, but no live position was found.`;
+    case "risk_blocked":
+      return `Risk blocked setup${setup}: ${item.reason ?? "risk manager"}.`;
+    case "order_rejected":
+      return `BingX rejected trigger order${setup}: ${item.reason ?? "exchange rejection"}.`;
+    default:
+      return `${item.event ?? item.status ?? "Runtime update"}${setup}${trigger}.`;
+  }
+}
+
+function deriveOperationalState({
+  activeAnalysisSession,
+  config = {},
+  currentPrice,
+  interval,
+  livestream,
+  markerSource,
+  runtime = {},
+  selectedHistoricalWindow,
+}) {
+  const positions = positionsForOperationalState(livestream, config);
+  const livePosition = positions[0] ?? null;
+  const pending = runtime.pendingTriggerOrder ?? null;
+  const status = String(runtime.status ?? "stopped").toLowerCase();
+  const pendingStatus = String(pending?.status ?? runtime.triggerOrderState ?? "").toLowerCase();
+  const markerReality = classifyMarkerReality({ activeAnalysisSession, markerSource, selectedHistoricalWindow });
+  const setup = runtime.latestSetupEvent ?? null;
+  const triggerPrice = Number(pending?.triggerPrice ?? setup?.trigger);
+  const side = pending?.direction ?? setup?.direction ?? positionSide(livePosition ?? {});
+  const blockedReason = runtime.lastBlockedReason || pending?.terminalReason || pending?.failureClassification || runtime.lastDecisionReason || "";
+  const base = {
+    detail: runtime.lastDecision || runtime.lastDecisionReason || markerReality.note,
+    interval,
+    markerReality,
+    pending,
+    rows: [],
+    tags: [],
+    timeline: timelineFromRuntime(runtime),
+    tone: "neutral",
+    visualObjects: [markerReality],
+  };
+
+  if (livePosition) {
+    const protectionActive = Number(livePosition.stopLoss) > 0 || (livePosition.attachedOrders ?? []).length > 0 || runtime.slPlacementStatus === "placed";
+    return {
+      ...base,
+      detail: protectionActive ? "Live exchange position exists and protection is visible." : "Live exchange position exists but SL/protection is missing.",
+      headline: `${positionSide(livePosition)} position active`,
+      rows: [
+        ["Entry", formatChartPrice(positionEntry(livePosition))],
+        ["SL", formatChartPrice(livePosition.stopLoss)],
+        ["PnL", formatChartPnl(positionPnl(livePosition))],
+        ["Qty", formatChartPrice(positionAmount(livePosition))],
+      ],
+      tags: [
+        { label: "LIVE POSITION", tone: "live" },
+        { label: protectionActive ? "SL placed correctly" : "Live protection missing (critical)", tone: protectionActive ? "live" : "critical" },
+      ],
+      tone: protectionActive ? "live" : "critical",
+      visualObjects: [{ label: "LIVE POSITION", note: "Position comes from live BingX account state.", tone: "live" }],
+    };
+  }
+
+  if (status === "interrupted" || status === "error" || status === "recovering") {
+    return {
+      ...base,
+      headline: status === "recovering" ? "Runner recovering" : "Runner interrupted, no live execution",
+      rows: [
+        ["Runtime", runtime.watchdogStatus ?? status],
+        ["Last error", runtime.error || runtime.lastError || "--"],
+      ],
+      tags: [
+        { label: status === "error" ? "EXCHANGE/RUNNER FAILED" : "BOT OFFLINE AT SIGNAL", tone: "critical" },
+        { label: markerReality.label, tone: markerReality.tone },
+      ],
+      tone: "critical",
+    };
+  }
+
+  if (status !== "running") {
+    return {
+      ...base,
+      headline: "Bot offline for this interval",
+      detail: "Sztab runner is not running, so chart markers are simulated/historical only.",
+      rows: [
+        ["Runtime", status || "stopped"],
+        ["Last signal", setup?.setupId ? `${setup.direction} ${compactId(setup.setupId)}` : "--"],
+      ],
+      tags: [
+        { label: "BOT OFFLINE AT SIGNAL", tone: "stale" },
+        { label: markerReality.label, tone: markerReality.tone },
+      ],
+      tone: "stale",
+    };
+  }
+
+  if (isActivePendingStatus(pendingStatus)) {
+    return {
+      ...base,
+      headline: `${side ?? ""} setup armed`.trim() || "Setup armed",
+      detail: "Exchange-side trigger order is armed; waiting for trigger touch/fill confirmation.",
+      rows: [
+        ["Trigger", formatChartPrice(triggerPrice)],
+        ["Current chart price", formatChartPrice(currentPrice)],
+        ["Pending order", pending?.orderId ? compactId(pending.orderId) : "--"],
+        ["BingX status", runtime.lastExchangeStatus || pendingStatus],
+      ],
+      tags: [
+        { label: "LIVE PENDING TRIGGER", tone: "pending" },
+        { label: "Waiting for trigger touch", tone: "pending" },
+      ],
+      tone: "pending",
+      visualObjects: [{ label: "LIVE PENDING TRIGGER", note: "Pending trigger order is local runtime plus BingX order status.", tone: "pending" }],
+    };
+  }
+
+  if (pending && isTerminalExchangeStatus(pendingStatus)) {
+    return {
+      ...base,
+      headline: pendingStatus === "filled_but_position_missing"
+        ? "Fill reported, position missing"
+        : "Trigger order failed on exchange",
+      detail: pendingStatus === "filled_but_position_missing"
+        ? "BingX reported executed quantity, but fresh sync did not find a matching position."
+        : `Pending trigger is terminal: ${pending.terminalReason ?? pending.failureClassification ?? pendingStatus}.`,
+      rows: [
+        ["Last trigger", formatChartPrice(pending.triggerPrice)],
+        ["Order", pending.orderId ? compactId(pending.orderId) : "--"],
+        ["Exchange status", runtime.lastExchangeStatus || pending.exchangeTerminalStatus || pendingStatus],
+        ["Executed qty", pending.executedQty ?? runtime.triggerOrderExecutedQty ?? "--"],
+      ],
+      tags: [
+        { label: pendingStatus === "filled_but_position_missing" ? "LIVE POSITION UNKNOWN" : "EXCHANGE FAILED", tone: "critical" },
+        { label: "Next setup can arm", tone: runtime.canArmNextSetup ? "live" : "critical" },
+      ],
+      tone: "critical",
+      visualObjects: [{ label: "EXCHANGE FAILED", note: "Exchange returned a terminal trigger-order state.", tone: "critical" }],
+    };
+  }
+
+  if (blockedReason.includes("risk") || blockedReason.includes("blocked") || pendingStatus === "risk_blocked") {
+    return {
+      ...base,
+      headline: `${side ?? ""} setup blocked`.trim() || "Setup blocked",
+      detail: blockedReason || "The runner rejected the setup before order placement.",
+      rows: [
+        ["Trigger", formatChartPrice(triggerPrice)],
+        ["Current chart price", formatChartPrice(currentPrice)],
+        ["Reason", blockedReason || "--"],
+      ],
+      tags: [{ label: "BLOCKED SETUP", tone: "blocked" }],
+      tone: "blocked",
+      visualObjects: [{ label: "BLOCKED SETUP", note: "Setup did not become an exchange order.", tone: "blocked" }],
+    };
+  }
+
+  if (setup?.setupId) {
+    return {
+      ...base,
+      headline: `Waiting for ${setup.direction ?? "next"} trigger/order`,
+      detail: runtime.lastDecision || "A setup is visible in runner state, but no active exchange trigger is armed.",
+      rows: [
+        ["Setup", compactId(setup.setupId)],
+        ["Trigger", formatChartPrice(setup.trigger)],
+        ["Current chart price", formatChartPrice(currentPrice)],
+      ],
+      tags: [
+        { label: "SIMULATED ENTRY", tone: "simulated" },
+        { label: "No live trigger armed", tone: "stale" },
+      ],
+      tone: "neutral",
+    };
+  }
+
+  return {
+    ...base,
+    headline: "No valid setup",
+    detail: runtime.lastDecision || "Runner is healthy and waiting for the next benchmark/setup.",
+    rows: [
+      ["Runtime", runtime.watchdogStatus ?? "healthy"],
+      ["Last candle", runtime.lastClosedCandleTime ? formatChartTime(runtime.lastClosedCandleTime) : "--"],
+      ["Current chart price", formatChartPrice(currentPrice)],
+    ],
+    tags: [{ label: "Waiting for benchmark candle", tone: "neutral" }],
+    tone: "neutral",
+  };
+}
+
+function OperationalTelemetryPanel({
+  compact = false,
+  dock = "left",
+  onDock,
+  onSelectInterval,
+  onToggleCompact,
+  selectedInterval,
+  states = {},
+}) {
+  const selected = states[selectedInterval] ?? deriveOperationalState({ interval: selectedInterval });
+  const intervals = timeframes.filter((item) => item.interval !== "4h");
+
+  return (
+    <section
+      className="hubert-operational-panel"
+      data-compact={compact ? "true" : "false"}
+      data-dock={dock}
+      data-tone={selected.tone}
+      aria-label="Live operational state"
+    >
+      <div className="hubert-operational-panel__head">
+        <div>
+          <strong>Operational state</strong>
+          <span>Live vs simulated status for Sztab intervals</span>
+        </div>
+        <div>
+          <button type="button" onClick={() => onToggleCompact?.()}>{compact ? "Expand" : "Compact"}</button>
+          <button type="button" onClick={() => onDock?.(dock === "left" ? "right" : "left")}>Dock {dock === "left" ? "right" : "left"}</button>
+        </div>
+      </div>
+
+      <div className="hubert-operational-intervals">
+        {intervals.map((item) => {
+          const state = states[item.interval] ?? deriveOperationalState({ interval: item.interval });
+          return (
+            <button
+              data-active={selectedInterval === item.interval}
+              data-tone={state.tone}
+              key={item.interval}
+              type="button"
+              onClick={() => onSelectInterval?.(item.interval)}
+            >
+              <b>{item.label}</b>
+              <span>{state.headline}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {!compact && (
+        <>
+          <div className="hubert-operational-card" data-tone={selected.tone}>
+            <strong>{selected.headline}</strong>
+            <p>{selected.detail}</p>
+            <div className="hubert-operational-tags">
+              {(selected.tags ?? []).map((tag, index) => (
+                <em data-tone={tag.tone} key={`${tag.label}-${index}`}>{tag.label}</em>
+              ))}
+            </div>
+            <div className="hubert-operational-grid">
+              {(selected.rows ?? []).map(([label, value]) => (
+                <span key={label}><b>{label}</b><i>{value ?? "--"}</i></span>
+              ))}
+            </div>
+          </div>
+
+          <div className="hubert-operational-section">
+            <strong>What the chart objects mean</strong>
+            {(selected.visualObjects ?? []).map((item, index) => (
+              <span data-tone={item.tone} key={`${item.label}-${index}`}>
+                <b>{item.label}</b>
+                <i>{item.note}</i>
+              </span>
+            ))}
+          </div>
+
+          <div className="hubert-operational-section">
+            <strong>Readable timeline</strong>
+            {(selected.timeline ?? []).length ? (selected.timeline ?? []).map((item, index) => (
+              <span key={`${item.time ?? index}-${index}`}>
+                <b>{formatChartTime(item.time)}</b>
+                <i>{item.text}</i>
+              </span>
+            )) : (
+              <span>
+                <b>Now</b>
+                <i>No setup/order lifecycle events have been recorded yet.</i>
+              </span>
+            )}
+          </div>
+        </>
+      )}
+    </section>
+  );
 }
 
 function chartTimeValue(value) {
@@ -339,6 +753,14 @@ function sanitizeMarkers(markers = [], label = "markers") {
   warnSanitizedChartData(label, { duplicateIds, invalid, nonAscending });
 
   return sanitized;
+}
+
+function labelMarkers(markers = [], prefix = "") {
+  if (!prefix) return markers;
+  return markers.map((marker) => ({
+    ...marker,
+    text: `${prefix} ${marker.text ?? ""}`.trim(),
+  }));
 }
 
 function sanitizeOverlayEvents(points = [], label = "overlay") {
@@ -628,6 +1050,9 @@ export default function TradingViewChart() {
     initialIndicatorSettings[persistedState.chartTimeframe ?? "15m"] ?? normalizeIndicatorSettings(persistedState.indicatorSettings),
   );
   const [sztabTelemetry, setSztabTelemetry] = useState(null);
+  const [livestreamTelemetry, setLivestreamTelemetry] = useState(null);
+  const [telemetryDock, setTelemetryDock] = useState("left");
+  const [telemetryCompact, setTelemetryCompact] = useState(false);
   const [settingsPanel, setSettingsPanel] = useState(null);
   const [activeBacktestSession, setActiveBacktestSession] = useState(null);
   const [backtestAnalysisActive, setBacktestAnalysisActive] = useState(false);
@@ -646,7 +1071,28 @@ export default function TradingViewChart() {
     () => historyDaysToLimit(selectedInterval, settings.historyDays ?? settings.historyLimit),
     [selectedInterval, settings.historyDays, settings.historyLimit],
   );
+  const currentChartPrice = rawCandles.at(-1)?.close ?? null;
   const activeAnalysisSession = backtestAnalysisActive ? activeBacktestSession : null;
+  const operationalStates = useMemo(() => {
+    const intervals = (sztabTelemetry?.config?.intervals ?? {});
+    return Object.fromEntries(
+      timeframes
+        .filter((item) => item.interval !== "4h")
+        .map((item) => [
+          item.interval,
+          deriveOperationalState({
+            activeAnalysisSession,
+            config: intervals[item.interval] ?? {},
+            currentPrice: currentChartPrice,
+            interval: item.interval,
+            livestream: livestreamTelemetry,
+            markerSource: chartRenderStats.markerSource,
+            runtime: sztabTelemetry?.intervals?.[item.interval]?.runtime ?? intervals[item.interval]?.runtime ?? {},
+            selectedHistoricalWindow,
+          }),
+        ]),
+    );
+  }, [activeAnalysisSession, chartRenderStats.markerSource, currentChartPrice, livestreamTelemetry, selectedHistoricalWindow, sztabTelemetry]);
 
   useEffect(() => {
     analysisModeRef.current = Boolean(activeAnalysisSession);
@@ -1157,7 +1603,7 @@ export default function TradingViewChart() {
     liveOrderLineSeriesRef.current = [];
   }, []);
 
-  const addLiveOrderSegment = useCallback(({ color, lineStyle = 0, value, startTime, endTime }) => {
+  const addLiveOrderSegment = useCallback(({ color, lineStyle = 0, title = "", value, startTime, endTime }) => {
     if (!chartRef.current || !Number.isFinite(Number(value))) {
       return false;
     }
@@ -1173,6 +1619,7 @@ export default function TradingViewChart() {
       color,
       lineWidth: 2,
       lineStyle,
+      title,
       priceLineVisible: true,
       lastValueVisible: true,
       crosshairMarkerVisible: false,
@@ -1343,7 +1790,7 @@ export default function TradingViewChart() {
 
       if (mode.analysisResult) {
         const markers = sanitizeMarkers(
-          toBacktestAnalysisMarkers(mode.analysisResult, mode.overlaySettings, chartCandles),
+          labelMarkers(toBacktestAnalysisMarkers(mode.analysisResult, mode.overlaySettings, chartCandles), "BT SIM"),
           "backtest analysis markers",
         );
         strategyMarkersRef.current?.setMarkers(markers);
@@ -1409,7 +1856,8 @@ export default function TradingViewChart() {
 
 	        const markerEvents = filterStrategyEvents(strategyEvents, renderSettings);
 	        const cappedMarkerEvents = markerEvents.slice(-MAX_BACKTEST_CHART_MARKERS);
-	        const strategyMarkers = sanitizeMarkers(toStrategyMarkers(cappedMarkerEvents), "strategy markers");
+        const markerLabelPrefix = selectedHistoricalWindowRef.current?.mode === "historical" ? "HIST" : "SIM";
+	        const strategyMarkers = sanitizeMarkers(labelMarkers(toStrategyMarkers(cappedMarkerEvents), markerLabelPrefix), "strategy markers");
 
 	        strategyMarkersRef.current?.setMarkers(strategyMarkers);
 	        renderStrategyLines(strategyEvents, closedCandles);
@@ -1801,10 +2249,19 @@ export default function TradingViewChart() {
 
     async function refreshSztabTelemetry() {
       try {
-        const status = await apiFetch("/sztab/status");
-        if (!ignore) setSztabTelemetry(status);
+        const [status, livestream] = await Promise.all([
+          apiFetch("/sztab/status"),
+          apiFetch("/livestream?fresh=1").catch(() => null),
+        ]);
+        if (!ignore) {
+          setSztabTelemetry(status);
+          setLivestreamTelemetry(livestream);
+        }
       } catch {
-        if (!ignore) setSztabTelemetry(null);
+        if (!ignore) {
+          setSztabTelemetry(null);
+          setLivestreamTelemetry(null);
+        }
       }
     }
 
@@ -1827,9 +2284,10 @@ export default function TradingViewChart() {
 
     if (pending && ["accepted", "placed", "new", "pending_sync"].includes(String(pending.status ?? "").toLowerCase())) {
       addLiveOrderSegment({
-        color: pending.direction === "LONG" ? "rgba(66, 245, 164, 0.95)" : "rgba(255, 97, 97, 0.95)",
+        color: pending.direction === "LONG" ? "rgba(21, 152, 112, 0.95)" : "rgba(182, 50, 66, 0.95)",
         endTime: lastTime,
         startTime: Math.max(firstTime, Number(pending.entryEvent?.benchmarkTime ?? pending.entryEvent?.time ?? firstTime)),
+        title: "LIVE PENDING TRIGGER",
         value: pending.triggerPrice,
       });
     }
@@ -1840,6 +2298,7 @@ export default function TradingViewChart() {
         endTime: lastTime,
         lineStyle: 2,
         startTime: Math.max(firstTime, Number(pending.fillDetectedAt ? Math.floor(new Date(pending.fillDetectedAt).getTime() / 1000) : firstTime)),
+        title: pending.status === "filled_protected" ? "LIVE SL PROTECTION" : "SL PLACEMENT FAILED",
         value: pending.stopLoss,
       });
     }
@@ -2010,23 +2469,15 @@ export default function TradingViewChart() {
         </div>
       </div>
 
-      <div className="hubert-live-trigger-panel" aria-label="Live trigger telemetry">
-        {(() => {
-          const runtime = sztabTelemetry?.intervals?.[selectedInterval]?.runtime;
-          const pending = runtime?.pendingTriggerOrder;
-          return (
-            <>
-              <strong>{selectedInterval.toUpperCase()} live trigger</strong>
-              <span>Time: {DISPLAY_TIME_ZONE}</span>
-              <span>State: {runtime?.triggerOrderState ?? pending?.status ?? "none"}</span>
-              <span>Setup: {pending?.setupId ?? runtime?.latestSetupEvent?.setupId ?? "--"} · {pending?.direction ?? runtime?.latestSetupEvent?.direction ?? "--"}</span>
-              <span>Trigger: {formatChartPrice(pending?.triggerPrice ?? runtime?.latestSetupEvent?.trigger)}</span>
-              <span>Order: {pending?.orderId ?? "--"} · SL: {runtime?.slPlacementStatus ?? "--"}</span>
-              <span>{runtime?.lastDecisionReason ?? "runner telemetry unavailable"}</span>
-            </>
-          );
-        })()}
-      </div>
+      <OperationalTelemetryPanel
+        compact={telemetryCompact}
+        dock={telemetryDock}
+        selectedInterval={selectedInterval}
+        states={operationalStates}
+        onDock={setTelemetryDock}
+        onSelectInterval={updateSelectedInterval}
+        onToggleCompact={() => setTelemetryCompact((value) => !value)}
+      />
 
       {measurementView?.start && (
         <MeasurementOverlay measurementView={measurementView} />
