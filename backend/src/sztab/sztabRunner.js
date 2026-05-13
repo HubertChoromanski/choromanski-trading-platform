@@ -127,6 +127,10 @@ function terminalPendingStatus(status) {
   ].includes(String(status ?? "").toLowerCase());
 }
 
+function isActivePendingTrigger(order) {
+  return ["accepted", "placed", "new", "partially_filled", "pending_sync"].includes(String(order?.status ?? "").toLowerCase());
+}
+
 function reconcileLocalScenarioWithExchange(profile, exchangePositions = []) {
   const pending = profile.live?.pendingTriggerOrder ?? null;
   const localPosition = profile.live?.openPosition ?? null;
@@ -1034,10 +1038,6 @@ export function createSztabRunner({
       clearInterval(timer);
       timers.delete(interval);
     }
-  }
-
-  function isActivePendingTrigger(order) {
-    return ["accepted", "placed", "new", "partially_filled", "pending_sync"].includes(String(order?.status ?? "").toLowerCase());
   }
 
   function triggerRuntimeSummary(pending, live = {}) {

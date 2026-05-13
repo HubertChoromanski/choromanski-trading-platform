@@ -10,7 +10,6 @@ import { createSolKlineSocket, fetchHistoricalCandles } from "../api/binance";
 import {
   STRATEGY_EVENT_TYPES,
   evaluateChoromanskiStrategy,
-  filterStrategyEvents,
   toStrategyMarkers,
 } from "../engine/strategyEngine";
 import { toHeikenAshi } from "../indicators/heikenAshi";
@@ -123,6 +122,29 @@ const defaultBacktestOverlaySettings = {
   showTrades: true,
   showVisibleTradeSlTp: false,
 };
+const overlayModes = [
+  {
+    id: "live",
+    label: "LIVE ONLY",
+    note: "Tylko pozycja live, SL/TP live, trigger live i aktualny setup.",
+  },
+  {
+    id: "operational",
+    label: "OPERACYJNY",
+    note: "Live plus bieżący setup oczekujący, zablokowany lub zastąpiony.",
+  },
+  {
+    id: "history",
+    label: "HISTORIA",
+    note: "Ostatnie historyczne/symulowane setupy jako kontekst.",
+  },
+  {
+    id: "debug",
+    label: "DEBUG",
+    note: "Pełne markery i linie diagnostyczne.",
+  },
+];
+const overlayModeIds = new Set(overlayModes.map((mode) => mode.id));
 
 function formatMeasurementValue(value) {
   const prefix = value > 0 ? "+" : "";
@@ -147,6 +169,108 @@ function formatChartPnl(value) {
   const prefix = Number(value) > 0 ? "+" : "";
 
   return `${prefix}${Number(value).toFixed(2)}`;
+}
+
+function normalizeOverlayMode(value) {
+  return overlayModeIds.has(value) ? value : "live";
+}
+
+function overlayModeDefinition(value) {
+  return overlayModes.find((mode) => mode.id === normalizeOverlayMode(value)) ?? overlayModes[0];
+}
+
+function takNie(value) {
+  return value ? "tak" : "nie";
+}
+
+function polishSide(value = "") {
+  const side = String(value || "").toUpperCase();
+  if (side.includes("LONG") || side === "BUY") return "LONG";
+  if (side.includes("SHORT") || side === "SELL") return "SHORT";
+  return side || "--";
+}
+
+function canonicalDirection(...values) {
+  for (const value of values) {
+    const side = polishSide(value);
+    if (side === "LONG" || side === "SHORT") return side;
+  }
+  return "";
+}
+
+function polishStatus(value = "") {
+  const normalized = String(value || "").toLowerCase();
+  const map = {
+    accepted: "zaakceptowane przez BingX",
+    canceled: "anulowane",
+    cancelled: "anulowane",
+    cancel_failed: "nie udało się anulować",
+    expired: "wygasło",
+    filled_but_position_missing: "fill zgłoszony, ale brak pozycji live",
+    filled_protected: "pozycja wykryta, ochrona założona",
+    filled_sl_failed: "pozycja wykryta, SL niepotwierdzony",
+    missing: "brak zlecenia na BingX",
+    new: "nowe",
+    partially_filled: "częściowo wykonane",
+    pending_sync: "czeka na potwierdzenie BingX",
+    placed: "wystawione",
+    rejected: "odrzucone",
+    risk_blocked: "zablokowane przez ryzyko",
+    terminal_failed: "zakończone błędem na BingX",
+    trigger_order_rejected: "trigger odrzucony przez BingX",
+    healthy: "zdrowy",
+    idle: "bezczynny",
+    interrupted: "przerwany",
+    recovering: "odzyskiwanie stanu",
+    running: "działa",
+    stopped: "zatrzymany",
+  };
+  return map[normalized] ?? (value || "--");
+}
+
+function polishProtectionSource(value = "") {
+  const normalized = String(value || "").toLowerCase();
+  const map = {
+    bingx_order: "zlecenie ochronne BingX",
+    bingx_position: "pole pozycji BingX",
+    local_planned: "lokalny plan po fillu triggera",
+    none: "brak",
+    simulated: "symulacja",
+    stale_local: "stary lokalny scenariusz",
+    "open orders": "otwarte zlecenia BingX",
+    "position fields": "pole pozycji BingX",
+  };
+  return map[normalized] ?? (value || "--");
+}
+
+function polishReason(value = "") {
+  const normalized = String(value || "").toLowerCase();
+  if (!normalized) return "--";
+  if (normalized.includes("filled_but_position_missing")) return "BingX nie potwierdza pozycji live dla tego scenariusza.";
+  if (normalized.includes("missing")) return "Zlecenie nie istnieje już na BingX.";
+  if (normalized.includes("expired")) return "Zlecenie trigger wygasło na BingX.";
+  if (normalized.includes("rejected")) return "BingX odrzucił zlecenie trigger.";
+  if (normalized.includes("canceled") || normalized.includes("cancelled")) return "Zlecenie zostało anulowane.";
+  if (normalized.includes("risk")) return "Setup został zablokowany przez warstwę ryzyka.";
+  if (normalized.includes("blocked")) return "Setup został zablokowany przed wysłaniem zlecenia.";
+  return value;
+}
+
+function polishLifecycleText(item = {}) {
+  const message = String(item.message ?? item.status ?? "");
+  const normalized = message.toLowerCase();
+  if (!message) return "Aktualizacja zlecenia trigger.";
+  if (normalized.includes("exchange accepted trigger-market")) return "BingX zaakceptował zlecenie trigger-market.";
+  if (normalized.includes("still pending")) return `Trigger nadal czeka na BingX (${polishStatus(item.status)}).`;
+  if (normalized.includes("terminal on exchange")) return `Trigger zakończył się na BingX: ${polishReason(message)}`;
+  if (normalized.includes("reported filled") && normalized.includes("no matching live position")) {
+    return "BingX zgłosił fill, ale świeży sync nie znalazł pozycji live.";
+  }
+  if (normalized.includes("sl placement failed")) return "Pozycja została wykryta, ale SL nie został potwierdzony.";
+  if (normalized.includes("sl protection placement requested")) return "Pozycja została wykryta; system wysłał zlecenie ochronne SL.";
+  if (normalized.includes("pending trigger order cancelled")) return "Poprzedni trigger został anulowany.";
+  if (normalized.includes("risk blocked")) return `Ryzyko zablokowało setup: ${message.replace(/^risk blocked:\s*/i, "")}`;
+  return message;
 }
 
 function compactId(value = "") {
@@ -201,12 +325,20 @@ function compactSymbol(value = "") {
   return String(value || "").replace("-", "").toUpperCase();
 }
 
+function displayInterval(value = "") {
+  return String(value).toLowerCase() === "1h" ? "1H" : value;
+}
+
 function positionSide(position = {}) {
   const raw = String(position.positionSide ?? position.side ?? position.direction ?? "").toUpperCase();
   if (raw.includes("LONG")) return "LONG";
   if (raw.includes("SHORT")) return "SHORT";
+  if (raw === "BUY") return "LONG";
+  if (raw === "SELL") return "SHORT";
   const amount = Number(position.positionAmt ?? position.positionAmount ?? position.quantity ?? 0);
-  return amount < 0 ? "SHORT" : "LONG";
+  if (amount < 0) return "SHORT";
+  if (amount > 0) return "LONG";
+  return "";
 }
 
 function positionAmount(position = {}) {
@@ -236,6 +368,13 @@ function stopProtectionOrder(position = {}) {
   }) ?? null;
 }
 
+function pendingTriggerStartTime(pending = {}, firstTime) {
+  return Math.max(
+    firstTime,
+    Number(pending.entryEvent?.benchmarkTime ?? pending.entryEvent?.time ?? firstTime),
+  );
+}
+
 function liveProtectionState({ livePosition = null, pending = null, runtime = {} }) {
   const pendingStatus = String(pending?.status ?? runtime.triggerOrderState ?? "").toLowerCase();
   const stopOrder = livePosition ? stopProtectionOrder(livePosition) : null;
@@ -247,8 +386,8 @@ function liveProtectionState({ livePosition = null, pending = null, runtime = {}
     return {
       activeScenarioCanBlockNewSetup: true,
       confirmed: true,
-      label: "LIVE SL PROTECTION CONFIRMED",
-      note: "Real BingX position exists and SL protection is visible in fresh position/order state.",
+      label: "LIVE SL — POTWIERDZONY NA BINGX",
+      note: "Istnieje realna pozycja na BingX i aktywny SL widoczny w świeżym syncu pozycji albo zleceń.",
       orderId: orderIdentifier(stopOrder),
       price: stopLoss || Number(pending?.stopLoss ?? 0),
       source: stopOrder ? "bingx_order" : "bingx_position",
@@ -260,8 +399,8 @@ function liveProtectionState({ livePosition = null, pending = null, runtime = {}
     return {
       activeScenarioCanBlockNewSetup: true,
       confirmed: false,
-      label: "LIVE POSITION, PROTECTION MISSING",
-      note: "Real BingX position exists, but no active SL protection is visible after sync.",
+      label: "LIVE POZYCJA — BRAK POTWIERDZONEGO SL",
+      note: "Pozycja istnieje na BingX, ale świeży sync nie pokazuje aktywnego SL.",
       orderId: null,
       price: Number(pending?.stopLoss ?? livePosition?.stopLoss ?? 0),
       source: "none",
@@ -270,11 +409,14 @@ function liveProtectionState({ livePosition = null, pending = null, runtime = {}
   }
 
   if (["filled_protected", "filled_sl_failed", "filled_but_position_missing"].includes(pendingStatus)) {
+    const staleLabel = pendingStatus === "filled_sl_failed"
+      ? "PLANOWANY SL — NIEPOTWIERDZONY"
+      : "HISTORYCZNY SL";
     return {
       activeScenarioCanBlockNewSetup: false,
       confirmed: false,
-      label: pendingStatus === "filled_sl_failed" ? "SL PLANNED, NOT CONFIRMED" : "STALE SL STATE",
-      note: "No live BingX position exists for this scenario, so this SL is local/stale state, not confirmed protection.",
+      label: staleLabel,
+      note: "Ten poziom pochodzi ze starego/lokalnego scenariusza. BingX nie potwierdza aktualnej pozycji live z tym SL.",
       orderId: orderIdentifier(pending?.stopOrder),
       price: Number(pending?.stopLoss ?? 0),
       source: "stale_local",
@@ -286,8 +428,8 @@ function liveProtectionState({ livePosition = null, pending = null, runtime = {}
     return {
       activeScenarioCanBlockNewSetup: false,
       confirmed: false,
-      label: "SL PLANNED, NOT CONFIRMED",
-      note: "SL is planned for after trigger fill. It is not active until a real position exists and BingX confirms protection.",
+      label: "PLANOWANY SL — NIEPOTWIERDZONY",
+      note: "SL zostanie użyty dopiero po fillu triggera. Teraz nie jest aktywną ochroną na BingX.",
       orderId: null,
       price: Number(pending.stopLoss),
       source: "local_planned",
@@ -298,8 +440,8 @@ function liveProtectionState({ livePosition = null, pending = null, runtime = {}
   return {
     activeScenarioCanBlockNewSetup: false,
     confirmed: false,
-    label: "SIMULATED SL",
-    note: "No live SL protection is present in exchange state.",
+    label: "SYMULOWANY SL",
+    note: "Brak live pozycji i brak potwierdzonego SL na BingX.",
     orderId: null,
     price: null,
     source: "simulated",
@@ -335,24 +477,283 @@ function isTerminalExchangeStatus(status) {
   ].includes(String(status ?? "").toLowerCase());
 }
 
+function semanticOverlayLabel(line = {}) {
+  const direction = canonicalDirection(line.direction);
+  const side = direction ? ` — ${direction}` : "";
+  if (line.type === "trigger") {
+    if (line.state === "active_live") return `TRIGGER LIVE — ZLECENIE NA BINGX${side}`;
+    if (line.state === "failed") return `NIEUDANY TRIGGER ${direction || ""} — BingX nie wykonał zlecenia`.trim();
+    if (line.state === "current_setup") return `SETUP W STRATEGII — BRAK AKTYWNEGO ZLECENIA BINGX${side}`;
+    if (line.state === "historical") return `HISTORYCZNY TRIGGER — BRAK AKTYWNEGO ZLECENIA${side}`;
+    return `SYMULOWANY TRIGGER${side}`;
+  }
+  if (line.type === "sl") {
+    if (line.state === "live_confirmed") return "LIVE SL — POTWIERDZONY NA BINGX";
+    if (line.state === "planned") return "PLANOWANY SL — NIEPOTWIERDZONY";
+    return "HISTORYCZNY SL";
+  }
+  if (line.type === "tp") {
+    if (line.state === "live_confirmed") return "LIVE TP";
+    if (line.state === "setup_target") return "CEL SETUPU / TP SCENARIUSZA";
+    return "SYMULOWANY TP";
+  }
+  if (line.type === "entry") {
+    if (line.state === "live_confirmed") return `LIVE ENTRY${side}`;
+    return `SYMULOWANY ENTRY${side}`;
+  }
+  return line.label ?? "";
+}
+
+function semanticOverlayStyle(line = {}) {
+  const direction = canonicalDirection(line.direction);
+  const sideColor = direction === "SHORT" ? "rgba(182, 50, 66, 0.95)" : "rgba(21, 152, 112, 0.95)";
+  if (line.type === "entry") {
+    return {
+      color: direction === "SHORT" ? "rgba(239, 68, 68, 0.95)" : "rgba(34, 197, 94, 0.95)",
+      lineStyle: 0,
+      lineWidth: 2,
+    };
+  }
+  if (line.type === "trigger") {
+    return {
+      color: line.state === "active_live" ? sideColor : "rgba(148, 163, 184, 0.55)",
+      lineStyle: line.state === "active_live" ? 0 : 2,
+      lineWidth: line.state === "active_live" ? 2 : 1,
+    };
+  }
+  if (line.type === "sl") {
+    return {
+      color: line.state === "live_confirmed" ? "rgba(34, 197, 94, 0.95)" : line.state === "planned" ? "rgba(255, 152, 67, 0.7)" : "rgba(148, 163, 184, 0.42)",
+      lineStyle: 2,
+      lineWidth: line.state === "live_confirmed" ? 2 : 1,
+    };
+  }
+  if (line.type === "tp") {
+    return {
+      color: line.state === "live_confirmed" ? "rgba(89, 168, 255, 0.95)" : line.state === "setup_target" ? "rgba(89, 168, 255, 0.62)" : "rgba(89, 168, 255, 0.36)",
+      lineStyle: line.state === "live_confirmed" ? 2 : 1,
+      lineWidth: line.state === "live_confirmed" ? 2 : 1,
+    };
+  }
+  return { color: "rgba(148, 163, 184, 0.5)", lineStyle: 2, lineWidth: 1 };
+}
+
+function warnDirectionLabelMismatch(line = {}, label = "") {
+  const direction = canonicalDirection(line.direction);
+  if (!direction) return;
+  const text = String(label).toUpperCase();
+  const opposite = direction === "LONG" ? "SHORT" : "LONG";
+  if (text.includes(opposite) && !text.includes(direction)) {
+    console.warn("Choromanski chart direction mismatch", {
+      direction,
+      label,
+      sourceField: line.sourceField,
+      type: line.type,
+      value: line.value,
+    });
+  }
+}
+
+function shouldRenderSemanticOverlay(line = {}, mode = "live") {
+  const normalizedMode = normalizeOverlayMode(mode);
+  if (line.state === "live_confirmed" || line.state === "active_live") return true;
+  if (normalizedMode === "live") return false;
+  if (normalizedMode === "operational") {
+    return line.state === "current_setup" || line.state === "setup_target";
+  }
+  return normalizedMode === "history" || normalizedMode === "debug";
+}
+
+function buildSemanticLiveOverlays({
+  firstTime,
+  interval,
+  lastTime,
+  livePosition = null,
+  mode = "live",
+  pending = null,
+  protection = null,
+  setup = null,
+}) {
+  const pendingStatus = String(pending?.status ?? "").toLowerCase();
+  const activePending = pending && isActivePendingStatus(pendingStatus);
+  const staleProtectionPending = pending && !livePosition && ["filled_protected", "filled_sl_failed", "filled_but_position_missing"].includes(pendingStatus);
+  const terminalPending = pending && !livePosition && (isTerminalExchangeStatus(pendingStatus) || pending.terminal || staleProtectionPending);
+  const pendingDirection = canonicalDirection(pending?.direction, pending?.positionSide, pending?.side);
+  const lines = [];
+  const addLine = (line) => {
+    if (!Number.isFinite(Number(line.value)) || Number(line.value) <= 0) return;
+    const label = semanticOverlayLabel(line);
+    warnDirectionLabelMismatch(line, label);
+    const key = [
+      interval,
+      line.setupId ?? line.orderId ?? "overlay",
+      line.type,
+      Number(line.value).toFixed(4),
+      line.sourceTime ?? line.startTime ?? firstTime,
+    ].join(":");
+    const nextLine = {
+      endTime: lastTime,
+      interval,
+      key,
+      label,
+      lineStyle: semanticOverlayStyle(line).lineStyle,
+      lineWidth: semanticOverlayStyle(line).lineWidth,
+      startTime: firstTime,
+      ...semanticOverlayStyle(line),
+      ...line,
+      value: Number(line.value),
+    };
+    if (shouldRenderSemanticOverlay(nextLine, mode)) {
+      lines.push(nextLine);
+    }
+  };
+
+  if (livePosition) {
+    const direction = canonicalDirection(positionSide(livePosition), livePosition?.positionSide, livePosition?.side);
+    addLine({
+      direction,
+      sourceField: "entryPrice",
+      state: "live_confirmed",
+      type: "entry",
+      value: positionEntry(livePosition),
+    });
+    if (protection?.confirmed) {
+      addLine({
+        direction,
+        orderId: protection.orderId,
+        sourceField: "stopLoss",
+        state: "live_confirmed",
+        type: "sl",
+        value: protection.price,
+      });
+    }
+    addLine({
+      direction,
+      sourceField: "takeProfit",
+      state: "live_confirmed",
+      type: "tp",
+      value: livePosition.takeProfit,
+    });
+  }
+
+  if (pending) {
+    const startTime = pendingTriggerStartTime(pending, firstTime);
+    if (activePending) {
+      addLine({
+        direction: pendingDirection,
+        orderId: pending.orderId,
+        setupId: pending.setupId,
+        sourceField: "triggerPrice",
+        startTime,
+        state: "active_live",
+        type: "trigger",
+        value: pending.triggerPrice,
+      });
+      addLine({
+        direction: pendingDirection,
+        setupId: pending.setupId,
+        sourceField: "takeProfit",
+        startTime,
+        state: "setup_target",
+        type: "tp",
+        value: pending.takeProfit,
+      });
+      if (normalizeOverlayMode(mode) !== "operational") {
+        addLine({
+          direction: pendingDirection,
+          setupId: pending.setupId,
+          sourceField: "stopLoss",
+          startTime,
+          state: "planned",
+          type: "sl",
+          value: pending.stopLoss,
+        });
+      }
+    } else if (terminalPending) {
+      const failedTrigger = pending.terminalReason || pending.failureClassification || pending.lastExchangeStatus;
+      addLine({
+        direction: pendingDirection,
+        orderId: pending.orderId,
+        setupId: pending.setupId,
+        sourceField: "triggerPrice",
+        startTime,
+        state: failedTrigger ? "failed" : "historical",
+        terminalReason: failedTrigger || "",
+        type: "trigger",
+        value: pending.triggerPrice,
+      });
+      addLine({
+        direction: pendingDirection,
+        setupId: pending.setupId,
+        sourceField: "stopLoss",
+        startTime,
+        state: "historical",
+        type: "sl",
+        value: pending.stopLoss,
+      });
+      addLine({
+        direction: pendingDirection,
+        setupId: pending.setupId,
+        sourceField: "takeProfit",
+        startTime,
+        state: "historical",
+        type: "tp",
+        value: pending.takeProfit,
+      });
+    }
+  }
+
+  const setupDirection = canonicalDirection(setup?.direction);
+  const setupTrigger = Number(setup?.trigger);
+  const setupIsActive = setup?.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE || String(setup?.status ?? "").toUpperCase() === "PENDING";
+  const pendingSetupStillCurrent = pending && setup?.setupId && pending.setupId === setup.setupId && canonicalDirection(pendingDirection) === setupDirection && activePending;
+  if (setupIsActive && setup?.setupId && setupDirection && Number.isFinite(setupTrigger) && !livePosition && !pendingSetupStillCurrent) {
+    const startTime = Number(setup.benchmarkTime ?? setup.time ?? firstTime);
+    addLine({
+      direction: setupDirection,
+      setupId: setup.setupId,
+      sourceField: "trigger",
+      sourceInterval: interval,
+      sourceTime: setup.time,
+      startTime: Math.max(firstTime, startTime),
+      state: "current_setup",
+      type: "trigger",
+      value: setupTrigger,
+    });
+    addLine({
+      direction: setupDirection,
+      setupId: setup.setupId,
+      sourceField: "takeProfit",
+      sourceInterval: interval,
+      sourceTime: setup.time,
+      startTime: Math.max(firstTime, startTime),
+      state: "setup_target",
+      type: "tp",
+      value: setup.takeProfit ?? setup.targetPrice,
+    });
+  }
+
+  return lines;
+}
+
 function classifyMarkerReality({ activeAnalysisSession, markerSource, selectedHistoricalWindow }) {
   if (activeAnalysisSession) {
     return {
-      label: "SIMULATED BACKTEST TRADE",
-      note: "Backtest markers are simulated analysis objects, not exchange positions.",
+      label: "SYMULOWANA TRANSAKCJA Z BACKTESTU",
+      note: "Marker pochodzi z backtestu. Nie oznacza pozycji ani zlecenia na BingX.",
       tone: "simulated",
     };
   }
   if (selectedHistoricalWindow?.mode === "historical" || String(markerSource ?? "").includes("historical")) {
     return {
-      label: "HISTORICAL MARKER",
-      note: "This setup exists in chart history only. The bot may not have been online or armed then.",
+      label: "HISTORYCZNY SETUP",
+      note: "Sygnał istnieje w historii wykresu. Bot mógł wtedy nie działać live albo nie mieć uzbrojonego triggera.",
       tone: "stale",
     };
   }
   return {
-    label: "SIMULATED ENTRY",
-    note: "Chart strategy markers show calculated signals. Live execution requires the Sztab runner and BingX order state.",
+    label: "SYMULOWANY ENTRY",
+    note: "Marker pokazuje obliczony sygnał strategii na wykresie. Live wejście wymaga aktywnego Sztabu i zlecenia na BingX.",
     tone: "simulated",
   };
 }
@@ -364,12 +765,12 @@ function timelineFromRuntime(runtime = {}) {
   }));
   const lifecycle = (runtime.pendingTriggerOrder?.orderLifecycle ?? []).slice(-5).map((item) => ({
     time: item.time,
-    text: item.message ?? item.status ?? "Trigger order update",
+    text: polishLifecycleText(item),
   }));
   const setup = runtime.latestSetupEvent
     ? [{
         time: runtime.latestSetupEvent.time,
-        text: `${runtime.latestSetupEvent.direction ?? ""} setup observed (${runtime.latestSetupEvent.setupId ?? "no id"})`,
+        text: `Strategia zobaczyła setup ${polishSide(runtime.latestSetupEvent.direction)} (${runtime.latestSetupEvent.setupId ?? "bez id"}).`,
       }]
     : [];
   return [...setup, ...journal, ...lifecycle]
@@ -385,28 +786,30 @@ function timelineFromRuntime(runtime = {}) {
 function readableJournalText(item = {}) {
   const setup = item.setupId ? ` ${compactId(item.setupId)}` : "";
   const trigger = Number.isFinite(Number(item.triggerPrice)) ? ` @ ${formatChartPrice(item.triggerPrice)}` : "";
-  const side = item.side ? ` ${item.side}` : "";
+  const side = item.side ? ` ${polishSide(item.side)}` : "";
   switch (item.event) {
     case "order_accepted":
-      return `BingX accepted${side} trigger order${setup}${trigger}.`;
+      return `BingX zaakceptował trigger${side}${setup}${trigger}.`;
     case "order_terminal":
-      return `Exchange ended trigger order${setup}: ${item.reason ?? item.status ?? "terminal"}.`;
+      return `Zlecenie trigger zakończyło się na BingX: ${polishReason(item.reason ?? item.status ?? "terminal")}`;
     case "order_missing":
-      return `Trigger order${setup} is missing on exchange.`;
+      return `Zlecenie trigger${setup} nie istnieje już na BingX.`;
     case "order_canceled":
-      return `Pending trigger${setup} canceled: ${item.reason ?? "operator/replacement"}.`;
+      return `Oczekujący trigger${setup} został anulowany: ${polishReason(item.reason ?? "operator/replacement")}`;
     case "fill_detected_sl_placed":
-      return `Position fill detected${setup}; SL protection requested.`;
+      return `Wykryto fill pozycji${setup}; system wysłał ochronę SL.`;
     case "fill_detected_sl_failed":
-      return `Position fill detected${setup}; SL placement failed.`;
+      return `Wykryto fill pozycji${setup}, ale SL nie został potwierdzony.`;
     case "filled_but_position_missing":
-      return `Exchange reports fill${setup}, but no live position was found.`;
+      return `BingX zgłosił fill${setup}, ale świeży sync nie znalazł pozycji live.`;
     case "risk_blocked":
-      return `Risk blocked setup${setup}: ${item.reason ?? "risk manager"}.`;
+      return `Ryzyko zablokowało setup${setup}: ${polishReason(item.reason ?? "risk manager")}`;
     case "order_rejected":
-      return `BingX rejected trigger order${setup}: ${item.reason ?? "exchange rejection"}.`;
+      return `BingX odrzucił trigger${setup}: ${polishReason(item.reason ?? "exchange rejection")}`;
+    case "cancel_failed":
+      return `Nie udało się anulować triggera${setup}; sprawdź status BingX.`;
     default:
-      return `${item.event ?? item.status ?? "Runtime update"}${setup}${trigger}.`;
+      return `Aktualizacja scenariusza${setup}${trigger}: ${polishStatus(item.event ?? item.status ?? "runtime")}`;
   }
 }
 
@@ -427,11 +830,14 @@ function deriveOperationalState({
   const pendingStatus = String(pending?.status ?? runtime.triggerOrderState ?? "").toLowerCase();
   const markerReality = classifyMarkerReality({ activeAnalysisSession, markerSource, selectedHistoricalWindow });
   const setup = runtime.latestSetupEvent ?? null;
+  const setupIsActive = setup?.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE || String(setup?.status ?? "").toUpperCase() === "PENDING";
+  const intervalName = displayInterval(interval);
   const triggerPrice = Number(pending?.triggerPrice ?? setup?.trigger);
-  const side = pending?.direction ?? setup?.direction ?? positionSide(livePosition ?? {});
+  const side = canonicalDirection(pending?.direction, pending?.positionSide, pending?.side, setup?.direction, positionSide(livePosition ?? {}));
   const blockedReason = runtime.lastBlockedReason || pending?.terminalReason || pending?.failureClassification || runtime.lastDecisionReason || "";
+  const sideText = polishSide(side);
   const base = {
-    detail: runtime.lastDecision || runtime.lastDecisionReason || markerReality.note,
+    detail: markerReality.note,
     interval,
     markerReality,
     pending,
@@ -447,39 +853,48 @@ function deriveOperationalState({
     return {
       ...base,
       detail: protection.note,
-      headline: `${positionSide(livePosition)} position active`,
+      headline: `${intervalName}: pozycja ${polishSide(positionSide(livePosition))} aktywna`,
       rows: [
-        ["Entry", formatChartPrice(positionEntry(livePosition))],
+        ["Wejście", formatChartPrice(positionEntry(livePosition))],
         ["SL", formatChartPrice(livePosition.stopLoss)],
         ["PnL", formatChartPnl(positionPnl(livePosition))],
-        ["Qty", formatChartPrice(positionAmount(livePosition))],
-        ["Position confirmed", "yes"],
-        ["Protection confirmed", protection.confirmed ? "yes" : "no"],
-        ["Protection source", protection.source],
-        ["Protection order", protection.orderId ? compactId(protection.orderId) : "--"],
+        ["Ilość", formatChartPrice(positionAmount(livePosition))],
+        ["Pozycja live", "tak"],
+        ["SL potwierdzony", takNie(protection.confirmed)],
+        ["Źródło ochrony", polishProtectionSource(protection.source)],
+        ["Order ochrony", protection.orderId ? compactId(protection.orderId) : "--"],
       ],
       tags: [
-        { label: "LIVE POSITION", tone: "live" },
+        { label: "LIVE ENTRY — POZYCJA NA BINGX", tone: "live" },
         { label: protection.label, tone: protection.tone },
       ],
       tone: protection.confirmed ? "live" : "critical",
       visualObjects: [
-        { label: "LIVE POSITION", note: "Position comes from live BingX account state.", tone: "live" },
+        { label: "LIVE ENTRY — POZYCJA NA BINGX", note: "Pozycja pochodzi z live stanu BingX.", tone: "live" },
         { label: protection.label, note: protection.note, tone: protection.tone },
       ],
     };
   }
 
   if (status === "interrupted" || status === "error" || status === "recovering") {
+    const programError = runtime.error || runtime.lastError || "";
+    const interruptedByCode = Boolean(programError);
     return {
       ...base,
-      headline: status === "recovering" ? "Runner recovering" : "Runner interrupted, no live execution",
+      headline: status === "recovering"
+        ? `${intervalName}: runner odzyskuje stan`
+        : interruptedByCode
+          ? `${intervalName}: runner przerwany przez błąd programu`
+          : `${intervalName}: runner przerwany, brak live egzekucji`,
+      detail: interruptedByCode
+        ? `Runner przerwany przez błąd programu: ${programError}`
+        : "Sztab nie może teraz wysłać live zlecenia z tego interwału.",
       rows: [
-        ["Runtime", runtime.watchdogStatus ?? status],
-        ["Last error", runtime.error || runtime.lastError || "--"],
+        ["Stan", polishStatus(runtime.watchdogStatus ?? status)],
+        ["Błąd", programError || "--"],
       ],
       tags: [
-        { label: status === "error" ? "EXCHANGE/RUNNER FAILED" : "BOT OFFLINE AT SIGNAL", tone: "critical" },
+        { label: interruptedByCode ? "BŁĄD PROGRAMU RUNNERA" : status === "error" ? "BŁĄD RUNNERA / GIEŁDY" : "BOT BYŁ OFFLINE PRZY SYGNALE", tone: "critical" },
         { label: markerReality.label, tone: markerReality.tone },
       ],
       tone: "critical",
@@ -489,14 +904,14 @@ function deriveOperationalState({
   if (status !== "running") {
     return {
       ...base,
-      headline: "Bot offline for this interval",
-      detail: "Sztab runner is not running, so chart markers are simulated/historical only.",
+      headline: `${intervalName}: bot offline dla tego interwału`,
+      detail: "Sztab nie działa na tym interwale, więc sygnały na wykresie są historyczne albo symulowane.",
       rows: [
-        ["Runtime", status || "stopped"],
-        ["Last signal", setup?.setupId ? `${setup.direction} ${compactId(setup.setupId)}` : "--"],
+        ["Stan", polishStatus(status || "stopped")],
+        ["Ostatni sygnał", setup?.setupId ? `${polishSide(setup.direction)} ${compactId(setup.setupId)}` : "--"],
       ],
       tags: [
-        { label: "BOT OFFLINE AT SIGNAL", tone: "stale" },
+        { label: "BOT BYŁ OFFLINE PRZY SYGNALE", tone: "stale" },
         { label: markerReality.label, tone: markerReality.tone },
       ],
       tone: "stale",
@@ -507,85 +922,95 @@ function deriveOperationalState({
     const protection = liveProtectionState({ livePosition, pending, runtime });
     return {
       ...base,
-      headline: `${side ?? ""} setup armed`.trim() || "Setup armed",
-      detail: "Exchange-side trigger order is armed; waiting for trigger touch/fill confirmation.",
+      headline: `${intervalName}: bot oczekuje na trigger ${sideText}`,
+      detail: `Trigger live jest wystawiony/uzbrojony. Bot czeka, aż cena dotknie poziomu ${formatChartPrice(triggerPrice)} i BingX potwierdzi fill.`,
       rows: [
         ["Trigger", formatChartPrice(triggerPrice)],
-        ["Current chart price", formatChartPrice(currentPrice)],
-        ["Pending order", pending?.orderId ? compactId(pending.orderId) : "--"],
-        ["BingX status", runtime.lastExchangeStatus || pendingStatus],
-        ["Position confirmed", "no"],
-        ["SL state", protection.label],
+        ["Cena teraz", formatChartPrice(currentPrice)],
+        ["Zlecenie", pending?.orderId ? compactId(pending.orderId) : "--"],
+        ["Status BingX", polishStatus(runtime.lastExchangeStatus || pendingStatus)],
+        ["Pozycja live", "nie"],
+        ["Stan SL", protection.label],
       ],
       tags: [
-        { label: "LIVE PENDING TRIGGER", tone: "pending" },
-        { label: "Waiting for trigger touch", tone: "pending" },
+        { label: "LIVE TRIGGER NA BINGX", tone: "pending" },
+        { label: "CZEKA NA DOTKNIĘCIE TRIGGERA", tone: "pending" },
         { label: protection.label, tone: protection.tone },
       ],
       tone: "pending",
-      visualObjects: [{ label: "LIVE PENDING TRIGGER", note: "Pending trigger order is local runtime plus BingX order status.", tone: "pending" }],
+      visualObjects: [{ label: "LIVE TRIGGER NA BINGX", note: "To live zlecenie trigger/stop-market powiązane ze Sztabem i statusem BingX.", tone: "pending" }],
     };
   }
 
-  if (pending && isTerminalExchangeStatus(pendingStatus)) {
-    const protection = liveProtectionState({ livePosition, pending, runtime });
+  if (pending && isTerminalExchangeStatus(pendingStatus) && !setupIsActive) {
+    const superseded = Boolean(runtime.supersededBySetupId ?? pending.supersededBySetupId);
+    const failedTriggerLabel = `${superseded ? "SETUP ZASTĄPIONY PRZEZ NOWY" : `NIEUDANY TRIGGER ${sideText}`}`;
     return {
       ...base,
-      headline: pendingStatus === "filled_but_position_missing"
-        ? "Fill reported, position missing"
-        : "Trigger order failed on exchange",
-      detail: pendingStatus === "filled_but_position_missing"
-        ? "BingX reported executed quantity, but fresh sync did not find a matching position."
-        : `Pending trigger is terminal: ${pending.terminalReason ?? pending.failureClassification ?? pendingStatus}.`,
+      headline: superseded
+        ? `${intervalName}: poprzedni setup został zastąpiony`
+        : pendingStatus === "filled_but_position_missing"
+        ? `${intervalName}: fill zgłoszony, ale brak pozycji live`
+        : `${intervalName}: trigger zakończył się bez pozycji`,
+      detail: superseded
+        ? "Pojawił się nowy setup, więc poprzedni scenariusz i jego trigger zostały anulowane. To nie jest aktywna pozycja live."
+        : pendingStatus === "filled_but_position_missing"
+        ? "BingX zgłosił wykonanie, ale świeży sync nie znalazł odpowiadającej pozycji live. Ten scenariusz nie powinien blokować nowego setupu."
+        : `Zlecenie trigger zakończyło się terminalnie: ${polishReason(pending.terminalReason ?? pending.failureClassification ?? pendingStatus)}`,
       rows: [
-        ["Last trigger", formatChartPrice(pending.triggerPrice)],
-        ["Order", pending.orderId ? compactId(pending.orderId) : "--"],
-        ["Exchange status", runtime.lastExchangeStatus || pending.exchangeTerminalStatus || pendingStatus],
-        ["Executed qty", pending.executedQty ?? runtime.triggerOrderExecutedQty ?? "--"],
-        ["Can block new setup", runtime.activeScenarioCanBlockNewSetup ? "yes" : "no"],
-        ["Terminal reason", runtime.scenarioTerminalReason || pending.terminalReason || pending.failureClassification || pendingStatus],
-        ["Superseded by", runtime.supersededBySetupId ? compactId(runtime.supersededBySetupId) : "--"],
-        ["Protection source", protection.source],
+        ["Ostatni trigger", formatChartPrice(pending.triggerPrice)],
+        ["Zlecenie", pending.orderId ? compactId(pending.orderId) : "--"],
+        ["Status BingX", polishStatus(runtime.lastExchangeStatus || pending.exchangeTerminalStatus || pendingStatus)],
+        ["Wykonana ilość", pending.executedQty ?? runtime.triggerOrderExecutedQty ?? "--"],
+        ["Blokuje nowy setup", takNie(runtime.activeScenarioCanBlockNewSetup)],
+        ["Powód zakończenia", polishReason(runtime.scenarioTerminalReason || pending.terminalReason || pending.failureClassification || pendingStatus)],
+        ["Zastąpiony przez", runtime.supersededBySetupId ? compactId(runtime.supersededBySetupId) : "--"],
+        ["Pozycja live", "nie"],
       ],
       tags: [
-        { label: pendingStatus === "filled_but_position_missing" ? "LIVE POSITION UNKNOWN" : "EXCHANGE FAILED", tone: "critical" },
-        { label: "Next setup can arm", tone: runtime.canArmNextSetup ? "live" : "critical" },
-        { label: protection.label, tone: protection.tone },
+        { label: superseded ? "SETUP ZASTĄPIONY PRZEZ NOWY" : pendingStatus === "filled_but_position_missing" ? "BRAK POTWIERDZONEJ LIVE POZYCJI" : failedTriggerLabel, tone: superseded ? "stale" : "critical" },
+        { label: runtime.canArmNextSetup ? "NOWY SETUP MOŻE SIĘ UZBROIĆ" : "SCENARIUSZ NADAL BLOKUJE", tone: runtime.canArmNextSetup ? "live" : "critical" },
       ],
-      tone: "critical",
-      visualObjects: [{ label: "EXCHANGE FAILED", note: "Exchange returned a terminal trigger-order state.", tone: "critical" }],
+      tone: superseded ? "stale" : "critical",
+      visualObjects: [{
+        label: failedTriggerLabel,
+        note: superseded
+          ? "Stary scenariusz został anulowany, bo strategia wskazała nowszy setup."
+          : "BingX zwrócił terminalny status zlecenia trigger. To nie jest aktywna pozycja live.",
+        tone: superseded ? "stale" : "critical",
+      }],
     };
   }
 
   if (blockedReason.includes("risk") || blockedReason.includes("blocked") || pendingStatus === "risk_blocked") {
     return {
       ...base,
-      headline: `${side ?? ""} setup blocked`.trim() || "Setup blocked",
-      detail: blockedReason || "The runner rejected the setup before order placement.",
+      headline: `${intervalName}: setup ${sideText} zablokowany`,
+      detail: polishReason(blockedReason) || "Runner odrzucił setup przed wysłaniem zlecenia.",
       rows: [
         ["Trigger", formatChartPrice(triggerPrice)],
-        ["Current chart price", formatChartPrice(currentPrice)],
-        ["Reason", blockedReason || "--"],
+        ["Cena teraz", formatChartPrice(currentPrice)],
+        ["Powód", polishReason(blockedReason)],
       ],
-      tags: [{ label: "BLOCKED SETUP", tone: "blocked" }],
+      tags: [{ label: "SETUP ZABLOKOWANY", tone: "blocked" }],
       tone: "blocked",
-      visualObjects: [{ label: "BLOCKED SETUP", note: "Setup did not become an exchange order.", tone: "blocked" }],
+      visualObjects: [{ label: "SETUP ZABLOKOWANY", note: "Setup nie przeszedł do live zlecenia na BingX.", tone: "blocked" }],
     };
   }
 
   if (setup?.setupId) {
     return {
       ...base,
-      headline: `Waiting for ${setup.direction ?? "next"} trigger/order`,
-      detail: runtime.lastDecision || "A setup is visible in runner state, but no active exchange trigger is armed.",
+      headline: `${intervalName}: widać setup ${polishSide(setup.direction)}, ale brak live triggera`,
+      detail: "Setup jest widoczny w stanie strategii, ale nie ma aktywnego zlecenia trigger na BingX.",
       rows: [
         ["Setup", compactId(setup.setupId)],
         ["Trigger", formatChartPrice(setup.trigger)],
-        ["Current chart price", formatChartPrice(currentPrice)],
+        ["Cena teraz", formatChartPrice(currentPrice)],
       ],
       tags: [
-        { label: "SIMULATED ENTRY", tone: "simulated" },
-        { label: "No live trigger armed", tone: "stale" },
+        { label: "AKTYWNY CEL SETUPU", tone: "simulated" },
+        { label: "BRAK LIVE TRIGGERA", tone: "stale" },
       ],
       tone: "neutral",
     };
@@ -593,14 +1018,14 @@ function deriveOperationalState({
 
   return {
     ...base,
-    headline: "No valid setup",
-    detail: runtime.lastDecision || "Runner is healthy and waiting for the next benchmark/setup.",
+    headline: `${intervalName}: brak aktywnego setupu`,
+    detail: "Runner czeka na kolejną świecę benchmarkową albo nowy setup strategii.",
     rows: [
-      ["Runtime", runtime.watchdogStatus ?? "healthy"],
-      ["Last candle", runtime.lastClosedCandleTime ? formatChartTime(runtime.lastClosedCandleTime) : "--"],
-      ["Current chart price", formatChartPrice(currentPrice)],
+      ["Stan", polishStatus(runtime.watchdogStatus ?? "healthy")],
+      ["Ostatnia świeca", runtime.lastClosedCandleTime ? formatChartTime(runtime.lastClosedCandleTime) : "--"],
+      ["Cena teraz", formatChartPrice(currentPrice)],
     ],
-    tags: [{ label: "Waiting for benchmark candle", tone: "neutral" }],
+    tags: [{ label: "CZEKA NA ŚWIECĘ BENCHMARKOWĄ", tone: "neutral" }],
     tone: "neutral",
   };
 }
@@ -623,16 +1048,16 @@ function OperationalTelemetryPanel({
       data-compact={compact ? "true" : "false"}
       data-dock={dock}
       data-tone={selected.tone}
-      aria-label="Live operational state"
+      aria-label="Stan operacyjny live"
     >
       <div className="hubert-operational-panel__head">
         <div>
-          <strong>Operational state</strong>
-          <span>Live vs simulated status for Sztab intervals</span>
+          <strong>Stan operacyjny</strong>
+          <span>Co realnie dzieje się na interwałach Sztabu</span>
         </div>
         <div>
-          <button type="button" onClick={() => onToggleCompact?.()}>{compact ? "Expand" : "Compact"}</button>
-          <button type="button" onClick={() => onDock?.(dock === "left" ? "right" : "left")}>Dock {dock === "left" ? "right" : "left"}</button>
+          <button type="button" onClick={() => onToggleCompact?.()}>{compact ? "Rozwiń" : "Kompakt"}</button>
+          <button type="button" onClick={() => onDock?.(dock === "left" ? "right" : "left")}>{dock === "left" ? "Na prawo" : "Na lewo"}</button>
         </div>
       </div>
 
@@ -672,7 +1097,7 @@ function OperationalTelemetryPanel({
           </div>
 
           <div className="hubert-operational-section">
-            <strong>What the chart objects mean</strong>
+            <strong>Znaczenie linii i markerów</strong>
             {(selected.visualObjects ?? []).map((item, index) => (
               <span data-tone={item.tone} key={`${item.label}-${index}`}>
                 <b>{item.label}</b>
@@ -682,7 +1107,7 @@ function OperationalTelemetryPanel({
           </div>
 
           <div className="hubert-operational-section">
-            <strong>Readable timeline</strong>
+            <strong>Oś zdarzeń</strong>
             {(selected.timeline ?? []).length ? (selected.timeline ?? []).map((item, index) => (
               <span key={`${item.time ?? index}-${index}`}>
                 <b>{formatChartTime(item.time)}</b>
@@ -690,8 +1115,8 @@ function OperationalTelemetryPanel({
               </span>
             )) : (
               <span>
-                <b>Now</b>
-                <i>No setup/order lifecycle events have been recorded yet.</i>
+                <b>Teraz</b>
+                <i>Nie zapisano jeszcze zdarzeń setupu ani zleceń dla tego interwału.</i>
               </span>
             )}
           </div>
@@ -864,6 +1289,71 @@ function labelMarkers(markers = [], prefix = "") {
     ...marker,
     text: `${prefix} ${marker.text ?? ""}`.trim(),
   }));
+}
+
+function canonicalStrategyOverlayEvents(events = []) {
+  return events.filter((event) =>
+    event.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED ||
+    event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE ||
+    event.type === STRATEGY_EVENT_TYPES.SETUP_INVALIDATED ||
+    event.type === STRATEGY_EVENT_TYPES.SETUP_BLOCKED ||
+    event.type === STRATEGY_EVENT_TYPES.BENCHMARK_CONFIRMED
+  );
+}
+
+function overlayModeStrategyEvents(events = [], mode = "live") {
+  const normalized = normalizeOverlayMode(mode);
+  const relevant = canonicalStrategyOverlayEvents(events).filter((event) =>
+    event.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED ||
+    event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE ||
+    event.type === STRATEGY_EVENT_TYPES.SETUP_INVALIDATED
+  );
+
+  if (normalized === "live") return [];
+  if (normalized === "operational") return relevant.slice(-1);
+  if (normalized === "history") return relevant.slice(-12);
+  return relevant.slice(-MAX_STRATEGY_LINE_EVENTS);
+}
+
+function overlayModeMarkerEvents(events = [], mode = "live") {
+  const normalized = normalizeOverlayMode(mode);
+  const relevant = canonicalStrategyOverlayEvents(events);
+
+  if (normalized === "live") return [];
+  if (normalized === "operational") return relevant.slice(-1);
+  if (normalized === "history") return relevant.slice(-18);
+  return relevant.slice(-MAX_BACKTEST_CHART_MARKERS);
+}
+
+function overlayBacktestSettings(settings = defaultBacktestOverlaySettings, mode = "live") {
+  const normalized = normalizeOverlayMode(mode);
+
+  if (normalized === "debug") {
+    return {
+      ...settings,
+      showDebug: Boolean(settings.showDebug),
+    };
+  }
+
+  if (normalized === "history") {
+    return {
+      ...settings,
+      showDebug: false,
+      showExits: Boolean(settings.showExits),
+      showPnlLabels: false,
+    };
+  }
+
+  return {
+    ...settings,
+    showDebug: false,
+    showExits: false,
+    showPnlLabels: false,
+    showSelectedTradeSlTp: false,
+    showSlTp: false,
+    showTrades: false,
+    showVisibleTradeSlTp: false,
+  };
 }
 
 function sanitizeOverlayEvents(points = [], label = "overlay") {
@@ -1139,7 +1629,8 @@ export default function TradingViewChart() {
     cappedMarkers: 0,
     debugMarkers: 0,
     durationMs: 0,
-    markerSource: "No markers rendered yet",
+    hiddenInModeReason: "",
+    markerSource: "Brak markerów na wykresie",
     markers: 0,
     markerNote: "",
     renderedCandles: 0,
@@ -1152,6 +1643,7 @@ export default function TradingViewChart() {
   const [settings, setSettings] = useState(
     initialIndicatorSettings[persistedState.chartTimeframe ?? "15m"] ?? normalizeIndicatorSettings(persistedState.indicatorSettings),
   );
+  const [overlayMode, setOverlayMode] = useState(normalizeOverlayMode(persistedState.chartOverlayMode));
   const [sztabTelemetry, setSztabTelemetry] = useState(null);
   const [livestreamTelemetry, setLivestreamTelemetry] = useState(null);
   const [telemetryDock, setTelemetryDock] = useState("left");
@@ -1328,6 +1820,7 @@ export default function TradingViewChart() {
       state: "Unsaved changes",
     }));
     clearStrategyLines();
+    clearLiveOrderLines();
     strategyMarkersRef.current?.setMarkers([]);
     strategyCacheRef.current = { key: "", events: [] };
     setSelectedHistoricalWindow({
@@ -1553,6 +2046,7 @@ export default function TradingViewChart() {
     setSettings(nextSettings);
     if (interval !== selectedInterval) {
       clearStrategyLines();
+      clearLiveOrderLines();
       strategyMarkersRef.current?.setMarkers([]);
       strategyCacheRef.current = { key: "", events: [] };
       setSelectedHistoricalWindow({
@@ -1635,6 +2129,7 @@ export default function TradingViewChart() {
       const lastSavedAt = new Date().toISOString();
       writeStoredJson(PLATFORM_STORAGE_KEY, {
         chartTimeframe: selectedInterval,
+        chartOverlayMode: overlayMode,
         indicatorSettings: settings,
         indicatorSettingsByInterval: {
           ...indicatorSettingsByInterval,
@@ -1647,7 +2142,7 @@ export default function TradingViewChart() {
     }, 350);
 
     return () => window.clearTimeout(timeoutId);
-  }, [indicatorSettingsByInterval, selectedInterval, settings]);
+  }, [indicatorSettingsByInterval, overlayMode, selectedInterval, settings]);
 
   const clearStrategyLines = useCallback(() => {
     if (!chartRef.current) {
@@ -1656,12 +2151,16 @@ export default function TradingViewChart() {
     }
 
     strategyLineSeriesRef.current.forEach((series) => {
-      chartRef.current?.removeSeries(series);
+      try {
+        chartRef.current?.removeSeries(series);
+      } catch {
+        // lightweight-charts can throw during HMR/reload if a series has already been detached.
+      }
     });
     strategyLineSeriesRef.current = [];
   }, []);
 
-  const addStrategySegment = useCallback(({ color, lineStyle = 0, lineWidth = 1, value, startTime, endTime, showLabel }) => {
+  const addStrategySegment = useCallback(({ color, lineStyle = 0, lineWidth = 1, title = "", value, startTime, endTime, showLabel }) => {
     if (!chartRef.current) {
       return false;
     }
@@ -1679,6 +2178,7 @@ export default function TradingViewChart() {
       color,
       lineWidth,
       lineStyle,
+      title,
       priceLineVisible: false,
       lastValueVisible: showLabel,
       crosshairMarkerVisible: false,
@@ -1701,12 +2201,16 @@ export default function TradingViewChart() {
     }
 
     liveOrderLineSeriesRef.current.forEach((series) => {
-      chartRef.current?.removeSeries(series);
+      try {
+        chartRef.current?.removeSeries(series);
+      } catch {
+        // lightweight-charts can throw during HMR/reload if a series has already been detached.
+      }
     });
     liveOrderLineSeriesRef.current = [];
   }, []);
 
-  const addLiveOrderSegment = useCallback(({ color, lineStyle = 0, title = "", value, startTime, endTime }) => {
+  const addLiveOrderSegment = useCallback(({ color, lineStyle = 0, lineWidth = 2, title = "", value, startTime, endTime }) => {
     if (!chartRef.current || !Number.isFinite(Number(value))) {
       return false;
     }
@@ -1720,7 +2224,7 @@ export default function TradingViewChart() {
 
     const lineSeries = chartRef.current.addSeries(LineSeries, {
       color,
-      lineWidth: 2,
+      lineWidth,
       lineStyle,
       title,
       priceLineVisible: true,
@@ -1738,22 +2242,37 @@ export default function TradingViewChart() {
     return true;
   }, []);
 
+  useEffect(() => {
+    clearStrategyLines();
+    clearLiveOrderLines();
+    strategyMarkersRef.current?.setMarkers([]);
+    strategyCacheRef.current = { key: "", events: [] };
+    setChartRenderStats((current) => ({
+      ...current,
+      hiddenInModeReason: "",
+      markerSource: `Ładowanie nakładek dla ${displayInterval(selectedInterval)}`,
+      markers: 0,
+      skippedMarkers: 0,
+      slTpLines: 0,
+    }));
+  }, [clearLiveOrderLines, clearStrategyLines, selectedInterval]);
+
   const renderStrategyLines = useCallback(
-    (events, candles) => {
+    (events, candles, currentOverlayMode = "live") => {
       clearStrategyLines();
 
-      if (!settings.showSl && !settings.showTrigger) {
+      const normalizedMode = normalizeOverlayMode(currentOverlayMode);
+      const operationalMode = normalizedMode === "operational";
+      if (normalizedMode === "live" || (!operationalMode && !settings.showSl && !settings.showTrigger)) {
         return;
       }
 
-      events
-        .filter(
-          (event) =>
-            event.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED ||
-            (event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE && settings.showBenchmarks) ||
-            (event.type === STRATEGY_EVENT_TYPES.SETUP_INVALIDATED && settings.showNegated),
-        )
-        .slice(-MAX_STRATEGY_LINE_EVENTS)
+      overlayModeStrategyEvents(events, normalizedMode)
+        .filter((event) => {
+          if (event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE) return normalizedMode === "operational" || settings.showBenchmarks || normalizedMode === "debug";
+          if (event.type === STRATEGY_EVENT_TYPES.SETUP_INVALIDATED) return normalizedMode === "operational" || settings.showNegated || normalizedMode === "debug";
+          return true;
+        })
         .forEach((event) => {
           if (!Number.isFinite(event.trigger) || !Number.isFinite(event.stopLoss)) {
             return;
@@ -1762,31 +2281,53 @@ export default function TradingViewChart() {
           const startIndex = event.benchmarkIndex ?? event.index;
           const triggerEndIndex = Math.min(startIndex + 6, candles.length - 1);
           const stopEndIndex = Math.min(startIndex + 8, candles.length - 1);
-          const triggerEndTime = candles[triggerEndIndex]?.time ?? event.time;
-          const stopEndTime = candles[stopEndIndex]?.time ?? event.time;
-          const triggerColor = event.direction === "LONG" ? "#f5f5f5" : "#050505";
+	          const triggerEndTime = candles[triggerEndIndex]?.time ?? event.time;
+	          const stopEndTime = candles[stopEndIndex]?.time ?? event.time;
+	          const historyMode = normalizedMode === "history";
+            const direction = canonicalDirection(event.direction);
+	          const triggerColor = direction === "LONG"
+	            ? operationalMode ? "rgba(34, 197, 94, 0.72)" : "rgba(245, 245, 245, 0.24)"
+	            : operationalMode ? "rgba(239, 68, 68, 0.72)" : "rgba(5, 5, 5, 0.28)";
+          const stopColor = operationalMode ? "rgba(245, 125, 52, 0.6)" : "rgba(120, 24, 24, 0.18)";
           const startTime = event.benchmarkTime ?? event.time;
-
-          if (settings.showTrigger) {
-            addStrategySegment({
+          const historical = selectedHistoricalWindowRef.current?.mode === "historical";
+          const setupState = event.type === STRATEGY_EVENT_TYPES.SETUP_INVALIDATED
+            ? "ANULOWANY SETUP"
+            : event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE
+              ? "ACTIVE SETUP TARGET"
+              : "SYMULOWANY ENTRY";
+	          const triggerTitle = historical
+	            ? `HISTORYCZNY TRIGGER ${direction}`.trim()
+	            : `${setupState} — TRIGGER ${direction}`.trim();
+	          const slTitle = historical
+	            ? "HISTORYCZNY SL SYMULACJI"
+	            : event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE
+	              ? `AKTYWNY POZIOM SL SETUPU ${direction}`.trim()
+	              : "SYMULOWANY SL";
+	
+	          if (settings.showTrigger || operationalMode) {
+	            addStrategySegment({
               color: triggerColor,
-              lineWidth: 1,
+              lineStyle: historyMode ? 2 : 0,
+              lineWidth: operationalMode ? 2 : 1,
+              title: triggerTitle,
               value: event.trigger,
               startTime,
               endTime: triggerEndTime,
-              showLabel: false,
+              showLabel: normalizedMode === "debug",
             });
           }
 
-          if (settings.showSl) {
+	          if (settings.showSl && !operationalMode) {
             addStrategySegment({
-              color: "rgba(120, 24, 24, 0.72)",
+              color: stopColor,
               lineStyle: 2,
-              lineWidth: 1,
+              lineWidth: operationalMode ? 2 : 1,
+              title: slTitle,
               value: event.stopLoss,
               startTime,
               endTime: stopEndTime,
-              showLabel: true,
+              showLabel: false,
             });
           }
         });
@@ -1802,8 +2343,13 @@ export default function TradingViewChart() {
   );
 
   const renderBacktestLines = useCallback(
-    (result, overlaySettings, candles = []) => {
+    (result, overlaySettings, candles = [], currentOverlayMode = "live") => {
       clearStrategyLines();
+
+      const normalizedMode = normalizeOverlayMode(currentOverlayMode);
+      if (!["history", "debug"].includes(normalizedMode)) {
+        return 0;
+      }
 
       const selectedTradeId = overlaySettings.selectedTradeId;
       const showSelected = overlaySettings.showSelectedTradeSlTp && selectedTradeId;
@@ -1827,28 +2373,30 @@ export default function TradingViewChart() {
             : trade.exitTime ?? trade.entryTime;
 
 	          if (Number.isFinite(Number(trade.stopLoss))) {
-	            const rendered = addStrategySegment({
-	              color: "rgba(120, 24, 24, 0.72)",
-	              endTime,
-              lineStyle: 2,
-              lineWidth: 1,
-              showLabel: true,
-	              startTime,
-	              value: Number(trade.stopLoss),
-	            });
+		            const rendered = addStrategySegment({
+		              color: "rgba(120, 24, 24, 0.72)",
+		              endTime,
+	              lineStyle: 2,
+	              lineWidth: 1,
+	              showLabel: normalizedMode === "debug",
+	              title: "SYMULOWANY SL — BACKTEST",
+		              startTime,
+		              value: Number(trade.stopLoss),
+		            });
 	            if (rendered) linesRendered += 1;
 	          }
 	
 	          if (Number.isFinite(Number(trade.takeProfit))) {
-	            const rendered = addStrategySegment({
-	              color: "rgba(245, 245, 245, 0.78)",
-	              endTime,
-              lineStyle: 2,
-              lineWidth: 1,
-              showLabel: true,
-	              startTime,
-	              value: Number(trade.takeProfit),
-	            });
+		            const rendered = addStrategySegment({
+		              color: "rgba(89, 168, 255, 0.86)",
+		              endTime,
+	              lineStyle: 2,
+	              lineWidth: 1,
+	              showLabel: normalizedMode === "debug",
+	              title: "SYMULOWANY TP — BACKTEST",
+		              startTime,
+		              value: Number(trade.takeProfit),
+		            });
 	            if (rendered) linesRendered += 1;
 	          }
         });
@@ -1891,15 +2439,19 @@ export default function TradingViewChart() {
       lowerSeriesRef.current?.setData(lowerLine);
       realPriceSeriesRef.current.setData(realPriceLine);
 
+      const currentOverlayMode = normalizeOverlayMode(overlayMode);
+      const overlayModeText = overlayModeDefinition(currentOverlayMode).label;
+
       if (mode.analysisResult) {
+        const effectiveOverlaySettings = overlayBacktestSettings(mode.overlaySettings, currentOverlayMode);
         const markers = sanitizeMarkers(
-          labelMarkers(toBacktestAnalysisMarkers(mode.analysisResult, mode.overlaySettings, chartCandles), "BT SIM"),
+          labelMarkers(toBacktestAnalysisMarkers(mode.analysisResult, effectiveOverlaySettings, chartCandles), "BACKTEST"),
           "backtest analysis markers",
         );
         strategyMarkersRef.current?.setMarkers(markers);
-        const slTpLines = renderBacktestLines(mode.analysisResult, mode.overlaySettings, chartCandles);
-        const visibleTrades = visibleBacktestTrades(mode.analysisResult, chartCandles).length;
-        const debugMarkers = mode.overlaySettings?.showDebug
+        const slTpLines = renderBacktestLines(mode.analysisResult, effectiveOverlaySettings, chartCandles, currentOverlayMode);
+        const visibleTrades = renderedTradeCount(mode.analysisResult, chartCandles, effectiveOverlaySettings);
+        const debugMarkers = effectiveOverlaySettings?.showDebug
           ? markers.filter((marker) => String(marker.id ?? "").startsWith("analysis-debug")).length
           : 0;
         const totalTrades = mode.analysisResult?.trades?.length ?? 0;
@@ -1907,8 +2459,15 @@ export default function TradingViewChart() {
 		          cappedMarkers: Math.max(0, totalTrades - visibleTrades),
 		          debugMarkers,
 		          durationMs: Math.round(performance.now() - renderStartedAt),
-              markerNote: "Backtest analysis markers are visual audit markers, not live executable signals.",
-              markerSource: "backtest analysis marker",
+              hiddenInModeReason: currentOverlayMode === "live" && totalTrades > 0
+                ? "Markery backtestu są ukryte w LIVE ONLY, bo ten tryb pokazuje tylko realny stan live."
+                : currentOverlayMode === "operational" && totalTrades > markers.length
+                ? "Tryb OPERACYJNY nie pokazuje pełnej historii backtestu; przełącz HISTORIA/DEBUG."
+                : "",
+              markerNote: currentOverlayMode === "live"
+                ? "Tryb LIVE ONLY ukrywa markery backtestu, aby live stan był czytelny."
+                : "Markery backtestu są symulacją/analityką. Nie są live zleceniami ani pozycjami BingX.",
+	              markerSource: `${overlayModeText} · ${displayInterval(selectedInterval)} · markery analizy backtestu`,
 		          markers: markers.length,
 		          renderedCandles: chartCandles.length,
 		          skippedMarkers: Math.max(0, totalTrades - visibleTrades),
@@ -1924,9 +2483,10 @@ export default function TradingViewChart() {
           multiplier: renderSettings.envelopeMultiplier,
         });
         const lastClosedCandle = closedCandles[closedCandles.length - 1];
-        const strategyKey = [
-          closedCandles.length,
-          lastClosedCandle?.time ?? 0,
+	        const strategyKey = [
+            selectedInterval,
+	          closedCandles.length,
+	          lastClosedCandle?.time ?? 0,
           renderSettings.bandwidth,
           renderSettings.envelopeMultiplier,
           renderSettings.atrLength,
@@ -1957,23 +2517,30 @@ export default function TradingViewChart() {
           console.debug("Choromanski setup audit available at window.__CHOROMANSKI_SETUP_AUDIT__");
         }
 
-	        const markerEvents = filterStrategyEvents(strategyEvents, renderSettings);
-	        const cappedMarkerEvents = markerEvents.slice(-MAX_BACKTEST_CHART_MARKERS);
-        const markerLabelPrefix = selectedHistoricalWindowRef.current?.mode === "historical" ? "HIST" : "SIM";
+		        const markerEvents = canonicalStrategyOverlayEvents(strategyEvents);
+		        const cappedMarkerEvents = overlayModeMarkerEvents(markerEvents, currentOverlayMode);
+        const markerLabelPrefix = selectedHistoricalWindowRef.current?.mode === "historical" ? "HISTORIA" : "SYMULACJA";
 	        const strategyMarkers = sanitizeMarkers(labelMarkers(toStrategyMarkers(cappedMarkerEvents), markerLabelPrefix), "strategy markers");
 
 	        strategyMarkersRef.current?.setMarkers(strategyMarkers);
-	        renderStrategyLines(strategyEvents, closedCandles);
+		        renderStrategyLines(strategyEvents, closedCandles, currentOverlayMode);
 		        setChartRenderStats({
 		          cappedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
 		          debugMarkers: 0,
 		          durationMs: Math.round(performance.now() - renderStartedAt),
-              markerNote: selectedHistoricalWindowRef.current?.mode === "historical"
-                ? "Historical chart signals can be older than the live executable candle window."
-                : "Latest chart markers are executable only when they occur on the latest closed candle or one candle back.",
+              hiddenInModeReason: currentOverlayMode === "live" && markerEvents.length > 0
+                ? "Sygnały strategii są ukryte w LIVE ONLY, bo ten tryb pokazuje tylko realny stan live."
+                : currentOverlayMode === "operational" && markerEvents.length > cappedMarkerEvents.length
+                ? "Tryb OPERACYJNY pokazuje tylko najnowszy istotny sygnał; starsze są w HISTORIA/DEBUG."
+                : "",
+              markerNote: currentOverlayMode === "live"
+                ? "Tryb LIVE ONLY ukrywa historyczne/symulowane markery strategii. Zmień tryb na OPERACYJNY, HISTORIA albo DEBUG, żeby je zobaczyć."
+                : selectedHistoricalWindowRef.current?.mode === "historical"
+                ? "Historyczne sygnały na wykresie nie oznaczają, że bot był wtedy online."
+                : "Najnowsze markery są live-egzekwowalne tylko wtedy, gdy runner Sztabu widzi je w swoim aktualnym oknie decyzyjnym.",
               markerSource: selectedHistoricalWindowRef.current?.mode === "historical"
-                ? "historical chart signal"
-                : "live/latest chart signal window",
+                ? `${overlayModeText} · ${displayInterval(selectedInterval)} · historyczne sygnały wykresu`
+                : `${overlayModeText} · ${displayInterval(selectedInterval)} · okno live/najnowszych sygnałów`,
 		          markers: strategyMarkers.length,
 		          renderedCandles: chartCandles.length,
 		          skippedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
@@ -1985,7 +2552,7 @@ export default function TradingViewChart() {
         chartRef.current?.timeScale().fitContent();
       }
     },
-    [renderBacktestLines, renderStrategyLines, settings],
+    [overlayMode, renderBacktestLines, renderStrategyLines, selectedInterval, settings],
   );
 
   const scheduleLiveCandleUpdate = useCallback((candles) => {
@@ -2270,6 +2837,7 @@ export default function TradingViewChart() {
       setIsLoading(true);
       setError("");
       clearStrategyLines();
+      clearLiveOrderLines();
       strategyMarkersRef.current?.setMarkers([]);
 
       try {
@@ -2381,6 +2949,7 @@ export default function TradingViewChart() {
     const runtime = sztabTelemetry?.intervals?.[selectedInterval]?.runtime;
     const selectedConfig = sztabTelemetry?.config?.intervals?.[selectedInterval] ?? {};
     const pending = runtime?.pendingTriggerOrder;
+    const setup = runtime?.latestSetupEvent;
     const livePosition = positionsForOperationalState(livestreamTelemetry, selectedConfig)[0] ?? null;
     const protection = liveProtectionState({ livePosition, pending, runtime });
     const firstTime = rawCandles[0]?.time;
@@ -2388,31 +2957,44 @@ export default function TradingViewChart() {
 
     if (!runtime || !firstTime || !lastTime) return;
 
-    if (pending && ["accepted", "placed", "new", "pending_sync"].includes(String(pending.status ?? "").toLowerCase())) {
+    buildSemanticLiveOverlays({
+      firstTime,
+      interval: selectedInterval,
+      lastTime,
+      livePosition,
+      mode: overlayMode,
+      pending,
+      protection,
+      setup,
+    }).filter((line) => line.interval === selectedInterval).forEach((line) => {
+      const auditEntry = {
+        interval: selectedInterval,
+        label: line.label,
+        labelDirection: canonicalDirection(line.direction),
+        mode: overlayMode,
+        price: line.value,
+        semanticType: line.type,
+        setupId: line.setupId ?? pending?.setupId ?? setup?.setupId ?? "",
+        sourceDirection: canonicalDirection(line.direction),
+        sourceEventTimestamp: line.sourceTime ?? setup?.time ?? pending?.entryEvent?.time ?? null,
+        sourceField: line.sourceField,
+        sourceInterval: line.sourceInterval ?? selectedInterval,
+      };
+      globalThis.__CHOROMANSKI_OVERLAY_AUDIT__ = [
+        ...(globalThis.__CHOROMANSKI_OVERLAY_AUDIT__ ?? []).slice(-30),
+        auditEntry,
+      ];
       addLiveOrderSegment({
-        color: pending.direction === "LONG" ? "rgba(21, 152, 112, 0.95)" : "rgba(182, 50, 66, 0.95)",
-        endTime: lastTime,
-        startTime: Math.max(firstTime, Number(pending.entryEvent?.benchmarkTime ?? pending.entryEvent?.time ?? firstTime)),
-        title: "LIVE PENDING TRIGGER",
-        value: pending.triggerPrice,
+        color: line.color,
+        endTime: line.endTime,
+        lineStyle: line.lineStyle,
+        lineWidth: line.lineWidth,
+        startTime: line.startTime,
+        title: line.label,
+        value: line.value,
       });
-    }
-
-    if (protection.price && ["live", "critical", "stale"].includes(protection.tone)) {
-      addLiveOrderSegment({
-        color: protection.confirmed
-          ? "rgba(34, 197, 94, 0.95)"
-          : protection.label === "STALE SL STATE"
-            ? "rgba(148, 163, 184, 0.85)"
-            : "rgba(255, 83, 83, 0.95)",
-        endTime: lastTime,
-        lineStyle: 2,
-        startTime: Math.max(firstTime, Number(pending?.fillDetectedAt ? Math.floor(new Date(pending.fillDetectedAt).getTime() / 1000) : firstTime)),
-        title: protection.label,
-        value: protection.price,
-      });
-    }
-  }, [addLiveOrderSegment, clearLiveOrderLines, livestreamTelemetry, rawCandles, selectedInterval, sztabTelemetry]);
+    });
+  }, [addLiveOrderSegment, clearLiveOrderLines, livestreamTelemetry, overlayMode, rawCandles, selectedInterval, sztabTelemetry]);
 
   return (
     <main className="hubert-dashboard">
@@ -2558,24 +3140,38 @@ export default function TradingViewChart() {
         onClick={handleChartClick}
         onDoubleClick={resetChartView}
         ref={chartContainerRef}
-        title="Double-click to center chart on current range"
+        title="Kliknij dwukrotnie, aby wyśrodkować wykres na aktualnym zakresie"
       />
 
-      <div className="hubert-window-panel" aria-label="Chart window controls">
+      <div className="hubert-window-panel" aria-label="Kontrola okna wykresu">
         <strong>{dataDiagnostics.provider ?? "binance-futures"}</strong>
-        <span>{rawCandles.length} rendered / {fullHistoryDataset.length || dataDiagnostics.fullCandles || 0} loaded</span>
-        <span>{chartRenderStats.markers} markers · {chartRenderStats.slTpLines} lines · {chartRenderStats.durationMs}ms render</span>
+        <span>{rawCandles.length} świec na wykresie / {fullHistoryDataset.length || dataDiagnostics.fullCandles || 0} w pamięci</span>
+        <span>{chartRenderStats.markers} markerów · {chartRenderStats.slTpLines} linii · {chartRenderStats.durationMs}ms render</span>
         <span title={chartRenderStats.markerNote}>{chartRenderStats.markerSource}</span>
-        <span>{selectedHistoricalWindow.mode === "historical" ? "Viewing historical window" : "Live/latest window"}</span>
-        <span>Time: {DISPLAY_TIME_ZONE}</span>
+        {chartRenderStats.hiddenInModeReason && <span>{chartRenderStats.hiddenInModeReason}</span>}
+        <span>{selectedHistoricalWindow.mode === "historical" ? "Okno historyczne" : "Okno live/najnowsze"}</span>
+        <span>Czas: {DISPLAY_TIME_ZONE}</span>
+        <div className="hubert-overlay-mode" aria-label="Tryb nakładek wykresu">
+          {overlayModes.map((mode) => (
+            <button
+              data-active={overlayMode === mode.id}
+              key={mode.id}
+              onClick={() => setOverlayMode(mode.id)}
+              title={mode.note}
+              type="button"
+            >
+              {mode.label}
+            </button>
+          ))}
+        </div>
         <div>
           <input
-            aria-label="Jump to date"
+            aria-label="Skocz do daty"
             type="date"
             value={jumpDate}
             onChange={(event) => setJumpDate(event.target.value)}
           />
-          <button type="button" onClick={jumpToHistoricalDate}>Jump</button>
+          <button type="button" onClick={jumpToHistoricalDate}>Skocz</button>
         </div>
       </div>
 
@@ -2599,7 +3195,7 @@ export default function TradingViewChart() {
         data-active={measurementActive}
         onClick={toggleMeasurementTool}
         type="button"
-        aria-label="Ruler percent tool"
+        aria-label="Narzędzie pomiaru procentowego"
       >
         %
       </button>
@@ -2608,15 +3204,15 @@ export default function TradingViewChart() {
         className="hubert-reset-tool"
         onClick={resetChartView}
         type="button"
-        aria-label="Reset chart view"
-        title="Center chart on current backtest range and restore default zoom."
+        aria-label="Wyśrodkuj wykres"
+        title="Wyśrodkuj wykres na aktualnym zakresie i przywróć domyślny zoom."
       >
-        Reset View
+        Wyśrodkuj
       </button>
 
       {(isLoading || error) && (
         <div className="hubert-chart-state" role="status">
-          {error || "Loading SOLUSDT Binance data"}
+          {error || "Ładowanie danych SOLUSDT z Binance"}
         </div>
       )}
     </main>
@@ -2632,30 +3228,30 @@ function BacktestAnalysisBanner({ overlaySettings, renderStats, session, onAnaly
   const hasEndTrade = Boolean(session.result?.trades?.some((trade) => trade.exitReason === "END"));
 
   return (
-    <aside className="hubert-backtest-banner" aria-label="Backtest Analysis Mode">
+    <aside className="hubert-backtest-banner" aria-label="Tryb analizy backtestu">
       <div className="hubert-backtest-banner__head">
         <div>
-          <strong>Backtest Analysis Mode</strong>
+          <strong>Tryb analizy backtestu</strong>
           <span>
-            {session.strategyDeckName} · {session.mmDeckName} · {session.timeframe} · {tradeCount} trades
+            {session.strategyDeckName} · {session.mmDeckName} · {session.timeframe} · {tradeCount} transakcji
           </span>
-          <span>Viewing historical window from backtest: {formatChartTime(range.from)} → {formatChartTime(range.to)}</span>
-          <span>Full test range: {formatChartTime(fullRange.from)} → {formatChartTime(fullRange.to)}</span>
-          <span>{session.candles?.length ?? 0} chart candles · {session.backtestCandles?.length ?? session.result?.candlesUsed ?? "--"} backtest candles</span>
+          <span>Okno historyczne z backtestu: {formatChartTime(range.from)} → {formatChartTime(range.to)}</span>
+          <span>Pełny zakres testu: {formatChartTime(fullRange.from)} → {formatChartTime(fullRange.to)}</span>
+          <span>{session.candles?.length ?? 0} świec na wykresie · {session.backtestCandles?.length ?? session.result?.candlesUsed ?? "--"} świec backtestu</span>
           <span className={hasMismatch ? "hubert-backtest-banner__warning" : ""}>
-            Trades in table: {tradeCount} · rendered on chart: {renderedCount}
+            Transakcje w tabeli: {tradeCount} · pokazane na wykresie: {renderedCount}
           </span>
         </div>
         <div className="hubert-backtest-banner__actions">
-          <button type="button" onClick={onAnalyze}>Analyze on Chart</button>
-          <button type="button" onClick={onExit}>Exit Backtest Analysis</button>
+          <button type="button" onClick={onAnalyze}>Pokaż na wykresie</button>
+          <button type="button" onClick={onExit}>Wyjdź z analizy</button>
         </div>
       </div>
       <div className="hubert-backtest-banner__toggles">
         {[
-          ["showTrades", "Trades"],
-          ["showSelectedTradeSlTp", "Selected trade SL/TP"],
-          ["showPnlLabels", "PnL labels"],
+          ["showTrades", "Transakcje"],
+          ["showSelectedTradeSlTp", "SL/TP wybranej transakcji"],
+          ["showPnlLabels", "Etykiety PnL"],
         ].map(([key, label]) => (
           <label key={key}>
             <input
@@ -2667,41 +3263,41 @@ function BacktestAnalysisBanner({ overlaySettings, renderStats, session, onAnaly
           </label>
         ))}
         <details className="hubert-backtest-advanced">
-          <summary>Advanced / Debug</summary>
+          <summary>Szczegóły techniczne</summary>
           <label>
             <input checked={Boolean(overlaySettings.showExits)} type="checkbox" onChange={(event) => onToggle("showExits", event.target.checked)} />
-            <span>Exit markers</span>
+            <span>Markery wyjścia</span>
           </label>
           <label>
             <input checked={Boolean(overlaySettings.showVisibleTradeSlTp || overlaySettings.showSlTp)} type="checkbox" onChange={(event) => onToggle("showVisibleTradeSlTp", event.target.checked)} />
-            <span>SL/TP for visible trades</span>
+            <span>SL/TP widocznych transakcji</span>
           </label>
           <label>
             <input checked={Boolean(overlaySettings.showDebug)} type="checkbox" onChange={(event) => onToggle("showDebug", event.target.checked)} />
-            <span>Skipped/debug markers</span>
+            <span>Pominięte markery diagnostyczne</span>
           </label>
           <span>
-            Rendered: {renderStats?.renderedCandles ?? 0} candles · {renderStats?.markers ?? 0} markers · {renderStats?.slTpLines ?? 0} lines · {renderStats?.durationMs ?? 0}ms
+            Render: {renderStats?.renderedCandles ?? 0} świec · {renderStats?.markers ?? 0} markerów · {renderStats?.slTpLines ?? 0} linii · {renderStats?.durationMs ?? 0}ms
           </span>
         </details>
       </div>
       {hasMismatch && (
         <div className="hubert-backtest-banner__warning">
-          Chart markers are capped to keep zoom and pan responsive. The table remains the full record.
+          Markery na wykresie są ograniczone dla płynnego zoomu i przesuwania. Tabela nadal zawiera pełny zapis.
         </div>
       )}
       {hasEndTrade && (
         <div className="hubert-backtest-banner__warning">
-          END means a trade was still open when the test range ended. It is not a live open position.
+          END oznacza, że symulowana transakcja była nadal otwarta na końcu zakresu testu. To nie jest live pozycja.
         </div>
       )}
       {overlaySettings.showDebug && (
         <div className="hubert-backtest-legend">
-          <span><b />HA missing = Heikin Ashi confirmation missing</span>
-          <span><b />Candidate = setup candidate checked</span>
-          <span><b />In position = already in a trade/setup</span>
-          <span><b />SL limiter = blocked by same-side SL limit</span>
-          <span><b />MM invalid = sizing/money management invalid</span>
+          <span><b />Brak HA = brak potwierdzenia Heikin Ashi</span>
+          <span><b />Kandydat = sprawdzony kandydat setupu</span>
+          <span><b />W pozycji = strategia była już w setupie/transakcji</span>
+          <span><b />Limiter SL = blokada po serii SL po tej samej stronie</span>
+          <span><b />MM nieważny = błędny sizing / money management</span>
         </div>
       )}
     </aside>

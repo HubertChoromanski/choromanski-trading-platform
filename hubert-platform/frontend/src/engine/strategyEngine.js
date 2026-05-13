@@ -1031,71 +1031,103 @@ export function filterStrategyEvents(events, display) {
   });
 }
 
+function canonicalEventDirection(value = "") {
+  const direction = String(value || "").toUpperCase();
+  if (direction.includes("LONG") || direction === "BUY") return "LONG";
+  if (direction.includes("SHORT") || direction === "SELL") return "SHORT";
+  return direction;
+}
+
+function warnMarkerDirectionMismatch(event = {}, text = "") {
+  const direction = canonicalEventDirection(event.direction);
+  if (direction !== "LONG" && direction !== "SHORT") return;
+  const opposite = direction === "LONG" ? "SHORT" : "LONG";
+  if (String(text).toUpperCase().includes(opposite) && !String(text).toUpperCase().includes(direction)) {
+    console.warn("Choromanski marker direction mismatch", {
+      direction,
+      setupId: event.setupId,
+      text,
+      type: event.type,
+    });
+  }
+}
+
 export function toStrategyMarkers(events) {
   return events.map((event) => {
+    const direction = canonicalEventDirection(event.direction);
     if (
       event.type === STRATEGY_EVENT_TYPES.BENCHMARK_CONFIRMED &&
-      event.direction === "LONG"
+      direction === "LONG"
     ) {
+      const text = "L";
+      warnMarkerDirectionMismatch(event, text);
       return {
         id: `benchmark-long-${event.setupId}`,
         time: event.time,
         position: "belowBar",
         shape: "circle",
         color: "#f5f5f5",
-        text: "L",
+        text,
         size: 0.62,
       };
     }
 
     if (
       event.type === STRATEGY_EVENT_TYPES.BENCHMARK_CONFIRMED &&
-      event.direction === "SHORT"
+      direction === "SHORT"
     ) {
+      const text = "S";
+      warnMarkerDirectionMismatch(event, text);
       return {
         id: `benchmark-short-${event.setupId}`,
         time: event.time,
         position: "aboveBar",
         shape: "circle",
         color: "#050505",
-        text: "S",
+        text,
         size: 0.62,
       };
     }
 
-    if (event.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED && event.direction === "LONG") {
+    if (event.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED && direction === "LONG") {
+      const text = "LONG";
+      warnMarkerDirectionMismatch(event, text);
       return {
         id: `entry-long-${event.setupId}`,
         time: event.time,
         position: "belowBar",
         shape: "arrowUp",
         color: "#f5f5f5",
-        text: "LONG",
+        text,
         size: 1,
       };
     }
 
-    if (event.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED && event.direction === "SHORT") {
+    if (event.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED && direction === "SHORT") {
+      const text = "SHORT";
+      warnMarkerDirectionMismatch(event, text);
       return {
         id: `entry-short-${event.setupId}`,
         time: event.time,
         position: "aboveBar",
         shape: "arrowDown",
         color: "#050505",
-        text: "SHORT",
+        text,
         size: 1,
       };
     }
 
+    const text = event.type === STRATEGY_EVENT_TYPES.SETUP_BLOCKED
+      ? `${direction} BLOCKED`
+      : `${direction || "SETUP"} ${event.type === STRATEGY_EVENT_TYPES.SETUP_INVALIDATED ? "X" : "SETUP"}`;
+    warnMarkerDirectionMismatch(event, text);
     return {
       id: `${event.type.toLowerCase()}-${event.setupId}`,
       time: event.time,
-      position: event.direction === "LONG" ? "belowBar" : "aboveBar",
+      position: direction === "LONG" ? "belowBar" : "aboveBar",
       shape: "square",
-      color: "rgba(120, 24, 24, 0.68)",
-      text: event.type === STRATEGY_EVENT_TYPES.SETUP_BLOCKED
-        ? `${event.direction} BLOCKED`
-        : "X",
+      color: direction === "LONG" ? "rgba(34, 197, 94, 0.72)" : "rgba(239, 68, 68, 0.72)",
+      text,
       size: 0.58,
     };
   });
