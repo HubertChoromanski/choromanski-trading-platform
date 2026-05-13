@@ -1,4 +1,4 @@
-import { processLiveProfileExecution } from "../execution/executionEngine.js";
+import { cancelLivePendingTriggerOrder, processLiveProfileExecution } from "../execution/executionEngine.js";
 import { runStrategyForProfile, runStrategyOnCandles } from "../strategy/strategyRunner.js";
 
 export const SZTAB_INTERVALS = ["10m", "15m", "20m", "30m", "1h"];
@@ -120,7 +120,20 @@ function defaultIntervalConfig(interval) {
       lastLoopDurationMs: null,
       lastTickAt: null,
       lastOrderAttempt: null,
+      pendingTriggerOrder: null,
+      canArmNextSetup: true,
+      exchangeTerminalStatus: "",
+      lastExchangeStatus: "",
+      lastStatusCheckAt: null,
+      lastTriggerFailureReason: "",
       lastBlockedReason: "",
+      pendingOrderAgeSeconds: null,
+      slPlacementStatus: "",
+      setupOrderJournal: [],
+      triggerFailureClassification: "",
+      triggerOrderFillDetected: false,
+      triggerOrderExecutedQty: null,
+      triggerOrderState: "none",
       latestEntryEvent: null,
       latestSetupEvent: null,
       lastSignal: null,
@@ -210,6 +223,8 @@ function setIntervalConfig(config, interval, patch) {
 
 function configToProfile(config, existing = {}) {
   const riskPerSl = numberValue(config.mm?.riskPerSlPercent ?? config.mm?.oneSlPercent, 1);
+  const runtimeLive = config.runtime ?? {};
+  const existingLive = existing.live ?? {};
 
   return {
     ...existing,
@@ -223,7 +238,15 @@ function configToProfile(config, existing = {}) {
     enabled: true,
     executionMode: "live",
     id: `sztab-${config.interval}`,
-    live: existing.live ?? { lastProcessedSetupId: null, openPosition: null, orderLog: [] },
+    live: {
+      lastProcessedSetupId: null,
+      openPosition: null,
+      orderLog: [],
+      setupOrderJournal: runtimeLive.setupOrderJournal ?? [],
+      ...existingLive,
+      pendingTriggerOrder: existingLive.pendingTriggerOrder ?? runtimeLive.pendingTriggerOrder ?? null,
+      setupOrderJournal: existingLive.setupOrderJournal ?? runtimeLive.setupOrderJournal ?? [],
+    },
     liveModeEnabled: true,
     locked: true,
     paper: existing.paper ?? { equity: 0, lastProcessedSetupId: null, openPosition: null, realizedPnl: 0, tradesToday: 0 },
@@ -330,6 +353,7 @@ export function createSztabRunner({
   store,
 }) {
   const timers = new Map();
+  const triggerWatchers = new Map();
   const liveProfiles = new Map();
 
   async function persistRuntime(interval, patch) {
@@ -597,7 +621,7 @@ export function createSztabRunner({
       const exchangePositions = normalizeExchangeList(await client.getOpenPositions(profile.symbol))
         .filter((position) => compactSymbol(position.symbol) === compactSymbol(profile.symbol) && positionAmount(position) > 0);
 
-      if (exchangePositions.length > 0 && !profile.live?.openPosition) {
+      if (exchangePositions.length > 0 && !profile.live?.openPosition && !profile.live?.pendingTriggerOrder) {
         await persistRuntime(interval, {
           ...executionDiagnostics,
           intervalBlockers: [],
@@ -672,14 +696,25 @@ export function createSztabRunner({
       const lastOrderAttempt = updatedProfile.live?.orderLog?.at?.(-1) ?? null;
       const lastExchangeResponse = lastOrderAttempt
         ? {
-            marketOrder: lastOrderAttempt.marketOrder ?? null,
-            stopOrder: lastOrderAttempt.stopOrder ?? null,
-            takeProfitOrder: lastOrderAttempt.takeProfitOrder ?? null,
-            time: lastOrderAttempt.time ?? null,
-          }
+          marketOrder: lastOrderAttempt.marketOrder ?? null,
+          triggerOrder: lastOrderAttempt.triggerOrder ?? null,
+          stopOrder: lastOrderAttempt.stopOrder ?? null,
+          takeProfitOrder: lastOrderAttempt.takeProfitOrder ?? null,
+          time: lastOrderAttempt.time ?? null,
+        }
         : null;
+      const pendingTriggerOrder = updatedProfile.live?.pendingTriggerOrder ?? null;
+      const triggerOrderState = pendingTriggerOrder?.status ?? "none";
+      const triggerSummary = triggerRuntimeSummary(pendingTriggerOrder, updatedProfile.live);
+      if (isActivePendingTrigger(pendingTriggerOrder)) {
+        scheduleTriggerWatcher(interval);
+      } else {
+        clearTriggerWatcher(interval);
+      }
       const lastDecisionReason = lastSignal
         ? "fresh_executable_entry_signal"
+        : pendingTriggerOrder
+          ? `trigger_order_${triggerOrderState}`
         : latestEntryEvent
           ? "latest_entry_signal_is_historical_or_stale"
           : "no_entry_signal";
@@ -702,17 +737,46 @@ export function createSztabRunner({
           : null,
         lastBlockedReason: "",
         lastClosedCandleTime: strategyResult.diagnostics?.lastClosedCandleTime ?? lastCandle?.time ?? null,
-        lastDecision: lastSignal ? `Latest ${lastSignal.direction} signal ${lastSignal.setupId}` : "No fresh entry signal on latest closed candle.",
+        lastDecision: pendingTriggerOrder
+          ? triggerOrderDecisionText(pendingTriggerOrder)
+          : lastSignal
+            ? `Latest ${lastSignal.direction} signal ${lastSignal.setupId}`
+            : "No fresh entry signal on latest closed candle.",
         lastDecisionReason,
         lastError: "",
-        lastExchangeResponse,
+        lastExchangeResponse: lastExchangeResponse ?? (pendingTriggerOrder?.lastOrderStatus
+          ? {
+              orderStatus: pendingTriggerOrder.lastOrderStatus,
+              triggerOrder: pendingTriggerOrder.exchangeResponse ?? null,
+              time: pendingTriggerOrder.lastStatusCheckAt ?? pendingTriggerOrder.updatedAt ?? nowIso(),
+            }
+          : null),
         lastLoopDurationMs: Date.now() - loopStartedAt,
         lastOrderAttempt,
         lastSignal,
         lastSyncAt: nowIso(),
+        pendingTriggerOrder,
+        canArmNextSetup: triggerSummary.canArmNextSetup,
+        exchangeTerminalStatus: triggerSummary.exchangeTerminalStatus,
+        lastExchangeStatus: triggerSummary.lastExchangeStatus,
+        lastStatusCheckAt: triggerSummary.lastStatusCheckAt,
+        lastTriggerFailureReason: triggerSummary.lastTriggerFailureReason,
         latestEntryEvent,
         latestSetupEvent,
+        pendingOrderAgeSeconds: triggerSummary.pendingOrderAgeSeconds,
         profileConnected: publicProfile?.status === "connected",
+        slPlacementStatus: pendingTriggerOrder?.status === "filled_protected"
+          ? "placed"
+          : pendingTriggerOrder?.status === "filled_sl_failed"
+            ? "failed"
+            : pendingTriggerOrder?.stopOrder
+              ? "placed"
+              : "not_placed",
+        setupOrderJournal: triggerSummary.setupOrderJournal,
+        triggerFailureClassification: triggerSummary.triggerFailureClassification,
+        triggerOrderExecutedQty: triggerSummary.triggerOrderExecutedQty,
+        triggerOrderFillDetected: triggerSummary.triggerOrderFillDetected,
+        triggerOrderState,
         validNweBandCount: strategyResult.diagnostics?.validNweBandCount ?? 0,
       });
 
@@ -743,6 +807,212 @@ export function createSztabRunner({
     if (timer) {
       clearInterval(timer);
       timers.delete(interval);
+    }
+  }
+
+  function isActivePendingTrigger(order) {
+    return ["accepted", "placed", "new", "partially_filled", "pending_sync"].includes(String(order?.status ?? "").toLowerCase());
+  }
+
+  function triggerRuntimeSummary(pending, live = {}) {
+    const isActive = isActivePendingTrigger(pending);
+    const status = String(pending?.status ?? "none");
+    return {
+      canArmNextSetup: pending ? Boolean(pending.canArmNextSetup ?? !isActive) : true,
+      exchangeTerminalStatus: pending?.exchangeTerminalStatus ?? (pending?.terminal ? pending?.lastExchangeStatus ?? status : ""),
+      lastExchangeStatus: pending?.lastExchangeStatus ?? "",
+      lastStatusCheckAt: pending?.lastStatusCheckAt ?? null,
+      lastTriggerFailureReason: pending?.terminalReason ?? pending?.failureClassification ?? pending?.critical ?? "",
+      pendingOrderAgeSeconds: pending?.acceptedAt || pending?.updatedAt || pending?.createdAt
+        ? secondsSinceIso(pending.acceptedAt ?? pending.updatedAt ?? pending.createdAt)
+        : null,
+      setupOrderJournal: (live?.setupOrderJournal ?? []).slice(-100),
+      triggerFailureClassification: pending?.failureClassification ?? "",
+      triggerOrderExecutedQty: pending?.executedQty ?? null,
+      triggerOrderFillDetected: ["filled_protected", "filled_sl_failed", "filled_but_position_missing"].includes(status.toLowerCase()),
+      triggerOrderState: status,
+    };
+  }
+
+  function triggerOrderDecisionText(pending) {
+    const status = String(pending?.status ?? "none").toLowerCase();
+    if (!pending) return "No pending trigger order.";
+    if (status === "filled_protected") return "Trigger order fill detected; SL protection placement requested.";
+    if (status === "filled_sl_failed") return "Trigger order filled but SL placement failed. Manual crisis management required.";
+    if (status === "filled_but_position_missing") return "Trigger order reports fill, but no matching position was found after sync.";
+    if (pending.terminal || ["terminal_failed", "canceled", "cancelled", "expired", "rejected", "missing"].includes(status)) {
+      return `Trigger order terminal: ${pending.terminalReason ?? pending.failureClassification ?? status}.`;
+    }
+    return "Pending trigger order is still waiting for fill.";
+  }
+
+  function clearTriggerWatcher(interval) {
+    const watcher = triggerWatchers.get(interval);
+    if (watcher) {
+      clearInterval(watcher);
+      triggerWatchers.delete(interval);
+    }
+  }
+
+  function scheduleTriggerWatcher(interval) {
+    if (triggerWatchers.has(interval)) return;
+    triggerWatchers.set(interval, setInterval(() => {
+      pollPendingTrigger(interval).catch((error) => {
+        appendLog("Sztab trigger watcher error", {
+          error: error instanceof Error ? error.message : String(error),
+          interval,
+        }).catch(() => {});
+      });
+    }, Number(process.env.SZTAB_TRIGGER_WATCH_MS || 5_000)));
+  }
+
+  async function pollPendingTrigger(interval) {
+    const config = normalizeConfig(store.getSztabConfig());
+    const current = config.intervals[interval];
+    const existingProfile = liveProfiles.get(interval);
+    const pending = existingProfile?.live?.pendingTriggerOrder ?? current?.runtime?.pendingTriggerOrder ?? null;
+
+    if (!current || current.runtime?.status !== "running" || !isActivePendingTrigger(pending)) {
+      clearTriggerWatcher(interval);
+      return null;
+    }
+
+    const client = getApiProfileClient(current.apiProfile);
+    const profile = configToProfile(current, existingProfile ?? {
+      live: {
+        pendingTriggerOrder: pending,
+      },
+    });
+    const updatedProfile = await processLiveProfileExecution({
+      bingxClient: client,
+      logger: (message, context) => appendLog(message, { interval, profileId: profile.id, ...context }),
+      profile,
+      store,
+      strategyResult: {
+        latestSetupEvent: null,
+        sourceCandles: [],
+        strategy: { events: [] },
+      },
+    });
+    liveProfiles.set(interval, updatedProfile);
+
+    const nextPending = updatedProfile.live?.pendingTriggerOrder ?? null;
+    const lastOrderAttempt = updatedProfile.live?.orderLog?.at?.(-1) ?? null;
+    const triggerSummary = triggerRuntimeSummary(nextPending, updatedProfile.live);
+    await persistRuntime(interval, {
+      heartbeatAt: nowIso(),
+      lastDecision: triggerOrderDecisionText(nextPending),
+      lastDecisionReason: `trigger_order_${nextPending?.status ?? "none"}`,
+      lastExchangeResponse: lastOrderAttempt
+        ? {
+            orderStatus: nextPending?.lastOrderStatus ?? null,
+            stopOrder: lastOrderAttempt.stopOrder ?? nextPending?.stopOrder ?? null,
+            takeProfitOrder: lastOrderAttempt.takeProfitOrder ?? nextPending?.takeProfitOrder ?? null,
+            triggerOrder: lastOrderAttempt.triggerOrder ?? nextPending?.exchangeResponse ?? null,
+            time: lastOrderAttempt.time ?? nowIso(),
+          }
+        : nextPending?.lastOrderStatus
+          ? {
+              orderStatus: nextPending.lastOrderStatus,
+              triggerOrder: nextPending.exchangeResponse ?? null,
+              time: nextPending.lastStatusCheckAt ?? nextPending.updatedAt ?? nowIso(),
+            }
+          : current.runtime?.lastExchangeResponse ?? null,
+      lastOrderAttempt,
+      pendingTriggerOrder: nextPending,
+      canArmNextSetup: triggerSummary.canArmNextSetup,
+      exchangeTerminalStatus: triggerSummary.exchangeTerminalStatus,
+      lastExchangeStatus: triggerSummary.lastExchangeStatus,
+      lastStatusCheckAt: triggerSummary.lastStatusCheckAt,
+      lastTriggerFailureReason: triggerSummary.lastTriggerFailureReason,
+      pendingOrderAgeSeconds: triggerSummary.pendingOrderAgeSeconds,
+      setupOrderJournal: triggerSummary.setupOrderJournal,
+      slPlacementStatus: nextPending?.status === "filled_protected"
+        ? "placed"
+        : nextPending?.status === "filled_sl_failed"
+          ? "failed"
+          : "not_placed",
+      triggerFailureClassification: triggerSummary.triggerFailureClassification,
+      triggerOrderExecutedQty: triggerSummary.triggerOrderExecutedQty,
+      triggerOrderFillDetected: triggerSummary.triggerOrderFillDetected,
+      triggerOrderState: triggerSummary.triggerOrderState,
+    });
+
+    if (!isActivePendingTrigger(nextPending)) {
+      clearTriggerWatcher(interval);
+    }
+
+    return updatedProfile;
+  }
+
+  async function cancelPendingTriggerForInterval(interval, reason = "interval_stopped") {
+    const config = normalizeConfig(store.getSztabConfig());
+    const current = config.intervals[interval];
+    const existingProfile = liveProfiles.get(interval);
+    const pending = existingProfile?.live?.pendingTriggerOrder ?? current?.runtime?.pendingTriggerOrder ?? null;
+
+    if (!pending || !["accepted", "placed", "new", "partially_filled"].includes(String(pending.status ?? "").toLowerCase())) {
+      return null;
+    }
+
+    try {
+      const client = getApiProfileClient(current.apiProfile);
+      const profile = configToProfile(current, existingProfile ?? {
+        live: {
+          pendingTriggerOrder: pending,
+        },
+      });
+      const updatedProfile = await cancelLivePendingTriggerOrder({
+        bingxClient: client,
+        logger: (message, context) => appendLog(message, { interval, profileId: profile.id, ...context }),
+        profile,
+        reason,
+      });
+      liveProfiles.set(interval, updatedProfile);
+      const pendingAfterCancel = updatedProfile.live?.pendingTriggerOrder ?? null;
+      const triggerSummary = triggerRuntimeSummary(pendingAfterCancel, updatedProfile.live);
+      await persistRuntime(interval, {
+        lastDecision: `Pending trigger order ${pendingAfterCancel?.status ?? "cancel requested"}: ${reason}.`,
+        lastDecisionReason: "pending_trigger_cancelled",
+        pendingTriggerOrder: pendingAfterCancel,
+        canArmNextSetup: triggerSummary.canArmNextSetup,
+        exchangeTerminalStatus: triggerSummary.exchangeTerminalStatus,
+        lastExchangeStatus: triggerSummary.lastExchangeStatus,
+        lastStatusCheckAt: triggerSummary.lastStatusCheckAt,
+        lastTriggerFailureReason: triggerSummary.lastTriggerFailureReason,
+        pendingOrderAgeSeconds: triggerSummary.pendingOrderAgeSeconds,
+        setupOrderJournal: triggerSummary.setupOrderJournal,
+        triggerFailureClassification: triggerSummary.triggerFailureClassification,
+        triggerOrderExecutedQty: triggerSummary.triggerOrderExecutedQty,
+        triggerOrderFillDetected: triggerSummary.triggerOrderFillDetected,
+        triggerOrderState: triggerSummary.triggerOrderState,
+      });
+      return updatedProfile.live?.pendingTriggerOrder ?? null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await persistRuntime(interval, {
+        lastError: message,
+        pendingTriggerOrder: {
+          ...pending,
+          canArmNextSetup: true,
+          cancelReason: reason,
+          error: message,
+          failureClassification: "trigger_order_cancel_failed",
+          lastExchangeStatus: "CANCEL_FAILED",
+          lastStatusCheckAt: nowIso(),
+          terminalReason: "trigger_order_cancel_failed",
+          status: "cancel_failed",
+          updatedAt: nowIso(),
+        },
+        canArmNextSetup: true,
+        lastExchangeStatus: "CANCEL_FAILED",
+        lastStatusCheckAt: nowIso(),
+        lastTriggerFailureReason: "trigger_order_cancel_failed",
+        triggerFailureClassification: "trigger_order_cancel_failed",
+        triggerOrderState: "cancel_failed",
+      });
+      await appendLog("Sztab pending trigger cancel failed", { error: message, interval, reason });
+      return null;
     }
   }
 
@@ -795,6 +1065,8 @@ export function createSztabRunner({
     }
 
     clearTimer(interval);
+    clearTriggerWatcher(interval);
+    await cancelPendingTriggerForInterval(interval, "interval_stopped_by_operator");
     await persistRuntime(interval, {
       ...clearTransientBlockers(),
       intervalBlockers: [{

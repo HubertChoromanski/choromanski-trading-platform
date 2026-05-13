@@ -64,6 +64,31 @@ function positionQuantity(position) {
   ));
 }
 
+export function buildTriggerMarketOrderPayload(symbol, side, stopPrice, quantity, options = {}) {
+  const normalizedSide = String(side ?? "").toUpperCase();
+  const positionSide = normalizePositionSide(options.positionSide) ?? entrySideToPositionSide(normalizedSide);
+  const payload = {
+    positionSide,
+    quantity,
+    side: normalizedSide,
+    stopPrice,
+    symbol: normalizeSymbol(symbol),
+    type: "TRIGGER_MARKET",
+  };
+
+  if (options.workingType !== false) {
+    payload.workingType = options.workingType ?? "MARK_PRICE";
+  }
+  if (options.clientOrderID) {
+    payload.clientOrderID = options.clientOrderID;
+  }
+  if (options.clientOrderId) {
+    payload.clientOrderId = options.clientOrderId;
+  }
+
+  return payload;
+}
+
 function normalizeExchangeList(value) {
   if (Array.isArray(value)) return value;
   if (Array.isArray(value?.positions)) return value.positions;
@@ -175,6 +200,16 @@ export function createBingxClient({
         symbol: normalizeSymbol(symbol),
         type: "MARKET",
       });
+    },
+
+    async placeTriggerMarketOrder(symbol, side, stopPrice, quantity, options = {}) {
+      return request("POST", "/openApi/swap/v2/trade/order", buildTriggerMarketOrderPayload(
+        symbol,
+        side,
+        stopPrice,
+        quantity,
+        options,
+      ));
     },
 
     async placeReduceOnlyMarketOrder(symbol, side, quantity, options = {}) {

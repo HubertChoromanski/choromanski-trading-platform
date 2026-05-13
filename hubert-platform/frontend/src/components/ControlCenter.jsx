@@ -1509,6 +1509,7 @@ export default function ControlCenter({
   backtestAnalysisActive,
   chartDiagnostics,
   fullHistoryDataset,
+  indicatorSettingsByInterval = {},
   onApplyChart,
   onAnalyzeBacktest,
   onBacktestResult,
@@ -1516,6 +1517,7 @@ export default function ControlCenter({
   onClose,
   onExitBacktestAnalysis,
   onResetChartView,
+  onSyncChartFromSztab,
   onViewBacktestTrade,
   rawCandles,
   selectedHistoricalWindow,
@@ -2876,6 +2878,8 @@ export default function ControlCenter({
           accountProfiles={accountProfiles}
           backendStatus={sztabStatus}
           battleDecks={battleDecks}
+          chartSettings={settings}
+          indicatorSettingsByInterval={indicatorSettingsByInterval}
           livestream={livestream}
           mmDecks={mmDecks}
           positionActionState={positionActionState}
@@ -2943,6 +2947,7 @@ export default function ControlCenter({
             await refreshLiveStatus({ fresh: true });
           })}
           onOpenAdvanced={(nextPanel) => setActivePanel(nextPanel)}
+          onSyncChartFromSztab={onSyncChartFromSztab}
           onPositionAction={prepareCrisisAction}
           onPositionRefresh={refreshPositionCard}
           onSaveConfig={saveSztabIntervalConfig}
@@ -3033,6 +3038,7 @@ export default function ControlCenter({
           selectedHistoricalWindow={selectedHistoricalWindow}
           selectedInterval={selectedInterval}
           settings={settings}
+          indicatorSettingsByInterval={indicatorSettingsByInterval}
           updateSetting={updateSetting}
         />
       )}
@@ -3678,6 +3684,7 @@ function IndicatorPanel({
   chartDiagnostics,
   fullHistoryDataset,
   fullLoadedDays,
+  indicatorSettingsByInterval = {},
   loadedDays,
   rawCandles,
   selectedHistoricalWindow,
@@ -3690,6 +3697,9 @@ function IndicatorPanel({
       <MiniStatus>
         Chart is rendering {rawCandles.length} candles, about {fmt(loadedDays, 0)} days. Full loaded context has {fullHistoryDataset?.length ?? 0} candles, about {fmt(fullLoadedDays, 0)} days.
         Backtests fetch their own historical range from {chartDiagnostics?.provider ?? "binance-futures"}.
+      </MiniStatus>
+      <MiniStatus>
+        Indicator settings are stored per interval. Active panel: {selectedInterval.toUpperCase()} · saved interval sets: {Object.keys(indicatorSettingsByInterval).join(", ") || "none"}.
       </MiniStatus>
       <div className="hubert-lab__grid">
         <NumberField commitEmpty={false} label="History days" value={settings.historyDays ?? 31} min="1" max="1000" onChange={(value) => updateSetting("historyDays", value)} help="Choose time in days. The platform converts it into candles for this timeframe." />
@@ -4985,6 +4995,8 @@ function SztabGeneralnyPanel({
   accountProfiles = [],
   backendStatus,
   battleDecks = [],
+  chartSettings = {},
+  indicatorSettingsByInterval = {},
   livestream,
   mmDecks = [],
   onAction,
@@ -4992,6 +5004,7 @@ function SztabGeneralnyPanel({
   onEmergencyStop,
   onForceSync,
   onOpenAdvanced,
+  onSyncChartFromSztab,
   onCheckSignalParity,
   onPositionAction,
   onPositionRefresh,
@@ -5220,7 +5233,9 @@ function SztabGeneralnyPanel({
           accountProfiles={accountProfiles}
           battleDecks={battleDecks}
           config={state.intervals[activeTab]}
+          chartSettings={chartSettings}
           globalRunning={globalRunning}
+          indicatorSettingsByInterval={indicatorSettingsByInterval}
           interval={activeTab}
           livestream={livestream}
           mmDecks={mmDecks}
@@ -5237,6 +5252,34 @@ function SztabGeneralnyPanel({
           onStop={() => stopInterval(activeTab)}
           onRestart={() => onRestartInterval(activeTab)}
           onSyncInterval={onSyncInterval}
+          onSyncChartFromSztab={() => {
+            onSyncChartFromSztab?.(activeTab, state.intervals[activeTab]?.strategy ?? {});
+            setLocalMessage(`Chart params synced from ${intervalDisplayLabel(activeTab)} Sztab settings.`);
+          }}
+          onPushChartToSztab={() => {
+            const chartSource = selectedInterval === activeTab
+              ? chartSettings
+              : indicatorSettingsByInterval[activeTab] ?? chartSettings;
+            patchInterval(activeTab, (current) => ({
+              ...current,
+              strategy: {
+                ...current.strategy,
+                atrLength: chartSource.atrLength,
+                atrMultiplier: chartSource.atrMultiplier,
+                bandwidth: chartSource.bandwidth,
+                envelopeMultiplier: chartSource.envelopeMultiplier,
+                maxSameSideFailures: chartSource.maxSameSideFailures,
+                strategySource: chartSource.strategySource,
+              },
+              strategyDirty: true,
+              validation: {
+                ...current.validation,
+                message: "Chart settings pushed into Sztab. Save Strategy before applying.",
+                ok: false,
+              },
+            }));
+            setLocalMessage(`Sztab ${intervalDisplayLabel(activeTab)} strategy updated from chart indicator settings. Save Strategy before start.`);
+          }}
           onToggleLock={async (locked) => {
             patchInterval(activeTab, (current) => ({
               ...current,
@@ -5387,8 +5430,10 @@ function SztabGeneralOverview({
 function SztabIntervalPanel({
   accountProfiles = [],
   battleDecks = [],
+  chartSettings = {},
   config,
   globalRunning,
+  indicatorSettingsByInterval = {},
   interval,
   livestream,
   mmDecks = [],
@@ -5405,7 +5450,9 @@ function SztabIntervalPanel({
   onStop,
   onRestart,
   onSyncInterval,
+  onSyncChartFromSztab,
   onToggleLock,
+  onPushChartToSztab,
   onUpdateMm,
   onUpdateProfile,
   onUpdateStrategy,
@@ -5434,6 +5481,8 @@ function SztabIntervalPanel({
   const validationTone = config.validation?.ok ? "good" : "neutral";
   const validationMessage = validationText(config.validation);
   const startReady = Boolean(config.apiProfile && config.strategySavedAt && config.mmSavedAt && config.strategyLocked && config.mmLocked && config.validation?.ok);
+  const triggerOrderStatus = String(runtime.pendingTriggerOrder?.status ?? runtime.triggerOrderState ?? "").toLowerCase();
+  const triggerOrderIsActive = ["accepted", "placed", "new", "partially_filled", "pending_sync"].includes(triggerOrderStatus);
   const strategySaveStatus = config.strategyDirty
     ? "Unsaved changes"
     : config.strategySavedAt
@@ -5444,6 +5493,10 @@ function SztabIntervalPanel({
     : config.mmSavedAt
       ? `MM saved ${compactDateText(config.mmSavedAt)}`
       : "MM not saved";
+  const intervalChartSettings = selectedInterval === interval
+    ? chartSettings
+    : indicatorSettingsByInterval[interval] ?? chartSettings;
+  const chartSztabDiffs = strategyParamDiffs(config.strategy, intervalChartSettings);
 
   function lockedStart() {
     onStart();
@@ -5469,6 +5522,7 @@ function SztabIntervalPanel({
           <Metric label="Bot status" value={runtime.status ?? "stopped"} />
           <Metric label="API profile" value={profile?.label || config.apiProfile || "Missing"} />
           <Metric label="Exchange source" value="BingX futures" />
+          <Metric label="Live execution model" value="Exchange stop-market trigger execution" />
           <Metric label="Live sync" value={ageText(summary.lastBingxSyncAt)} />
           <Metric label="Lock state" value={locked ? "Locked" : "Unlocked"} />
           <Metric label="Started" value={compactDateText(runtime.startedAt)} />
@@ -5489,6 +5543,15 @@ function SztabIntervalPanel({
         <MiniStatus tone={config.strategyDirty ? "bad" : config.strategySavedAt ? "good" : "neutral"}>
           {strategySaveStatus}
         </MiniStatus>
+        <MiniStatus tone={chartSztabDiffs.length ? "bad" : "good"}>
+          {chartSztabDiffs.length
+            ? `Chart/Sztab mismatch: ${chartSztabDiffs.map((diff) => `${diff.field} chart=${diff.chart ?? "--"} sztab=${diff.sztab ?? "--"}`).join("; ")}`
+            : "Chart and Sztab params match for this interval."}
+        </MiniStatus>
+        <div className="hubert-lab__actions">
+          <button type="button" onClick={onSyncChartFromSztab}>Sync chart from Sztab</button>
+          <button disabled={locked} type="button" onClick={onPushChartToSztab}>Push chart to Sztab</button>
+        </div>
         <div className="hubert-lab__grid">
           <NumberField disabled={locked} label="ATR length" value={config.strategy.atrLength} onChange={(value) => onUpdateStrategy("atrLength", value)} />
           <NumberField disabled={locked} label="ATR multiplier" step="0.1" value={config.strategy.atrMultiplier} onChange={(value) => onUpdateStrategy("atrMultiplier", value)} />
@@ -5613,11 +5676,62 @@ function SztabIntervalPanel({
           <Metric label="Latest setup event" value={eventText(runtime.latestSetupEvent)} />
           <Metric label="Latest entry event" value={eventText(runtime.latestEntryEvent)} />
           <Metric label="Latest executable signal" value={eventText(runtime.lastSignal)} />
+          <Metric label="Current setup state" value={runtime.pendingTriggerOrder?.status ?? runtime.latestSetupEvent?.status ?? "none"} />
+          <Metric label="Trigger armed" value={triggerOrderIsActive && runtime.pendingTriggerOrder?.orderId ? "yes" : "no"} />
+          <Metric label="Pending trigger order" value={runtime.pendingTriggerOrder?.orderId ?? "--"} />
+          <Metric label="Trigger price" value={fmt(runtime.pendingTriggerOrder?.triggerPrice ?? runtime.latestSetupEvent?.trigger)} />
+          <Metric label="Trigger order status" value={runtime.triggerOrderState ?? runtime.pendingTriggerOrder?.status ?? "--"} />
+          <Metric label="Exchange terminal status" value={runtime.exchangeTerminalStatus || "--"} />
+          <Metric label="Last exchange status" value={runtime.lastExchangeStatus || runtime.pendingTriggerOrder?.lastExchangeStatus || "--"} />
+          <Metric label="Last status check" value={compactDateText(runtime.lastStatusCheckAt)} />
+          <Metric label="Executed qty" value={runtime.triggerOrderExecutedQty !== null && runtime.triggerOrderExecutedQty !== undefined ? fmt(runtime.triggerOrderExecutedQty, 3) : "--"} />
+          <Metric label="Failure classification" value={runtime.triggerFailureClassification || "--"} />
+          <Metric label="Last trigger failure" value={runtime.lastTriggerFailureReason || "--"} />
+          <Metric label="Pending order age" value={runtime.pendingOrderAgeSeconds !== null && runtime.pendingOrderAgeSeconds !== undefined ? `${runtime.pendingOrderAgeSeconds}s` : "--"} />
+          <Metric label="Can arm next setup" value={runtime.canArmNextSetup ? "true" : "false"} />
+          <Metric label="Trigger fill detected" value={runtime.triggerOrderFillDetected ? "yes" : "no"} />
+          <Metric label="SL placed" value={runtime.slPlacementStatus ?? "--"} />
+          <Metric label="Calculated qty" value={fmt(runtime.pendingTriggerOrder?.quantity, 3)} />
           <Metric label="Decision reason" value={runtime.lastDecisionReason || runtime.lastDecision || "--"} />
           <Metric label="Blocked reason" value={runtime.lastBlockedReason || "--"} />
           <Metric label="Interval blocker" value={intervalBlockers.map((blocker) => blocker.type ?? blocker.source).join(", ") || "--"} />
           <Metric label="Last exchange response" value={runtime.lastExchangeResponse ? compactDateText(runtime.lastExchangeResponse.time) : "--"} />
         </div>
+        <details className="hubert-advanced" open>
+          <summary>Setup / order journal</summary>
+          <div className="hubert-lab__table">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Setup</th>
+                  <th>Side</th>
+                  <th>Trigger</th>
+                  <th>Qty</th>
+                  <th>Order</th>
+                  <th>Status</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(runtime.setupOrderJournal ?? []).length ? (runtime.setupOrderJournal ?? []).slice(-20).reverse().map((item, index) => (
+                  <tr key={`${item.timestamp ?? index}-${item.orderId ?? item.setupId ?? index}`}>
+                    <td>{compactDateText(item.timestamp)}</td>
+                    <td>{item.setupId ?? "--"}</td>
+                    <td>{item.side ?? "--"}</td>
+                    <td>{fmt(item.triggerPrice)}</td>
+                    <td>{fmt(item.quantity, 3)}</td>
+                    <td>{item.orderId ?? "--"}</td>
+                    <td>{item.status ?? item.event ?? "--"}</td>
+                    <td>{item.reason ?? item.failureClassification ?? item.event ?? "--"}</td>
+                  </tr>
+                )) : (
+                  <tr><td colSpan="8">No setup/order journal entries yet.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </details>
         {globalBlockers.length > 0 && (
           <MiniStatus tone="bad">
             Global execution blocker active: {globalBlockers.map((blocker) => blocker.reason).join("; ")}.
@@ -5645,6 +5759,8 @@ function SztabIntervalPanel({
             latestEntryEvent: runtime.latestEntryEvent ?? null,
             latestSetupEvent: runtime.latestSetupEvent ?? null,
             latestSignal: runtime.lastSignal ?? null,
+            pendingTriggerOrder: runtime.pendingTriggerOrder ?? null,
+            setupOrderJournal: runtime.setupOrderJournal ?? [],
           }, null, 2)}</pre>
         </details>
       </section>
@@ -5840,6 +5956,21 @@ function SztabPositionCard({ onPositionAction, onPositionRefresh, position, stat
 
 function intervalDisplayLabel(interval) {
   return SZTAB_TIMEFRAMES.find((item) => item.interval === interval)?.label ?? interval;
+}
+
+function strategyParamDiffs(left = {}, right = {}) {
+  return [
+    ["atrLength", "ATR length"],
+    ["atrMultiplier", "ATR multiplier"],
+    ["bandwidth", "Bandwidth"],
+    ["envelopeMultiplier", "NWE multiplier"],
+    ["maxSameSideFailures", "Max same-side failures"],
+    ["strategySource", "Strategy source"],
+  ].flatMap(([key, label]) => (
+    String(left?.[key] ?? "") === String(right?.[key] ?? "")
+      ? []
+      : [{ chart: right?.[key], field: label, sztab: left?.[key] }]
+  ));
 }
 
 function validationText(validation = {}) {

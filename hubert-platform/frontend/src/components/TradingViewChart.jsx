@@ -65,6 +65,22 @@ const defaultSettings = {
   showSl: true,
   showTrigger: false,
 };
+const indicatorSettingKeys = [
+  "atrLength",
+  "atrMultiplier",
+  "bandwidth",
+  "envelopeMultiplier",
+  "historyDays",
+  "historyLimit",
+  "maxSameSideFailures",
+  "showBands",
+  "showBenchmarks",
+  "showEntries",
+  "showNegated",
+  "showSl",
+  "showTrigger",
+  "strategySource",
+];
 const DEFAULT_CHART_RENDER_CAP = 1500;
 const ABSOLUTE_CHART_RENDER_CAP = 3000;
 const MAX_BACKTEST_CHART_MARKERS = 100;
@@ -128,6 +144,50 @@ function formatChartTime(value) {
 function chartTimeValue(value) {
   const numeric = Number(value);
   return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
+function normalizeBackendUrl(value) {
+  const normalized = String(value || "").replace(/\/+$/u, "");
+  return normalized.endsWith("/api") ? normalized : `${normalized}/api`;
+}
+
+const BACKEND_URL = normalizeBackendUrl(
+  import.meta.env.VITE_BACKEND_URL ?? (import.meta.env.PROD ? "/api" : "http://127.0.0.1:8787"),
+);
+const DASHBOARD_TOKEN = import.meta.env.VITE_DASHBOARD_TOKEN ?? "";
+
+async function apiFetch(path) {
+  const response = await fetch(`${BACKEND_URL}${path}`, {
+    headers: DASHBOARD_TOKEN ? { "x-dashboard-token": DASHBOARD_TOKEN } : {},
+  });
+
+  if (!response.ok) {
+    throw new Error(`Backend request failed: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+function normalizeIndicatorSettings(value = {}) {
+  return {
+    ...defaultSettings,
+    ...Object.fromEntries(indicatorSettingKeys.map((key) => [key, value[key] ?? defaultSettings[key]])),
+  };
+}
+
+function initialIndicatorSettingsByInterval(persisted = {}) {
+  const legacy = persisted.indicatorSettings ?? {};
+  const byInterval = persisted.indicatorSettingsByInterval ?? {};
+
+  return Object.fromEntries(
+    timeframes.map((timeframe) => [
+      timeframe.interval,
+      normalizeIndicatorSettings({
+        ...legacy,
+        ...(byInterval[timeframe.interval] ?? {}),
+      }),
+    ]),
+  );
 }
 
 function warnSanitizedChartData(label, details) {
@@ -463,6 +523,10 @@ function toIncrementalHeikenAshi(rawCandle, previousHa) {
 
 export default function TradingViewChart() {
   const [persistedState] = useState(readPlatformState);
+  const initialIndicatorSettings = useMemo(
+    () => initialIndicatorSettingsByInterval(persistedState),
+    [persistedState],
+  );
   const chartContainerRef = useRef(null);
   const importInputRef = useRef(null);
   const chartRef = useRef(null);
@@ -472,6 +536,7 @@ export default function TradingViewChart() {
   const realPriceSeriesRef = useRef(null);
   const strategyMarkersRef = useRef(null);
   const strategyLineSeriesRef = useRef([]);
+  const liveOrderLineSeriesRef = useRef([]);
   const strategyCacheRef = useRef({ key: "", events: [] });
   const heikenAshiCacheRef = useRef([]);
   const pendingLiveCandlesRef = useRef(null);
@@ -487,6 +552,7 @@ export default function TradingViewChart() {
   const [selectedInterval, setSelectedInterval] = useState(
     persistedState.chartTimeframe ?? "15m",
   );
+  const [indicatorSettingsByInterval, setIndicatorSettingsByInterval] = useState(initialIndicatorSettings);
   const [fullHistoryDataset, setFullHistoryDataset] = useState([]);
   const [rawCandles, setRawCandlesState] = useState([]);
   const [selectedHistoricalWindow, setSelectedHistoricalWindow] = useState({
@@ -515,10 +581,10 @@ export default function TradingViewChart() {
   const [jumpDate, setJumpDate] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
-  const [settings, setSettings] = useState({
-    ...defaultSettings,
-    ...(persistedState.indicatorSettings ?? {}),
-  });
+  const [settings, setSettings] = useState(
+    initialIndicatorSettings[persistedState.chartTimeframe ?? "15m"] ?? normalizeIndicatorSettings(persistedState.indicatorSettings),
+  );
+  const [sztabTelemetry, setSztabTelemetry] = useState(null);
   const [settingsPanel, setSettingsPanel] = useState(null);
   const [activeBacktestSession, setActiveBacktestSession] = useState(null);
   const [backtestAnalysisActive, setBacktestAnalysisActive] = useState(false);
@@ -651,10 +717,17 @@ export default function TradingViewChart() {
       ...currentStatus,
       state: "Unsaved changes",
     }));
-    setSettings((currentSettings) => ({
-      ...currentSettings,
-      [key]: value,
-    }));
+    setSettings((currentSettings) => {
+      const nextSettings = {
+        ...currentSettings,
+        [key]: value,
+      };
+      setIndicatorSettingsByInterval((currentByInterval) => ({
+        ...currentByInterval,
+        [selectedInterval]: nextSettings,
+      }));
+      return nextSettings;
+    });
   }
 
   function updateSelectedInterval(interval) {
@@ -671,6 +744,11 @@ export default function TradingViewChart() {
       mode: "latest",
       to: null,
     });
+    setIndicatorSettingsByInterval((currentByInterval) => ({
+      ...currentByInterval,
+      [selectedInterval]: settings,
+    }));
+    setSettings(indicatorSettingsByInterval[interval] ?? normalizeIndicatorSettings());
     setSelectedInterval(interval);
   }
 
@@ -802,6 +880,10 @@ export default function TradingViewChart() {
       chartTimeframe: selectedInterval,
       exportedAt: new Date().toISOString(),
       indicatorSettings: settings,
+      indicatorSettingsByInterval: {
+        ...indicatorSettingsByInterval,
+        [selectedInterval]: settings,
+      },
       lastSavedAt: saveStatus.lastSavedAt,
       version: 1,
     };
@@ -829,7 +911,12 @@ export default function TradingViewChart() {
     const imported = JSON.parse(await file.text());
 
     if (imported.chartTimeframe) setSelectedInterval(imported.chartTimeframe);
-    if (imported.indicatorSettings) {
+    if (imported.indicatorSettingsByInterval) {
+      const nextByInterval = initialIndicatorSettingsByInterval(imported);
+      setIndicatorSettingsByInterval(nextByInterval);
+      setSettings(nextByInterval[imported.chartTimeframe ?? selectedInterval] ?? normalizeIndicatorSettings(imported.indicatorSettings));
+    }
+    if (!imported.indicatorSettingsByInterval && imported.indicatorSettings) {
       setSettings({ ...defaultSettings, ...imported.indicatorSettings });
     }
     setSaveStatus({ state: "Unsaved changes", lastSavedAt: saveStatus.lastSavedAt });
@@ -837,14 +924,56 @@ export default function TradingViewChart() {
   }
 
   function applyStrategyConfigToChart(config) {
-    setSettings((currentSettings) => ({
-      ...currentSettings,
-      atrLength: config.atrLength ?? currentSettings.atrLength,
-      atrMultiplier: config.atrMultiplier ?? currentSettings.atrMultiplier,
-      bandwidth: config.bandwidth ?? currentSettings.bandwidth,
-      envelopeMultiplier: config.envelopeMultiplier ?? currentSettings.envelopeMultiplier,
-      maxSameSideFailures: config.maxSameSideFailures ?? currentSettings.maxSameSideFailures,
-      strategySource: config.strategySource ?? currentSettings.strategySource,
+    setSettings((currentSettings) => {
+      const nextSettings = {
+        ...currentSettings,
+        atrLength: config.atrLength ?? currentSettings.atrLength,
+        atrMultiplier: config.atrMultiplier ?? currentSettings.atrMultiplier,
+        bandwidth: config.bandwidth ?? currentSettings.bandwidth,
+        envelopeMultiplier: config.envelopeMultiplier ?? currentSettings.envelopeMultiplier,
+        maxSameSideFailures: config.maxSameSideFailures ?? currentSettings.maxSameSideFailures,
+        strategySource: config.strategySource ?? currentSettings.strategySource,
+      };
+      setIndicatorSettingsByInterval((currentByInterval) => ({
+        ...currentByInterval,
+        [selectedInterval]: nextSettings,
+      }));
+      return nextSettings;
+    });
+  }
+
+  function syncChartFromSztab(interval, strategy = {}) {
+    const base = indicatorSettingsByInterval[interval] ?? normalizeIndicatorSettings();
+    const nextSettings = normalizeIndicatorSettings({
+      ...base,
+      atrLength: strategy.atrLength ?? base.atrLength,
+      atrMultiplier: strategy.atrMultiplier ?? base.atrMultiplier,
+      bandwidth: strategy.bandwidth ?? base.bandwidth,
+      envelopeMultiplier: strategy.envelopeMultiplier ?? base.envelopeMultiplier,
+      maxSameSideFailures: strategy.maxSameSideFailures ?? base.maxSameSideFailures,
+      strategySource: strategy.strategySource ?? base.strategySource,
+    });
+
+    setIndicatorSettingsByInterval((currentByInterval) => ({
+      ...currentByInterval,
+      [interval]: nextSettings,
+    }));
+    setSettings(nextSettings);
+    if (interval !== selectedInterval) {
+      clearStrategyLines();
+      strategyMarkersRef.current?.setMarkers([]);
+      strategyCacheRef.current = { key: "", events: [] };
+      setSelectedHistoricalWindow({
+        centerTime: null,
+        from: null,
+        mode: "latest",
+        to: null,
+      });
+      setSelectedInterval(interval);
+    }
+    setSaveStatus((currentStatus) => ({
+      ...currentStatus,
+      state: "Unsaved changes",
     }));
   }
 
@@ -917,6 +1046,10 @@ export default function TradingViewChart() {
       writeStoredJson(PLATFORM_STORAGE_KEY, {
         chartTimeframe: selectedInterval,
         indicatorSettings: settings,
+        indicatorSettingsByInterval: {
+          ...indicatorSettingsByInterval,
+          [selectedInterval]: settings,
+        },
         lastSavedAt,
         version: 1,
       });
@@ -924,7 +1057,7 @@ export default function TradingViewChart() {
     }, 350);
 
     return () => window.clearTimeout(timeoutId);
-  }, [selectedInterval, settings]);
+  }, [indicatorSettingsByInterval, selectedInterval, settings]);
 
   const clearStrategyLines = useCallback(() => {
     if (!chartRef.current) {
@@ -968,6 +1101,49 @@ export default function TradingViewChart() {
 
     lineSeries.setData(data);
     strategyLineSeriesRef.current.push(lineSeries);
+    return true;
+  }, []);
+
+  const clearLiveOrderLines = useCallback(() => {
+    if (!chartRef.current) {
+      liveOrderLineSeriesRef.current = [];
+      return;
+    }
+
+    liveOrderLineSeriesRef.current.forEach((series) => {
+      chartRef.current?.removeSeries(series);
+    });
+    liveOrderLineSeriesRef.current = [];
+  }, []);
+
+  const addLiveOrderSegment = useCallback(({ color, lineStyle = 0, value, startTime, endTime }) => {
+    if (!chartRef.current || !Number.isFinite(Number(value))) {
+      return false;
+    }
+
+    const data = sanitizeOverlayEvents([
+      { time: startTime, value: Number(value) },
+      { time: endTime, value: Number(value) },
+    ], "live trigger segment");
+
+    if (data.length < 2) return false;
+
+    const lineSeries = chartRef.current.addSeries(LineSeries, {
+      color,
+      lineWidth: 2,
+      lineStyle,
+      priceLineVisible: true,
+      lastValueVisible: true,
+      crosshairMarkerVisible: false,
+      priceFormat: {
+        type: "price",
+        precision: 2,
+        minMove: 0.01,
+      },
+    });
+
+    lineSeries.setData(data);
+    liveOrderLineSeriesRef.current.push(lineSeries);
     return true;
   }, []);
 
@@ -1577,6 +1753,55 @@ export default function TradingViewChart() {
     }
   }, [activeAnalysisSession, backtestOverlaySettings, rawCandles, renderMarket]);
 
+  useEffect(() => {
+    let ignore = false;
+
+    async function refreshSztabTelemetry() {
+      try {
+        const status = await apiFetch("/sztab/status");
+        if (!ignore) setSztabTelemetry(status);
+      } catch {
+        if (!ignore) setSztabTelemetry(null);
+      }
+    }
+
+    refreshSztabTelemetry();
+    const intervalId = window.setInterval(refreshSztabTelemetry, 12_000);
+    return () => {
+      ignore = true;
+      window.clearInterval(intervalId);
+    };
+  }, []);
+
+  useEffect(() => {
+    clearLiveOrderLines();
+    const runtime = sztabTelemetry?.intervals?.[selectedInterval]?.runtime;
+    const pending = runtime?.pendingTriggerOrder;
+    const firstTime = rawCandles[0]?.time;
+    const lastTime = rawCandles.at(-1)?.time;
+
+    if (!runtime || !firstTime || !lastTime) return;
+
+    if (pending && ["accepted", "placed", "new", "pending_sync"].includes(String(pending.status ?? "").toLowerCase())) {
+      addLiveOrderSegment({
+        color: pending.direction === "LONG" ? "rgba(66, 245, 164, 0.95)" : "rgba(255, 97, 97, 0.95)",
+        endTime: lastTime,
+        startTime: Math.max(firstTime, Number(pending.entryEvent?.benchmarkTime ?? pending.entryEvent?.time ?? firstTime)),
+        value: pending.triggerPrice,
+      });
+    }
+
+    if (pending?.stopLoss && ["filled_protected", "filled_sl_failed"].includes(String(pending.status ?? "").toLowerCase())) {
+      addLiveOrderSegment({
+        color: pending.status === "filled_protected" ? "rgba(255, 186, 73, 0.95)" : "rgba(255, 83, 83, 0.95)",
+        endTime: lastTime,
+        lineStyle: 2,
+        startTime: Math.max(firstTime, Number(pending.fillDetectedAt ? Math.floor(new Date(pending.fillDetectedAt).getTime() / 1000) : firstTime)),
+        value: pending.stopLoss,
+      });
+    }
+  }, [addLiveOrderSegment, clearLiveOrderLines, rawCandles, selectedInterval, sztabTelemetry]);
+
   return (
     <main className="hubert-dashboard">
       <header className="hubert-toolbar" aria-label="Trading controls">
@@ -1689,6 +1914,8 @@ export default function TradingViewChart() {
           setActivePanel={setSettingsPanel}
           setSelectedInterval={updateSelectedInterval}
           settings={settings}
+          indicatorSettingsByInterval={indicatorSettingsByInterval}
+          onSyncChartFromSztab={syncChartFromSztab}
           updateSetting={updateSetting}
         />
       )}
@@ -1737,6 +1964,23 @@ export default function TradingViewChart() {
           />
           <button type="button" onClick={jumpToHistoricalDate}>Jump</button>
         </div>
+      </div>
+
+      <div className="hubert-live-trigger-panel" aria-label="Live trigger telemetry">
+        {(() => {
+          const runtime = sztabTelemetry?.intervals?.[selectedInterval]?.runtime;
+          const pending = runtime?.pendingTriggerOrder;
+          return (
+            <>
+              <strong>{selectedInterval.toUpperCase()} live trigger</strong>
+              <span>State: {runtime?.triggerOrderState ?? pending?.status ?? "none"}</span>
+              <span>Setup: {pending?.setupId ?? runtime?.latestSetupEvent?.setupId ?? "--"} · {pending?.direction ?? runtime?.latestSetupEvent?.direction ?? "--"}</span>
+              <span>Trigger: {formatChartPrice(pending?.triggerPrice ?? runtime?.latestSetupEvent?.trigger)}</span>
+              <span>Order: {pending?.orderId ?? "--"} · SL: {runtime?.slPlacementStatus ?? "--"}</span>
+              <span>{runtime?.lastDecisionReason ?? "runner telemetry unavailable"}</span>
+            </>
+          );
+        })()}
       </div>
 
       {measurementView?.start && (
