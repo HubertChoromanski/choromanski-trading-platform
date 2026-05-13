@@ -221,6 +221,92 @@ function positionPnl(position = {}) {
   return Number(position.unrealizedPnl ?? position.unrealizedProfit ?? position.pnl ?? 0);
 }
 
+function orderIdentifier(order = {}) {
+  return order.orderId ?? order.orderID ?? order.id ?? order.clientOrderId ?? order.clientOrderID ?? null;
+}
+
+function orderType(order = {}) {
+  return String(order.type ?? order.orderType ?? order.origType ?? order.planType ?? order.stopOrderType ?? "").toUpperCase();
+}
+
+function stopProtectionOrder(position = {}) {
+  return (position.attachedOrders ?? []).find((order) => {
+    const type = orderType(order);
+    return type.includes("STOP") && !type.includes("TAKE");
+  }) ?? null;
+}
+
+function liveProtectionState({ livePosition = null, pending = null, runtime = {} }) {
+  const pendingStatus = String(pending?.status ?? runtime.triggerOrderState ?? "").toLowerCase();
+  const stopOrder = livePosition ? stopProtectionOrder(livePosition) : null;
+  const stopLoss = Number(livePosition?.stopLoss ?? 0);
+  const positionSource = String(livePosition?.stopLossSource ?? livePosition?.protectionSource ?? "").toLowerCase();
+  const hasBingxProtection = Boolean(livePosition && (stopOrder || stopLoss > 0) && positionSource !== "none");
+
+  if (livePosition && hasBingxProtection) {
+    return {
+      activeScenarioCanBlockNewSetup: true,
+      confirmed: true,
+      label: "LIVE SL PROTECTION CONFIRMED",
+      note: "Real BingX position exists and SL protection is visible in fresh position/order state.",
+      orderId: orderIdentifier(stopOrder),
+      price: stopLoss || Number(pending?.stopLoss ?? 0),
+      source: stopOrder ? "bingx_order" : "bingx_position",
+      tone: "live",
+    };
+  }
+
+  if (livePosition) {
+    return {
+      activeScenarioCanBlockNewSetup: true,
+      confirmed: false,
+      label: "LIVE POSITION, PROTECTION MISSING",
+      note: "Real BingX position exists, but no active SL protection is visible after sync.",
+      orderId: null,
+      price: Number(pending?.stopLoss ?? livePosition?.stopLoss ?? 0),
+      source: "none",
+      tone: "critical",
+    };
+  }
+
+  if (["filled_protected", "filled_sl_failed", "filled_but_position_missing"].includes(pendingStatus)) {
+    return {
+      activeScenarioCanBlockNewSetup: false,
+      confirmed: false,
+      label: pendingStatus === "filled_sl_failed" ? "SL PLANNED, NOT CONFIRMED" : "STALE SL STATE",
+      note: "No live BingX position exists for this scenario, so this SL is local/stale state, not confirmed protection.",
+      orderId: orderIdentifier(pending?.stopOrder),
+      price: Number(pending?.stopLoss ?? 0),
+      source: "stale_local",
+      tone: pendingStatus === "filled_sl_failed" ? "critical" : "stale",
+    };
+  }
+
+  if (pending?.stopLoss) {
+    return {
+      activeScenarioCanBlockNewSetup: false,
+      confirmed: false,
+      label: "SL PLANNED, NOT CONFIRMED",
+      note: "SL is planned for after trigger fill. It is not active until a real position exists and BingX confirms protection.",
+      orderId: null,
+      price: Number(pending.stopLoss),
+      source: "local_planned",
+      tone: "pending",
+    };
+  }
+
+  return {
+    activeScenarioCanBlockNewSetup: false,
+    confirmed: false,
+    label: "SIMULATED SL",
+    note: "No live SL protection is present in exchange state.",
+    orderId: null,
+    price: null,
+    source: "simulated",
+    tone: "simulated",
+  };
+}
+
 function positionsForOperationalState(livestream, config = {}) {
   const positions = livestream?.positions ?? [];
   return positions.filter((position) => {
@@ -357,23 +443,30 @@ function deriveOperationalState({
   };
 
   if (livePosition) {
-    const protectionActive = Number(livePosition.stopLoss) > 0 || (livePosition.attachedOrders ?? []).length > 0 || runtime.slPlacementStatus === "placed";
+    const protection = liveProtectionState({ livePosition, pending, runtime });
     return {
       ...base,
-      detail: protectionActive ? "Live exchange position exists and protection is visible." : "Live exchange position exists but SL/protection is missing.",
+      detail: protection.note,
       headline: `${positionSide(livePosition)} position active`,
       rows: [
         ["Entry", formatChartPrice(positionEntry(livePosition))],
         ["SL", formatChartPrice(livePosition.stopLoss)],
         ["PnL", formatChartPnl(positionPnl(livePosition))],
         ["Qty", formatChartPrice(positionAmount(livePosition))],
+        ["Position confirmed", "yes"],
+        ["Protection confirmed", protection.confirmed ? "yes" : "no"],
+        ["Protection source", protection.source],
+        ["Protection order", protection.orderId ? compactId(protection.orderId) : "--"],
       ],
       tags: [
         { label: "LIVE POSITION", tone: "live" },
-        { label: protectionActive ? "SL placed correctly" : "Live protection missing (critical)", tone: protectionActive ? "live" : "critical" },
+        { label: protection.label, tone: protection.tone },
       ],
-      tone: protectionActive ? "live" : "critical",
-      visualObjects: [{ label: "LIVE POSITION", note: "Position comes from live BingX account state.", tone: "live" }],
+      tone: protection.confirmed ? "live" : "critical",
+      visualObjects: [
+        { label: "LIVE POSITION", note: "Position comes from live BingX account state.", tone: "live" },
+        { label: protection.label, note: protection.note, tone: protection.tone },
+      ],
     };
   }
 
@@ -411,6 +504,7 @@ function deriveOperationalState({
   }
 
   if (isActivePendingStatus(pendingStatus)) {
+    const protection = liveProtectionState({ livePosition, pending, runtime });
     return {
       ...base,
       headline: `${side ?? ""} setup armed`.trim() || "Setup armed",
@@ -420,10 +514,13 @@ function deriveOperationalState({
         ["Current chart price", formatChartPrice(currentPrice)],
         ["Pending order", pending?.orderId ? compactId(pending.orderId) : "--"],
         ["BingX status", runtime.lastExchangeStatus || pendingStatus],
+        ["Position confirmed", "no"],
+        ["SL state", protection.label],
       ],
       tags: [
         { label: "LIVE PENDING TRIGGER", tone: "pending" },
         { label: "Waiting for trigger touch", tone: "pending" },
+        { label: protection.label, tone: protection.tone },
       ],
       tone: "pending",
       visualObjects: [{ label: "LIVE PENDING TRIGGER", note: "Pending trigger order is local runtime plus BingX order status.", tone: "pending" }],
@@ -431,6 +528,7 @@ function deriveOperationalState({
   }
 
   if (pending && isTerminalExchangeStatus(pendingStatus)) {
+    const protection = liveProtectionState({ livePosition, pending, runtime });
     return {
       ...base,
       headline: pendingStatus === "filled_but_position_missing"
@@ -444,10 +542,15 @@ function deriveOperationalState({
         ["Order", pending.orderId ? compactId(pending.orderId) : "--"],
         ["Exchange status", runtime.lastExchangeStatus || pending.exchangeTerminalStatus || pendingStatus],
         ["Executed qty", pending.executedQty ?? runtime.triggerOrderExecutedQty ?? "--"],
+        ["Can block new setup", runtime.activeScenarioCanBlockNewSetup ? "yes" : "no"],
+        ["Terminal reason", runtime.scenarioTerminalReason || pending.terminalReason || pending.failureClassification || pendingStatus],
+        ["Superseded by", runtime.supersededBySetupId ? compactId(runtime.supersededBySetupId) : "--"],
+        ["Protection source", protection.source],
       ],
       tags: [
         { label: pendingStatus === "filled_but_position_missing" ? "LIVE POSITION UNKNOWN" : "EXCHANGE FAILED", tone: "critical" },
         { label: "Next setup can arm", tone: runtime.canArmNextSetup ? "live" : "critical" },
+        { label: protection.label, tone: protection.tone },
       ],
       tone: "critical",
       visualObjects: [{ label: "EXCHANGE FAILED", note: "Exchange returned a terminal trigger-order state.", tone: "critical" }],
@@ -2276,7 +2379,10 @@ export default function TradingViewChart() {
   useEffect(() => {
     clearLiveOrderLines();
     const runtime = sztabTelemetry?.intervals?.[selectedInterval]?.runtime;
+    const selectedConfig = sztabTelemetry?.config?.intervals?.[selectedInterval] ?? {};
     const pending = runtime?.pendingTriggerOrder;
+    const livePosition = positionsForOperationalState(livestreamTelemetry, selectedConfig)[0] ?? null;
+    const protection = liveProtectionState({ livePosition, pending, runtime });
     const firstTime = rawCandles[0]?.time;
     const lastTime = rawCandles.at(-1)?.time;
 
@@ -2292,17 +2398,21 @@ export default function TradingViewChart() {
       });
     }
 
-    if (pending?.stopLoss && ["filled_protected", "filled_sl_failed"].includes(String(pending.status ?? "").toLowerCase())) {
+    if (protection.price && ["live", "critical", "stale"].includes(protection.tone)) {
       addLiveOrderSegment({
-        color: pending.status === "filled_protected" ? "rgba(255, 186, 73, 0.95)" : "rgba(255, 83, 83, 0.95)",
+        color: protection.confirmed
+          ? "rgba(34, 197, 94, 0.95)"
+          : protection.label === "STALE SL STATE"
+            ? "rgba(148, 163, 184, 0.85)"
+            : "rgba(255, 83, 83, 0.95)",
         endTime: lastTime,
         lineStyle: 2,
-        startTime: Math.max(firstTime, Number(pending.fillDetectedAt ? Math.floor(new Date(pending.fillDetectedAt).getTime() / 1000) : firstTime)),
-        title: pending.status === "filled_protected" ? "LIVE SL PROTECTION" : "SL PLACEMENT FAILED",
-        value: pending.stopLoss,
+        startTime: Math.max(firstTime, Number(pending?.fillDetectedAt ? Math.floor(new Date(pending.fillDetectedAt).getTime() / 1000) : firstTime)),
+        title: protection.label,
+        value: protection.price,
       });
     }
-  }, [addLiveOrderSegment, clearLiveOrderLines, rawCandles, selectedInterval, sztabTelemetry]);
+  }, [addLiveOrderSegment, clearLiveOrderLines, livestreamTelemetry, rawCandles, selectedInterval, sztabTelemetry]);
 
   return (
     <main className="hubert-dashboard">

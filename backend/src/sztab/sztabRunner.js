@@ -84,6 +84,131 @@ function positionAmount(position) {
   return Math.abs(Number(position?.positionAmt ?? position?.positionAmount ?? position?.quantity ?? position?.availableAmt ?? 0));
 }
 
+function positionSideFromPosition(position = {}) {
+  const raw = String(position.positionSide ?? position.side ?? position.direction ?? "").toUpperCase();
+  if (raw.includes("LONG")) return "LONG";
+  if (raw.includes("SHORT")) return "SHORT";
+  const amount = Number(position.positionAmt ?? position.positionAmount ?? position.quantity ?? 0);
+  return amount < 0 ? "SHORT" : "LONG";
+}
+
+function matchingExchangePositionForLiveState(exchangePositions = [], livePosition = null, pending = null) {
+  const side = positionSideFromPosition(livePosition ?? pending ?? {});
+  return exchangePositions.find((position) => positionSideFromPosition(position) === side && positionAmount(position) > 0) ?? null;
+}
+
+function appendRuntimeJournal(profile, entry) {
+  profile.live = {
+    setupOrderJournal: [],
+    ...(profile.live ?? {}),
+  };
+  profile.live.setupOrderJournal = [
+    ...(profile.live.setupOrderJournal ?? []),
+    {
+      timestamp: nowIso(),
+      symbol: profile.symbol,
+      profileId: profile.id,
+      ...entry,
+    },
+  ].slice(-100);
+}
+
+function terminalPendingStatus(status) {
+  return [
+    "canceled",
+    "cancelled",
+    "expired",
+    "filled_but_position_missing",
+    "missing",
+    "rejected",
+    "simulated_only",
+    "terminal_failed",
+    "trigger_order_rejected",
+  ].includes(String(status ?? "").toLowerCase());
+}
+
+function reconcileLocalScenarioWithExchange(profile, exchangePositions = []) {
+  const pending = profile.live?.pendingTriggerOrder ?? null;
+  const localPosition = profile.live?.openPosition ?? null;
+  const matchingPosition = localPosition
+    ? matchingExchangePositionForLiveState(exchangePositions, localPosition, pending)
+    : null;
+
+  profile.live = {
+    ...(profile.live ?? {}),
+    activeScenarioCanBlockNewSetup: Boolean(localPosition || isActivePendingTrigger(pending)),
+    livePositionConfirmed: Boolean(matchingPosition),
+    liveProtectionConfirmed: false,
+    protectionOrderId: null,
+    protectionSource: matchingPosition ? "bingx_order" : pending ? "local_planned" : "none",
+    scenarioTerminalReason: pending?.terminalReason ?? "",
+    supersededBySetupId: pending?.supersededBySetupId ?? null,
+  };
+
+  if (!localPosition || matchingPosition) {
+    return profile;
+  }
+
+  const staleReason = "filled_but_position_missing";
+  profile.live.openPosition = null;
+  profile.live.lastProcessedSetupId = null;
+  profile.live.activeScenarioCanBlockNewSetup = false;
+  profile.live.livePositionConfirmed = false;
+  profile.live.liveProtectionConfirmed = false;
+  profile.live.protectionOrderId = null;
+  profile.live.protectionSource = "stale_local";
+  profile.live.scenarioTerminalReason = staleReason;
+
+  if (pending && !terminalPendingStatus(pending.status)) {
+    profile.live.pendingTriggerOrder = {
+      ...pending,
+      canArmNextSetup: true,
+      critical: staleReason,
+      failureClassification: staleReason,
+      lastExchangeStatus: pending.lastExchangeStatus ?? "POSITION_NOT_FOUND",
+      orderLifecycle: [
+        ...(pending.orderLifecycle ?? []),
+        {
+          message: "Local live position was cleared because fresh BingX sync did not find the expected position.",
+          status: staleReason,
+          time: nowIso(),
+        },
+      ].slice(-20),
+      protectionSource: "stale_local",
+      status: staleReason,
+      terminal: true,
+      terminalReason: staleReason,
+      updatedAt: nowIso(),
+    };
+  } else if (!pending && localPosition?.setupId) {
+    profile.live.pendingTriggerOrder = {
+      canArmNextSetup: true,
+      direction: localPosition.direction ?? positionSideFromPosition(localPosition),
+      failureClassification: staleReason,
+      protectionSource: "stale_local",
+      setupId: localPosition.setupId,
+      status: staleReason,
+      terminal: true,
+      terminalReason: staleReason,
+      triggerPrice: localPosition.entryPrice ?? null,
+      updatedAt: nowIso(),
+    };
+  }
+
+  appendRuntimeJournal(profile, {
+    event: "filled_but_position_missing",
+    failureClassification: staleReason,
+    interval: profile.timeframe,
+    reason: "Fresh BingX sync did not find the local live position; scenario will not block a newer setup.",
+    setupId: pending?.setupId ?? localPosition?.setupId ?? null,
+    side: pending?.side ?? positionSideFromPosition(localPosition),
+    status: staleReason,
+    triggerPrice: pending?.triggerPrice ?? localPosition?.entryPrice ?? null,
+  });
+
+  return profile;
+}
+
 function apiProfileLabel(apiProfiles = [], id = "") {
   return apiProfiles.find((profile) => profile.id === id)?.label ?? id;
 }
@@ -123,6 +248,7 @@ function defaultIntervalConfig(interval) {
       lastTickAt: null,
       lastOrderAttempt: null,
       pendingTriggerOrder: null,
+      activeScenarioCanBlockNewSetup: false,
       canArmNextSetup: true,
       exchangeTerminalStatus: "",
       lastExchangeStatus: "",
@@ -130,8 +256,14 @@ function defaultIntervalConfig(interval) {
       lastTriggerFailureReason: "",
       lastBlockedReason: "",
       pendingOrderAgeSeconds: null,
+      livePositionConfirmed: false,
+      liveProtectionConfirmed: false,
+      protectionOrderId: null,
+      protectionSource: "none",
+      scenarioTerminalReason: "",
       slPlacementStatus: "",
       setupOrderJournal: [],
+      supersededBySetupId: null,
       triggerFailureClassification: "",
       triggerOrderFillDetected: false,
       triggerOrderExecutedQty: null,
@@ -686,14 +818,15 @@ export function createSztabRunner({
       const publicProfile = apiProfiles.find((item) => item.id === current.apiProfile);
       const profileSyncAt = publicProfile?.lastSyncAt ?? publicProfile?.lastRefreshAt ?? null;
       const existingProfile = liveProfiles.get(interval) ?? {};
-      const profile = configToProfile({
+      let profile = configToProfile({
         ...current,
         apiProfileLabel: current.apiProfile,
       }, existingProfile);
       const exchangePositions = normalizeExchangeList(await client.getOpenPositions(profile.symbol))
         .filter((position) => compactSymbol(position.symbol) === compactSymbol(profile.symbol) && positionAmount(position) > 0);
+      profile = reconcileLocalScenarioWithExchange(profile, exchangePositions);
 
-      if (exchangePositions.length > 0 && !profile.live?.openPosition && !profile.live?.pendingTriggerOrder) {
+      if (exchangePositions.length > 0 && !profile.live?.openPosition && !isActivePendingTrigger(profile.live?.pendingTriggerOrder)) {
         await persistRuntime(interval, {
           ...executionDiagnostics,
           consecutiveErrors: 0,
@@ -831,15 +964,21 @@ export function createSztabRunner({
         lastSignal,
         lastSyncAt: nowIso(),
         pendingTriggerOrder,
+        activeScenarioCanBlockNewSetup: triggerSummary.activeScenarioCanBlockNewSetup,
         canArmNextSetup: triggerSummary.canArmNextSetup,
         exchangeTerminalStatus: triggerSummary.exchangeTerminalStatus,
         lastExchangeStatus: triggerSummary.lastExchangeStatus,
         lastStatusCheckAt: triggerSummary.lastStatusCheckAt,
         lastTriggerFailureReason: triggerSummary.lastTriggerFailureReason,
+        livePositionConfirmed: triggerSummary.livePositionConfirmed,
+        liveProtectionConfirmed: triggerSummary.liveProtectionConfirmed,
         latestEntryEvent,
         latestSetupEvent,
         pendingOrderAgeSeconds: triggerSummary.pendingOrderAgeSeconds,
+        protectionOrderId: triggerSummary.protectionOrderId,
+        protectionSource: triggerSummary.protectionSource,
         profileConnected: publicProfile?.status === "connected",
+        scenarioTerminalReason: triggerSummary.scenarioTerminalReason,
         slPlacementStatus: pendingTriggerOrder?.status === "filled_protected"
           ? "placed"
           : pendingTriggerOrder?.status === "filled_sl_failed"
@@ -848,6 +987,7 @@ export function createSztabRunner({
               ? "placed"
               : "not_placed",
         setupOrderJournal: triggerSummary.setupOrderJournal,
+        supersededBySetupId: triggerSummary.supersededBySetupId,
         triggerFailureClassification: triggerSummary.triggerFailureClassification,
         triggerOrderExecutedQty: triggerSummary.triggerOrderExecutedQty,
         triggerOrderFillDetected: triggerSummary.triggerOrderFillDetected,
@@ -904,15 +1044,22 @@ export function createSztabRunner({
     const isActive = isActivePendingTrigger(pending);
     const status = String(pending?.status ?? "none");
     return {
+      activeScenarioCanBlockNewSetup: Boolean(live?.activeScenarioCanBlockNewSetup ?? isActive),
       canArmNextSetup: pending ? Boolean(pending.canArmNextSetup ?? !isActive) : true,
       exchangeTerminalStatus: pending?.exchangeTerminalStatus ?? (pending?.terminal ? pending?.lastExchangeStatus ?? status : ""),
       lastExchangeStatus: pending?.lastExchangeStatus ?? "",
       lastStatusCheckAt: pending?.lastStatusCheckAt ?? null,
       lastTriggerFailureReason: pending?.terminalReason ?? pending?.failureClassification ?? pending?.critical ?? "",
+      livePositionConfirmed: Boolean(live?.livePositionConfirmed),
+      liveProtectionConfirmed: Boolean(live?.liveProtectionConfirmed),
       pendingOrderAgeSeconds: pending?.acceptedAt || pending?.updatedAt || pending?.createdAt
         ? secondsSinceIso(pending.acceptedAt ?? pending.updatedAt ?? pending.createdAt)
         : null,
+      protectionOrderId: live?.protectionOrderId ?? pending?.stopOrder?.orderId ?? pending?.stopOrder?.data?.orderId ?? null,
+      protectionSource: live?.protectionSource ?? pending?.protectionSource ?? (pending ? "local_planned" : "none"),
+      scenarioTerminalReason: live?.scenarioTerminalReason ?? pending?.terminalReason ?? "",
       setupOrderJournal: (live?.setupOrderJournal ?? []).slice(-100),
+      supersededBySetupId: live?.supersededBySetupId ?? pending?.supersededBySetupId ?? null,
       triggerFailureClassification: pending?.failureClassification ?? "",
       triggerOrderExecutedQty: pending?.executedQty ?? null,
       triggerOrderFillDetected: ["filled_protected", "filled_sl_failed", "filled_but_position_missing"].includes(status.toLowerCase()),
@@ -1006,18 +1153,25 @@ export function createSztabRunner({
           : current.runtime?.lastExchangeResponse ?? null,
       lastOrderAttempt,
       pendingTriggerOrder: nextPending,
+      activeScenarioCanBlockNewSetup: triggerSummary.activeScenarioCanBlockNewSetup,
       canArmNextSetup: triggerSummary.canArmNextSetup,
       exchangeTerminalStatus: triggerSummary.exchangeTerminalStatus,
       lastExchangeStatus: triggerSummary.lastExchangeStatus,
       lastStatusCheckAt: triggerSummary.lastStatusCheckAt,
       lastTriggerFailureReason: triggerSummary.lastTriggerFailureReason,
+      livePositionConfirmed: triggerSummary.livePositionConfirmed,
+      liveProtectionConfirmed: triggerSummary.liveProtectionConfirmed,
       pendingOrderAgeSeconds: triggerSummary.pendingOrderAgeSeconds,
+      protectionOrderId: triggerSummary.protectionOrderId,
+      protectionSource: triggerSummary.protectionSource,
+      scenarioTerminalReason: triggerSummary.scenarioTerminalReason,
       setupOrderJournal: triggerSummary.setupOrderJournal,
       slPlacementStatus: nextPending?.status === "filled_protected"
         ? "placed"
         : nextPending?.status === "filled_sl_failed"
           ? "failed"
           : "not_placed",
+      supersededBySetupId: triggerSummary.supersededBySetupId,
       triggerFailureClassification: triggerSummary.triggerFailureClassification,
       triggerOrderExecutedQty: triggerSummary.triggerOrderExecutedQty,
       triggerOrderFillDetected: triggerSummary.triggerOrderFillDetected,

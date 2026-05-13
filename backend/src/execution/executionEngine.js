@@ -219,6 +219,7 @@ export async function processLiveProfileExecution({
       logger,
       profile: updatedProfile,
       reason: "new_setup_replaced_pending_trigger",
+      supersededBySetupId: activeSetupEvent.setupId,
     });
   }
 
@@ -697,6 +698,7 @@ export async function cancelLivePendingTriggerOrder({
   logger = async () => {},
   profile,
   reason = "cancelled",
+  supersededBySetupId = null,
 }) {
   const updatedProfile = structuredClone(profile);
   const pending = activePendingTriggerOrder(updatedProfile.live?.pendingTriggerOrder);
@@ -770,6 +772,7 @@ export async function cancelLivePendingTriggerOrder({
       },
     ],
     status,
+    supersededBySetupId,
     terminal: status !== "cancel_failed",
     terminalReason,
     updatedAt: new Date().toISOString(),
@@ -784,6 +787,7 @@ export async function cancelLivePendingTriggerOrder({
     setupId: pending.setupId,
     side: pending.side,
     status,
+    supersededBySetupId,
     triggerPrice: pending.triggerPrice,
   });
 
