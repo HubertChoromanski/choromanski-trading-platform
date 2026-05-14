@@ -6,6 +6,7 @@ import {
   createChart,
   createSeriesMarkers,
 } from "lightweight-charts";
+import { backendApiUrl, dashboardAuthHeaders } from "../api/backend";
 import { createSolKlineSocket, fetchHistoricalCandles } from "../api/binance";
 import {
   STRATEGY_EVENT_TYPES,
@@ -1327,23 +1328,10 @@ function chartTimeValue(value) {
   return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
 }
 
-function normalizeBackendUrl(value) {
-  const normalized = String(value || "").replace(/\/+$/u, "");
-  if (import.meta.env.PROD && /^https?:\/\/(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(?::\d+)?/iu.test(normalized)) {
-    return "/api";
-  }
-  return normalized.endsWith("/api") ? normalized : `${normalized}/api`;
-}
-
-const BACKEND_URL = normalizeBackendUrl(
-  import.meta.env.VITE_BACKEND_URL ?? (import.meta.env.PROD ? "/api" : "http://127.0.0.1:8787"),
-);
-const DASHBOARD_TOKEN = import.meta.env.VITE_DASHBOARD_TOKEN ?? "";
-
 async function apiFetch(path) {
-  const response = await fetch(`${BACKEND_URL}${path}`, {
+  const response = await fetch(backendApiUrl(path), {
     cache: "no-store",
-    headers: DASHBOARD_TOKEN ? { "x-dashboard-token": DASHBOARD_TOKEN } : {},
+    headers: dashboardAuthHeaders(),
   });
 
   if (!response.ok) {

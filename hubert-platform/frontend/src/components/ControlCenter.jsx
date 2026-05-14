@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { runBacktest } from "../backtest/backtestEngine";
+import { BACKEND_URL, backendApiUrl, dashboardAuthHeaders } from "../api/backend";
 import { fetchHistoricalCandles } from "../api/binance";
 
 const PANEL_GROUPS = [
@@ -21,10 +22,6 @@ const PANEL_GROUPS = [
   },
 ];
 
-const BACKEND_URL = normalizeBackendUrl(
-  import.meta.env.VITE_BACKEND_URL ?? (import.meta.env.PROD ? "/api" : "http://127.0.0.1:8787"),
-);
-const DASHBOARD_TOKEN = import.meta.env.VITE_DASHBOARD_TOKEN ?? "";
 const DISPLAY_TIME_ZONE = import.meta.env.VITE_DISPLAY_TIME_ZONE || "Europe/Warsaw";
 const DISPLAY_LOCALE = import.meta.env.VITE_DISPLAY_LOCALE || "pl-PL";
 const DATE_TIME_FORMATTER = new Intl.DateTimeFormat(DISPLAY_LOCALE, {
@@ -349,25 +346,14 @@ function writeActiveSweepId(id) {
   }
 }
 
-function normalizeBackendUrl(value) {
-  if (!value) return "http://127.0.0.1:8787";
-  if (import.meta.env.PROD && /^https?:\/\/(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(?::\d+)?/iu.test(String(value))) {
-    return "/api";
-  }
-  if (value.toLowerCase() === "/api") return "/api";
-  return value.replace(/\/$/, "");
-}
-
 function apiUrl(path) {
-  if (BACKEND_URL.startsWith("http")) return `${BACKEND_URL}${path}`;
-  return `${BACKEND_URL}${path}`;
+  return backendApiUrl(path);
 }
 
 async function apiFetch(path, options = {}) {
   const headers = {
     "Content-Type": "application/json",
-    ...(DASHBOARD_TOKEN ? { "X-Dashboard-Token": DASHBOARD_TOKEN } : {}),
-    ...(options.headers ?? {}),
+    ...dashboardAuthHeaders(options.headers ?? {}),
   };
   const response = await fetch(apiUrl(path), {
     ...options,
@@ -389,8 +375,7 @@ async function apiFetch(path, options = {}) {
 async function apiFetchDetailed(path, options = {}) {
   const headers = {
     "Content-Type": "application/json",
-    ...(DASHBOARD_TOKEN ? { "X-Dashboard-Token": DASHBOARD_TOKEN } : {}),
-    ...(options.headers ?? {}),
+    ...dashboardAuthHeaders(options.headers ?? {}),
   };
   const response = await fetch(apiUrl(path), {
     ...options,

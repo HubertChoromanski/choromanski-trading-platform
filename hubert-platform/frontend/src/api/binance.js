@@ -1,27 +1,13 @@
+import { backendApiUrl } from "./backend";
+
 const BINANCE_BASE_URL = "https://api.binance.com/api/v3";
 const BINANCE_STREAM_BASE_URL = "wss://stream.binance.com:9443/ws";
-const BACKEND_URL = normalizeBackendUrl(
-  import.meta.env.VITE_BACKEND_URL ?? (import.meta.env.PROD ? "/api" : "http://127.0.0.1:8787"),
-);
 const NATIVE_INTERVALS = new Set(["1m", "5m", "15m", "30m", "1h", "4h"]);
 const SUPPORTED_INTERVALS = new Set(["10m", "15m", "20m", "30m", "1h", "4h"]);
 const CUSTOM_INTERVALS = {
   "10m": { base: "5m", minutes: 10 },
   "20m": { base: "5m", minutes: 20 },
 };
-
-function normalizeBackendUrl(value) {
-  if (!value) return "http://127.0.0.1:8787";
-  if (import.meta.env.PROD && /^https?:\/\/(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(?::\d+)?/iu.test(String(value))) {
-    return "/api";
-  }
-  if (value.toLowerCase() === "/api") return "/api";
-  return value.replace(/\/$/, "");
-}
-
-function backendApiUrl(path) {
-  return `${BACKEND_URL}${path}`;
-}
 
 function normalizeKline(kline) {
   return {
