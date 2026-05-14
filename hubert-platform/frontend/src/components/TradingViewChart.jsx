@@ -883,12 +883,27 @@ function runningIntervalSet(status = {}) {
 
 function normalizeSztabRuntimeForPanel(status = {}, interval) {
   const key = String(interval ?? "").toLowerCase();
+  const intervalsRunning = [...runningIntervalSet(status)];
   const statusInterval = status?.intervals?.[interval] ?? status?.intervals?.[key] ?? {};
   const configInterval = status?.config?.intervals?.[interval] ?? status?.config?.intervals?.[key] ?? {};
   const runtime = {
     ...(configInterval.runtime ?? {}),
     ...(statusInterval.runtime ?? {}),
   };
+  runtime.setupOrderJournal =
+    statusInterval.runtime?.setupOrderJournal ??
+    statusInterval.setupOrderJournal ??
+    configInterval.runtime?.setupOrderJournal ??
+    configInterval.setupOrderJournal ??
+    runtime.setupOrderJournal ??
+    [];
+  runtime.pendingTriggerOrder =
+    statusInterval.runtime?.pendingTriggerOrder ??
+    statusInterval.pendingTriggerOrder ??
+    configInterval.runtime?.pendingTriggerOrder ??
+    configInterval.pendingTriggerOrder ??
+    runtime.pendingTriggerOrder ??
+    null;
   const runningFromRunner = runningIntervalSet(status).has(key);
   const rawStatus = String(runtime.status ?? "").toLowerCase();
   const operationalStatus = runningFromRunner && !["running", "degraded", "recovering", "error", "interrupted"].includes(rawStatus)
@@ -898,11 +913,27 @@ function normalizeSztabRuntimeForPanel(status = {}, interval) {
   const backendUpdatedAt = status?.updatedAt ?? status?.config?.updatedAt ?? null;
   const heartbeatAge = runtime.heartbeatAgeSeconds ?? secondsSince(runtime.heartbeatAt ?? runtime.lastTickAt);
   const fetchAge = secondsSince(frontendFetchedAt);
-  const uiDataStale = Boolean(
-    status?.__frontendFetchError ||
-      (fetchAge !== null && fetchAge > 20) ||
-      (runningFromRunner && heartbeatAge !== null && heartbeatAge > 120),
-  );
+  const staleReasons = [
+    status?.__frontendFetchError ? `błąd pobrania: ${status.__frontendFetchError}` : "",
+    fetchAge !== null && fetchAge > 20 ? `frontend fetch ${fetchAge}s temu` : "",
+    runningFromRunner && heartbeatAge !== null && heartbeatAge > 120 ? `heartbeat ${heartbeatAge}s temu` : "",
+  ].filter(Boolean);
+  const uiDataStale = staleReasons.length > 0;
+  const sharedRuntime = {
+    backendUpdatedAt,
+    frontendStatusFetchAgeSeconds: fetchAge,
+    frontendStatusFetchedAt: frontendFetchedAt,
+    frontendStatusFetchError: status?.__frontendFetchError ?? "",
+    heartbeatAgeSeconds: heartbeatAge,
+    runnerRunningFromStatus: runningFromRunner,
+    runningIntervalsText: intervalsRunning.length ? intervalsRunning.join(", ") : "--",
+    staleDetection: staleReasons.length ? staleReasons.join("; ") : "świeże",
+    status: operationalStatus,
+    statusSource: runningFromRunner && rawStatus !== operationalStatus
+      ? "runner.runningIntervals"
+      : "runtime.status",
+    uiDataStale,
+  };
 
   return {
     config: {
@@ -910,32 +941,12 @@ function normalizeSztabRuntimeForPanel(status = {}, interval) {
       ...statusInterval,
       runtime: {
         ...runtime,
-        backendUpdatedAt,
-        frontendStatusFetchAgeSeconds: fetchAge,
-        frontendStatusFetchedAt: frontendFetchedAt,
-        frontendStatusFetchError: status?.__frontendFetchError ?? "",
-        heartbeatAgeSeconds: heartbeatAge,
-        runnerRunningFromStatus: runningFromRunner,
-        status: operationalStatus,
-        statusSource: runningFromRunner && rawStatus !== operationalStatus
-          ? "runner.runningIntervals"
-          : "runtime.status",
-        uiDataStale,
+        ...sharedRuntime,
       },
     },
     runtime: {
       ...runtime,
-      backendUpdatedAt,
-      frontendStatusFetchAgeSeconds: fetchAge,
-      frontendStatusFetchedAt: frontendFetchedAt,
-      frontendStatusFetchError: status?.__frontendFetchError ?? "",
-      heartbeatAgeSeconds: heartbeatAge,
-      runnerRunningFromStatus: runningFromRunner,
-      status: operationalStatus,
-      statusSource: runningFromRunner && rawStatus !== operationalStatus
-        ? "runner.runningIntervals"
-        : "runtime.status",
-      uiDataStale,
+      ...sharedRuntime,
     },
   };
 }
@@ -945,6 +956,8 @@ function runtimeDiagnostics(runtime = {}) {
     ["Status z", runtime.statusSource ?? "--"],
     ["Frontend fetch", runtime.frontendStatusFetchedAt ? `${formatChartTime(runtime.frontendStatusFetchedAt)} (${ageText(runtime.frontendStatusFetchedAt)})` : "--"],
     ["Backend updatedAt", runtime.backendUpdatedAt ? `${formatChartTime(runtime.backendUpdatedAt)} (${ageText(runtime.backendUpdatedAt)})` : "--"],
+    ["runningIntervals", runtime.runningIntervalsText ?? "--"],
+    ["Stale detection", runtime.staleDetection ?? "--"],
     ["Heartbeat", runtime.heartbeatAt ? `${formatChartTime(runtime.heartbeatAt)} (${ageText(runtime.heartbeatAt)})` : runtime.heartbeatAgeSeconds !== null && runtime.heartbeatAgeSeconds !== undefined ? `${runtime.heartbeatAgeSeconds}s temu` : "--"],
     ["Fetch error", runtime.frontendStatusFetchError || "--"],
   ];
@@ -1270,16 +1283,6 @@ function OperationalTelemetryPanel({
           </div>
 
           <div className="hubert-operational-section">
-            <strong>Diagnostyka statusu</strong>
-            {(selected.diagnostics ?? []).map(([label, value]) => (
-              <span key={label}>
-                <b>{label}</b>
-                <i>{value ?? "--"}</i>
-              </span>
-            ))}
-          </div>
-
-          <div className="hubert-operational-section">
             <strong>Znaczenie linii i markerów</strong>
             {(selected.visualObjects ?? []).map((item, index) => (
               <span data-tone={item.tone} key={`${item.label}-${index}`}>
@@ -1302,6 +1305,16 @@ function OperationalTelemetryPanel({
                 <i>Nie zapisano jeszcze zdarzeń setupu ani zleceń dla tego interwału.</i>
               </span>
             )}
+          </div>
+
+          <div className="hubert-operational-section">
+            <strong>Diagnostyka statusu</strong>
+            {(selected.diagnostics ?? []).map(([label, value]) => (
+              <span key={label}>
+                <b>{label}</b>
+                <i>{value ?? "--"}</i>
+              </span>
+            ))}
           </div>
         </>
       )}
