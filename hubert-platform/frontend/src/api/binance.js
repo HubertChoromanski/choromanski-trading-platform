@@ -12,6 +12,9 @@ const CUSTOM_INTERVALS = {
 
 function normalizeBackendUrl(value) {
   if (!value) return "http://127.0.0.1:8787";
+  if (import.meta.env.PROD && /^https?:\/\/(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(?::\d+)?/iu.test(String(value))) {
+    return "/api";
+  }
   if (value.toLowerCase() === "/api") return "/api";
   return value.replace(/\/$/, "");
 }

@@ -314,6 +314,19 @@ function formatChartTime(value) {
   return date ? FULL_TIME_FORMATTER.format(date) : "--";
 }
 
+function secondsSince(value) {
+  const date = dateFromChartTime(value);
+  if (!date) return null;
+  return Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+}
+
+function ageText(value) {
+  const seconds = secondsSince(value);
+  if (seconds === null) return "--";
+  if (seconds < 60) return `${seconds}s temu`;
+  return `${Math.floor(seconds / 60)}m temu`;
+}
+
 function formatChartAxisTime(value) {
   const date = dateFromChartTime(value);
   return date ? AXIS_TIME_FORMATTER.format(date) : "";
@@ -861,6 +874,82 @@ function readableJournalText(item = {}) {
   }
 }
 
+function runningIntervalSet(status = {}) {
+  return new Set(
+    (status?.runner?.runningIntervals ?? status?.runningIntervals ?? [])
+      .map((item) => String(item).toLowerCase()),
+  );
+}
+
+function normalizeSztabRuntimeForPanel(status = {}, interval) {
+  const key = String(interval ?? "").toLowerCase();
+  const statusInterval = status?.intervals?.[interval] ?? status?.intervals?.[key] ?? {};
+  const configInterval = status?.config?.intervals?.[interval] ?? status?.config?.intervals?.[key] ?? {};
+  const runtime = {
+    ...(configInterval.runtime ?? {}),
+    ...(statusInterval.runtime ?? {}),
+  };
+  const runningFromRunner = runningIntervalSet(status).has(key);
+  const rawStatus = String(runtime.status ?? "").toLowerCase();
+  const operationalStatus = runningFromRunner && !["running", "degraded", "recovering", "error", "interrupted"].includes(rawStatus)
+    ? "running"
+    : rawStatus || (runningFromRunner ? "running" : "stopped");
+  const frontendFetchedAt = status?.__frontendFetchedAt ?? null;
+  const backendUpdatedAt = status?.updatedAt ?? status?.config?.updatedAt ?? null;
+  const heartbeatAge = runtime.heartbeatAgeSeconds ?? secondsSince(runtime.heartbeatAt ?? runtime.lastTickAt);
+  const fetchAge = secondsSince(frontendFetchedAt);
+  const uiDataStale = Boolean(
+    status?.__frontendFetchError ||
+      (fetchAge !== null && fetchAge > 20) ||
+      (runningFromRunner && heartbeatAge !== null && heartbeatAge > 120),
+  );
+
+  return {
+    config: {
+      ...configInterval,
+      ...statusInterval,
+      runtime: {
+        ...runtime,
+        backendUpdatedAt,
+        frontendStatusFetchAgeSeconds: fetchAge,
+        frontendStatusFetchedAt: frontendFetchedAt,
+        frontendStatusFetchError: status?.__frontendFetchError ?? "",
+        heartbeatAgeSeconds: heartbeatAge,
+        runnerRunningFromStatus: runningFromRunner,
+        status: operationalStatus,
+        statusSource: runningFromRunner && rawStatus !== operationalStatus
+          ? "runner.runningIntervals"
+          : "runtime.status",
+        uiDataStale,
+      },
+    },
+    runtime: {
+      ...runtime,
+      backendUpdatedAt,
+      frontendStatusFetchAgeSeconds: fetchAge,
+      frontendStatusFetchedAt: frontendFetchedAt,
+      frontendStatusFetchError: status?.__frontendFetchError ?? "",
+      heartbeatAgeSeconds: heartbeatAge,
+      runnerRunningFromStatus: runningFromRunner,
+      status: operationalStatus,
+      statusSource: runningFromRunner && rawStatus !== operationalStatus
+        ? "runner.runningIntervals"
+        : "runtime.status",
+      uiDataStale,
+    },
+  };
+}
+
+function runtimeDiagnostics(runtime = {}) {
+  return [
+    ["Status z", runtime.statusSource ?? "--"],
+    ["Frontend fetch", runtime.frontendStatusFetchedAt ? `${formatChartTime(runtime.frontendStatusFetchedAt)} (${ageText(runtime.frontendStatusFetchedAt)})` : "--"],
+    ["Backend updatedAt", runtime.backendUpdatedAt ? `${formatChartTime(runtime.backendUpdatedAt)} (${ageText(runtime.backendUpdatedAt)})` : "--"],
+    ["Heartbeat", runtime.heartbeatAt ? `${formatChartTime(runtime.heartbeatAt)} (${ageText(runtime.heartbeatAt)})` : runtime.heartbeatAgeSeconds !== null && runtime.heartbeatAgeSeconds !== undefined ? `${runtime.heartbeatAgeSeconds}s temu` : "--"],
+    ["Fetch error", runtime.frontendStatusFetchError || "--"],
+  ];
+}
+
 function deriveOperationalState({
   activeAnalysisSession,
   config = {},
@@ -886,6 +975,7 @@ function deriveOperationalState({
   const sideText = polishSide(side);
   const base = {
     detail: markerReality.note,
+    diagnostics: runtimeDiagnostics(runtime),
     interval,
     markerReality,
     pending,
@@ -949,7 +1039,28 @@ function deriveOperationalState({
     };
   }
 
-  if (status !== "running") {
+  if (runtime.uiDataStale) {
+    return {
+      ...base,
+      headline: `${intervalName}: dane panelu są nieświeże`,
+      detail: runtime.frontendStatusFetchError
+        ? `Panel nie pobrał świeżego /api/sztab/status: ${runtime.frontendStatusFetchError}`
+        : "Backend runner może działać, ale panel nie ma wystarczająco świeżego statusu. To nie oznacza automatycznie, że bot jest offline.",
+      rows: [
+        ["Stan z backendu", polishStatus(status || "unknown")],
+        ["Runner aktywny wg statusu", takNie(runtime.runnerRunningFromStatus)],
+        ["Heartbeat", runtime.heartbeatAgeSeconds !== null && runtime.heartbeatAgeSeconds !== undefined ? `${runtime.heartbeatAgeSeconds}s` : "--"],
+        ["Ostatni fetch UI", runtime.frontendStatusFetchedAt ? formatChartTime(runtime.frontendStatusFetchedAt) : "--"],
+      ],
+      tags: [
+        { label: "DANE PANELU NIEŚWIEŻE", tone: "stale" },
+        { label: runtime.runnerRunningFromStatus ? "RUNNER WIDOCZNY W runningIntervals" : markerReality.label, tone: runtime.runnerRunningFromStatus ? "pending" : markerReality.tone },
+      ],
+      tone: "stale",
+    };
+  }
+
+  if (!["running", "degraded"].includes(status)) {
     return {
       ...base,
       headline: `${intervalName}: bot offline dla tego interwału`,
@@ -1159,6 +1270,16 @@ function OperationalTelemetryPanel({
           </div>
 
           <div className="hubert-operational-section">
+            <strong>Diagnostyka statusu</strong>
+            {(selected.diagnostics ?? []).map(([label, value]) => (
+              <span key={label}>
+                <b>{label}</b>
+                <i>{value ?? "--"}</i>
+              </span>
+            ))}
+          </div>
+
+          <div className="hubert-operational-section">
             <strong>Znaczenie linii i markerów</strong>
             {(selected.visualObjects ?? []).map((item, index) => (
               <span data-tone={item.tone} key={`${item.label}-${index}`}>
@@ -1195,6 +1316,9 @@ function chartTimeValue(value) {
 
 function normalizeBackendUrl(value) {
   const normalized = String(value || "").replace(/\/+$/u, "");
+  if (import.meta.env.PROD && /^https?:\/\/(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(?::\d+)?/iu.test(normalized)) {
+    return "/api";
+  }
   return normalized.endsWith("/api") ? normalized : `${normalized}/api`;
 }
 
@@ -1205,6 +1329,7 @@ const DASHBOARD_TOKEN = import.meta.env.VITE_DASHBOARD_TOKEN ?? "";
 
 async function apiFetch(path) {
   const response = await fetch(`${BACKEND_URL}${path}`, {
+    cache: "no-store",
     headers: DASHBOARD_TOKEN ? { "x-dashboard-token": DASHBOARD_TOKEN } : {},
   });
 
@@ -1731,23 +1856,25 @@ export default function TradingViewChart() {
   const currentChartPrice = rawCandles.at(-1)?.close ?? null;
   const activeAnalysisSession = backtestAnalysisActive ? activeBacktestSession : null;
   const operationalStates = useMemo(() => {
-    const intervals = (sztabTelemetry?.config?.intervals ?? {});
     return Object.fromEntries(
       timeframes
         .filter((item) => item.interval !== "4h")
-        .map((item) => [
-          item.interval,
-          deriveOperationalState({
-            activeAnalysisSession,
-            config: intervals[item.interval] ?? {},
-            currentPrice: currentChartPrice,
-            interval: item.interval,
-            livestream: livestreamTelemetry,
-            markerSource: chartRenderStats.markerSource,
-            runtime: sztabTelemetry?.intervals?.[item.interval]?.runtime ?? intervals[item.interval]?.runtime ?? {},
-            selectedHistoricalWindow,
-          }),
-        ]),
+        .map((item) => {
+          const normalized = normalizeSztabRuntimeForPanel(sztabTelemetry, item.interval);
+          return [
+            item.interval,
+            deriveOperationalState({
+              activeAnalysisSession,
+              config: normalized.config,
+              currentPrice: currentChartPrice,
+              interval: item.interval,
+              livestream: livestreamTelemetry,
+              markerSource: chartRenderStats.markerSource,
+              runtime: normalized.runtime,
+              selectedHistoricalWindow,
+            }),
+          ];
+        }),
     );
   }, [activeAnalysisSession, chartRenderStats.markerSource, currentChartPrice, livestreamTelemetry, selectedHistoricalWindow, sztabTelemetry]);
 
@@ -2981,25 +3108,34 @@ export default function TradingViewChart() {
     let ignore = false;
 
     async function refreshSztabTelemetry() {
+      const fetchedAt = new Date().toISOString();
       try {
         const [status, livestream] = await Promise.all([
           apiFetch("/sztab/status"),
           apiFetch("/livestream?fresh=1").catch(() => null),
         ]);
         if (!ignore) {
-          setSztabTelemetry(status);
-          setLivestreamTelemetry(livestream);
+          setSztabTelemetry({
+            ...status,
+            __frontendFetchedAt: fetchedAt,
+            __frontendFetchError: "",
+          });
+          if (livestream) setLivestreamTelemetry(livestream);
         }
-      } catch {
+      } catch (error) {
         if (!ignore) {
-          setSztabTelemetry(null);
-          setLivestreamTelemetry(null);
+          const message = error instanceof Error ? error.message : String(error);
+          setSztabTelemetry((current) => ({
+            ...(current ?? {}),
+            __frontendFetchError: message,
+            __frontendFetchFailedAt: fetchedAt,
+          }));
         }
       }
     }
 
     refreshSztabTelemetry();
-    const intervalId = window.setInterval(refreshSztabTelemetry, 12_000);
+    const intervalId = window.setInterval(refreshSztabTelemetry, 5_000);
     return () => {
       ignore = true;
       window.clearInterval(intervalId);
@@ -3008,8 +3144,9 @@ export default function TradingViewChart() {
 
   useEffect(() => {
     clearLiveOrderLines();
-    const runtime = sztabTelemetry?.intervals?.[selectedInterval]?.runtime;
-    const selectedConfig = sztabTelemetry?.config?.intervals?.[selectedInterval] ?? {};
+    const normalized = normalizeSztabRuntimeForPanel(sztabTelemetry, selectedInterval);
+    const runtime = normalized.runtime;
+    const selectedConfig = normalized.config ?? {};
     const pending = runtime?.pendingTriggerOrder;
     const setup = runtime?.latestSetupEvent;
     const livePosition = positionsForOperationalState(livestreamTelemetry, selectedConfig)[0] ?? null;

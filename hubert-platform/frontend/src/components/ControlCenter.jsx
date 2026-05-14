@@ -351,6 +351,9 @@ function writeActiveSweepId(id) {
 
 function normalizeBackendUrl(value) {
   if (!value) return "http://127.0.0.1:8787";
+  if (import.meta.env.PROD && /^https?:\/\/(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(?::\d+)?/iu.test(String(value))) {
+    return "/api";
+  }
   if (value.toLowerCase() === "/api") return "/api";
   return value.replace(/\/$/, "");
 }
@@ -368,6 +371,7 @@ async function apiFetch(path, options = {}) {
   };
   const response = await fetch(apiUrl(path), {
     ...options,
+    cache: options.cache ?? "no-store",
     headers,
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
@@ -390,6 +394,7 @@ async function apiFetchDetailed(path, options = {}) {
   };
   const response = await fetch(apiUrl(path), {
     ...options,
+    cache: options.cache ?? "no-store",
     headers,
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
