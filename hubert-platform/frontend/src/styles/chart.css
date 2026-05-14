@@ -784,6 +784,12 @@ button {
   color: #060606;
 }
 
+.hubert-mini-status[data-tone="warn"] {
+  border-color: rgba(118, 86, 20, 0.36);
+  background: rgba(190, 150, 50, 0.16);
+  color: #2b1d03;
+}
+
 .hubert-mini-status[data-tone="bad"] {
   border-color: rgba(120, 24, 24, 0.3);
   background: rgba(150, 80, 80, 0.15);

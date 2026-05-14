@@ -535,8 +535,87 @@ function eventText(event) {
   const side = event.direction ? `${event.direction} ` : "";
   const type = event.type ?? "event";
   const id = event.setupId ? ` ${event.setupId}` : "";
+  const fingerprint = event.setupFingerprintShort ? ` · ${event.setupFingerprintShort}` : "";
   const time = event.time ? ` @ ${dateText(event.time)}` : "";
-  return `${side}${type}${id}${time}`;
+  return `${side}${type}${id}${fingerprint}${time}`;
+}
+
+function triggerFailureCandidateText(runtime = {}) {
+  const pending = runtime.pendingTriggerOrder ?? {};
+  const diagnostics = runtime.lastTriggerFailureDiagnostics ?? pending.failureDiagnostics ?? {};
+  if (diagnostics.triggerAlreadyCrossed) return "trigger_price_invalid_or_crossed";
+  return runtime.lastTriggerFailureCandidate || pending.failureCandidate || "--";
+}
+
+function triggerMarginDiagnostics(runtime = {}) {
+  const pending = runtime.pendingTriggerOrder ?? {};
+  const diagnostics = runtime.triggerMarginDiagnostics ??
+    runtime.lastTriggerFailureDiagnostics ??
+    pending.failureDiagnostics ??
+    pending.placementDiagnostics ??
+    {};
+  const marginSafety = diagnostics.marginSafety ?? pending.marginSafety ?? {};
+  const available = diagnostics.available ?? {};
+  const availableMargin = Number(available.availableMargin);
+  const marginRequired = Number(diagnostics.marginRequired);
+  const marginHeadroom = Number.isFinite(Number(diagnostics.marginHeadroom))
+    ? Number(diagnostics.marginHeadroom)
+    : Number.isFinite(availableMargin) && Number.isFinite(marginRequired)
+      ? availableMargin - marginRequired
+      : null;
+  const marginHeadroomPct = Number.isFinite(Number(diagnostics.marginHeadroomPct))
+    ? Number(diagnostics.marginHeadroomPct)
+    : Number.isFinite(availableMargin) && availableMargin > 0 && Number.isFinite(marginHeadroom)
+      ? (marginHeadroom / availableMargin) * 100
+      : null;
+  const warnings = new Set([...(diagnostics.warnings ?? [])]);
+  if (Number.isFinite(availableMargin) && Number.isFinite(marginRequired) && marginRequired > availableMargin) {
+    warnings.add("order_too_large_for_available_margin");
+  }
+  if (marginSafety.capApplied) warnings.add("margin_safety_cap_applied");
+  if (marginSafety.reason === "margin_safety_cap_below_min_order_size") warnings.add("margin_safety_cap_below_min_order_size");
+  const riskBasis = Number(marginSafety.riskBasis ?? available.equity ?? availableMargin);
+  const requestedRiskUsdt = Number(marginSafety.requestedRiskAmount);
+  const actualRiskUsdt = Number(marginSafety.riskAmountAfterCap);
+  const requestedRiskPercent = Number.isFinite(Number(marginSafety.requestedRiskPercent))
+    ? Number(marginSafety.requestedRiskPercent)
+    : Number.isFinite(riskBasis) && riskBasis > 0 && Number.isFinite(requestedRiskUsdt)
+      ? (requestedRiskUsdt / riskBasis) * 100
+      : null;
+  const actualRiskPercent = Number.isFinite(Number(marginSafety.riskPercentAfterCap))
+    ? Number(marginSafety.riskPercentAfterCap)
+    : Number.isFinite(riskBasis) && riskBasis > 0 && Number.isFinite(actualRiskUsdt)
+      ? (actualRiskUsdt / riskBasis) * 100
+      : null;
+  return {
+    actualRiskPercent,
+    actualRiskUsdt,
+    availableMargin,
+    balance: Number(available.balance),
+    capApplied: Boolean(marginSafety.capApplied),
+    desiredEstimatedRequiredMargin: Number(marginSafety.desiredEstimatedRequiredMargin),
+    desiredMarginRequired: Number(marginSafety.desiredMarginRequired),
+    desiredQuantity: Number(marginSafety.desiredQuantity),
+    equity: Number(available.equity),
+    estimatedRequiredMarginWithBuffer: Number(marginSafety.estimatedRequiredMarginAfterCap ?? diagnostics.estimatedRequiredMarginWithBuffer),
+    finalQuantity: Number(marginSafety.finalQuantity ?? diagnostics.quantity),
+    leverage: diagnostics.leverage,
+    marginHeadroom: Number.isFinite(Number(marginSafety.marginHeadroomAfterCap)) ? Number(marginSafety.marginHeadroomAfterCap) : marginHeadroom,
+    marginHeadroomPct: Number.isFinite(Number(marginSafety.marginHeadroomAfterCap)) && Number.isFinite(availableMargin) && availableMargin > 0
+      ? (Number(marginSafety.marginHeadroomAfterCap) / availableMargin) * 100
+      : marginHeadroomPct,
+    marginMode: diagnostics.marginMode,
+    marginRequired,
+    marginSafetyReason: marginSafety.reason ?? "",
+    marginUsageCap: Number(marginSafety.marginUsageCap),
+    maxAllowedRequiredMargin: Number(marginSafety.maxAllowedRequiredMargin),
+    notional: Number(diagnostics.notional),
+    requestedRiskPercent,
+    requestedRiskUsdt,
+    riskBasis,
+    usedMargin: Number(available.usedMargin ?? available.raw?.usedMargin ?? available.raw?.used ?? available.raw?.freezedMargin),
+    warnings: [...warnings],
+  };
 }
 
 function dataFreshnessTone(time) {
@@ -601,6 +680,12 @@ function protectionOrder(position, kind) {
     if (wantsTp) return hasTpText;
     return hasSlText && !hasTpText;
   });
+}
+
+function takeProfitOrderLike(order = {}) {
+  const type = String(order.type ?? order.orderType ?? order.origType ?? order.planType ?? "").toUpperCase();
+  const purpose = String(order.protectionType ?? order.protectionKind ?? order.tpslType ?? "").toUpperCase();
+  return type.includes("TAKE") || purpose.includes("TAKE") || purpose.includes("TP");
 }
 
 function protectionSourceText(position, kind) {
@@ -5503,7 +5588,7 @@ function SztabIntervalPanel({
   system,
 }) {
   const runtime = config.runtime ?? {};
-  const isRunning = runtime.status === "running";
+  const isRunning = ["running", "degraded", "recovering"].includes(String(runtime.status ?? "").toLowerCase());
   const locked = isRunning || config.locked || (config.strategyLocked && config.mmLocked);
   const profile = accountProfiles.find((item) => item.id === config.apiProfile);
   const positions = positionsForInterval(livestream?.positions ?? [], config, interval);
@@ -5519,7 +5604,22 @@ function SztabIntervalPanel({
   const validationMessage = validationText(config.validation);
   const startReady = Boolean(config.apiProfile && config.strategySavedAt && config.mmSavedAt && config.strategyLocked && config.mmLocked && config.validation?.ok);
   const triggerOrderStatus = String(runtime.pendingTriggerOrder?.status ?? runtime.triggerOrderState ?? "").toLowerCase();
-  const triggerOrderIsActive = ["accepted", "placed", "new", "partially_filled", "pending_sync"].includes(triggerOrderStatus);
+  const triggerOrderIsActive = ["accepted", "placed", "new", "partially_filled", "pending_sync", "platform_armed"].includes(triggerOrderStatus);
+  const platformTriggerMode = (runtime.executionMode ?? runtime.pendingTriggerOrder?.executionMode) === "platform_market_trigger";
+  const reversalTrigger = Boolean(runtime.reversalTrigger || runtime.pendingTriggerOrder?.isReversal);
+  const cleanupFailureClassification = runtime.cleanupFailureClassification ?? "";
+  const marginDiagnostics = triggerMarginDiagnostics(runtime);
+  const marginWarnings = marginDiagnostics.warnings ?? [];
+  const detectedTakeProfitOrders = [
+    ...orders.filter(takeProfitOrderLike),
+    ...positions
+      .map((position) => protectionOrder(position, "TP"))
+      .filter(Boolean),
+    runtime.pendingTriggerOrder?.takeProfitOrder,
+  ].filter(Boolean);
+  const detectedLegacyTakeProfitState = detectedTakeProfitOrders.length > 0 ||
+    positions.some((position) => Number(position.takeProfit) > 0) ||
+    Boolean(runtime.pendingTriggerOrder?.takeProfitOrder);
   const strategySaveStatus = config.strategyDirty
     ? "Unsaved changes"
     : config.strategySavedAt
@@ -5559,7 +5659,7 @@ function SztabIntervalPanel({
           <Metric label="Bot status" value={runtime.status ?? "stopped"} />
           <Metric label="API profile" value={profile?.label || config.apiProfile || "Missing"} />
           <Metric label="Exchange source" value="BingX futures" />
-          <Metric label="Live execution model" value="Exchange stop-market trigger execution" />
+          <Metric label="Live execution model" value={platformTriggerMode ? "Platform MARKET trigger watcher" : "Exchange stop-market trigger execution"} />
           <Metric label="Live sync" value={ageText(summary.lastBingxSyncAt)} />
           <Metric label="Lock state" value={locked ? "Locked" : "Unlocked"} />
           <Metric label="Started" value={compactDateText(runtime.startedAt)} />
@@ -5692,6 +5792,14 @@ function SztabIntervalPanel({
           <strong>Runner diagnostics</strong>
           <button type="button" onClick={onCheckSignalParity}>Check signal parity</button>
         </div>
+        {(runtime.runnerDegraded || runtime.priceFeedStatus === "degraded") && (
+          <MiniStatus tone="warn">
+            Runner zwolnił przez limit API, ale nadal działa. Feed ceny: {runtime.priceFeedMode ?? "--"} / {runtime.priceFeedStatus ?? "--"}.
+          </MiniStatus>
+        )}
+        {runtime.autoRecoveryStatus === "recovered" && (
+          <MiniStatus tone="good">Runner automatycznie wznowiony po chwilowym problemie API/sieci.</MiniStatus>
+        )}
         <div className="hubert-lab__metrics">
           <Metric label="Tick count" value={runtime.tickCount ?? 0} />
           <Metric label="Last loop" value={compactDateText(runtime.lastTickAt)} />
@@ -5716,15 +5824,57 @@ function SztabIntervalPanel({
           <Metric label="Latest entry event" value={eventText(runtime.latestEntryEvent)} />
           <Metric label="Latest executable signal" value={eventText(runtime.lastSignal)} />
           <Metric label="Current setup state" value={runtime.pendingTriggerOrder?.status ?? runtime.latestSetupEvent?.status ?? "none"} />
-          <Metric label="Trigger armed" value={triggerOrderIsActive && runtime.pendingTriggerOrder?.orderId ? "yes" : "no"} />
+          <Metric label="Trigger armed" value={triggerOrderIsActive ? "yes" : "no"} />
           <Metric label="Pending trigger order" value={runtime.pendingTriggerOrder?.orderId ?? "--"} />
+          <Metric label="Order fingerprint" value={runtime.pendingTriggerOrder?.setupFingerprintShort ?? runtime.setupFingerprintShort ?? "--"} />
+          <Metric label="Latest setup FP" value={runtime.latestSetupEvent?.setupFingerprintShort ?? "--"} />
+          <Metric label="Fingerprint match" value={runtime.orderFingerprintMatchesLatestSetup === null || runtime.orderFingerprintMatchesLatestSetup === undefined ? "--" : runtime.orderFingerprintMatchesLatestSetup ? "match" : "mismatch"} />
+          <Metric label="Execution mode" value={platformTriggerMode ? "platform MARKET trigger" : runtime.executionMode ?? "exchange trigger"} />
+          <Metric label="Price feed" value={`${runtime.priceFeedMode ?? "--"} / ${runtime.priceFeedStatus ?? "--"}`} />
+          <Metric label="Price feed age" value={runtime.priceFeedAgeMs !== null && runtime.priceFeedAgeMs !== undefined ? `${Math.round(runtime.priceFeedAgeMs)}ms` : "--"} />
+          <Metric label="Price rate limits" value={runtime.priceFeedRateLimitCount ?? 0} />
+          <Metric label="Price requests" value={runtime.priceFeedRequestCount ?? "--"} />
+          <Metric label="Price websocket" value={runtime.priceFeedWebsocketStatus ?? "--"} />
+          <Metric label="Auto recovery" value={runtime.autoRecoveryStatus || (runtime.runnerDegraded ? "degraded" : "--")} />
+          <Metric label="Next recovery" value={compactDateText(runtime.nextRecoveryAt)} />
+          <Metric label="Price source" value={runtime.lastPriceSource ?? runtime.pendingTriggerOrder?.priceSource ?? "--"} />
+          <Metric label="Live mark price" value={fmt(runtime.lastMarkPrice ?? runtime.pendingTriggerOrder?.lastMarkPrice)} />
           <Metric label="Trigger price" value={fmt(runtime.pendingTriggerOrder?.triggerPrice ?? runtime.latestSetupEvent?.trigger)} />
+          <Metric label="Trigger crossed" value={(runtime.platformTriggerCrossed ?? runtime.pendingTriggerOrder?.triggerCrossed) ? "yes" : "no"} />
+          <Metric label="Crossed time" value={compactDateText(runtime.platformTriggerCrossedAt ?? runtime.pendingTriggerOrder?.triggerCrossedAt)} />
+          <Metric label="Market entry sent" value={(runtime.platformMarketEntrySent ?? runtime.pendingTriggerOrder?.marketOrderSent) ? "yes" : "no"} />
+          <Metric label="Execution price" value={fmt(runtime.executionPrice ?? runtime.pendingTriggerOrder?.executionPrice)} />
+          <Metric label="Trigger slippage" value={runtime.platformTriggerSlippagePct !== null && runtime.platformTriggerSlippagePct !== undefined ? `${fmt(runtime.platformTriggerSlippagePct, 4)}%` : "--"} />
+          <Metric label="Skipped reason" value={runtime.platformTriggerSkippedReason || runtime.pendingTriggerOrder?.skippedReason || "--"} />
+          <Metric label="Distance at placement" value={runtime.triggerDistanceAtPlacementPct !== null && runtime.triggerDistanceAtPlacementPct !== undefined ? `${fmt(runtime.triggerDistanceAtPlacementPct, 4)}%` : "--"} />
+          <Metric label="Distance at failure" value={runtime.triggerDistanceAtFailurePct !== null && runtime.triggerDistanceAtFailurePct !== undefined ? `${fmt(runtime.triggerDistanceAtFailurePct, 4)}%` : "--"} />
+          <Metric label="Placement warning" value={(runtime.pendingTriggerOrder?.placementDiagnostics?.warnings ?? []).join(", ") || "--"} />
+          <Metric label="Equity" value={fmt(marginDiagnostics.equity)} />
+          <Metric label="Futures balance" value={fmt(marginDiagnostics.balance)} />
+          <Metric label="Available margin" value={fmt(marginDiagnostics.availableMargin)} />
+          <Metric label="Used margin" value={fmt(marginDiagnostics.usedMargin)} />
+          <Metric label="Risk basis used" value={fmt(marginDiagnostics.riskBasis)} />
+          <Metric label="Requested SL risk" value={Number.isFinite(marginDiagnostics.requestedRiskPercent) ? `${fmt(marginDiagnostics.requestedRiskUsdt)} (${fmt(marginDiagnostics.requestedRiskPercent)}%)` : "--"} />
+          <Metric label="Actual SL risk" value={Number.isFinite(marginDiagnostics.actualRiskPercent) ? `${fmt(marginDiagnostics.actualRiskUsdt)} (${fmt(marginDiagnostics.actualRiskPercent)}%)` : "--"} />
+          <Metric label="Desired qty" value={fmt(marginDiagnostics.desiredQuantity, 3)} />
+          <Metric label="Final qty" value={fmt(marginDiagnostics.finalQuantity, 3)} />
+          <Metric label="Margin cap applied" value={marginDiagnostics.capApplied ? "yes" : "no"} />
+          <Metric label="Margin usage cap" value={Number.isFinite(marginDiagnostics.marginUsageCap) ? `${fmt(marginDiagnostics.marginUsageCap * 100, 0)}%` : "--"} />
+          <Metric label="Max allowed margin" value={fmt(marginDiagnostics.maxAllowedRequiredMargin)} />
+          <Metric label="Required margin est." value={fmt(marginDiagnostics.marginRequired)} />
+          <Metric label="Required + buffer" value={fmt(marginDiagnostics.estimatedRequiredMarginWithBuffer)} />
+          <Metric label="Margin headroom" value={Number.isFinite(marginDiagnostics.marginHeadroom) ? `${fmt(marginDiagnostics.marginHeadroom)} (${fmt(marginDiagnostics.marginHeadroomPct, 2)}%)` : "--"} />
+          <Metric label="Leverage used" value={marginDiagnostics.leverage ?? "--"} />
+          <Metric label="Margin mode" value={marginDiagnostics.marginMode ?? "--"} />
+          <Metric label="Margin safety" value={marginDiagnostics.marginSafetyReason || "--"} />
+          <Metric label="Margin warning" value={marginWarnings.length ? marginWarnings.join(", ") : "--"} />
           <Metric label="Trigger order status" value={runtime.triggerOrderState ?? runtime.pendingTriggerOrder?.status ?? "--"} />
           <Metric label="Exchange terminal status" value={runtime.exchangeTerminalStatus || "--"} />
           <Metric label="Last exchange status" value={runtime.lastExchangeStatus || runtime.pendingTriggerOrder?.lastExchangeStatus || "--"} />
           <Metric label="Last status check" value={compactDateText(runtime.lastStatusCheckAt)} />
           <Metric label="Executed qty" value={runtime.triggerOrderExecutedQty !== null && runtime.triggerOrderExecutedQty !== undefined ? fmt(runtime.triggerOrderExecutedQty, 3) : "--"} />
           <Metric label="Failure classification" value={runtime.triggerFailureClassification || "--"} />
+          <Metric label="Failure candidate" value={triggerFailureCandidateText(runtime)} />
           <Metric label="Last trigger failure" value={runtime.lastTriggerFailureReason || "--"} />
           <Metric label="Pending order age" value={runtime.pendingOrderAgeSeconds !== null && runtime.pendingOrderAgeSeconds !== undefined ? `${runtime.pendingOrderAgeSeconds}s` : "--"} />
           <Metric label="Can arm next setup" value={runtime.canArmNextSetup ? "true" : "false"} />
@@ -5744,6 +5894,7 @@ function SztabIntervalPanel({
                 <tr>
                   <th>Time</th>
                   <th>Setup</th>
+                  <th>FP</th>
                   <th>Side</th>
                   <th>Trigger</th>
                   <th>Qty</th>
@@ -5757,6 +5908,7 @@ function SztabIntervalPanel({
                   <tr key={`${item.timestamp ?? index}-${item.orderId ?? item.setupId ?? index}`}>
                     <td>{compactDateText(item.timestamp)}</td>
                     <td>{item.setupId ?? "--"}</td>
+                    <td>{item.setupFingerprintShort ?? (item.setupFingerprint ? String(item.setupFingerprint).replace(/^sf_/, "").slice(0, 8).toUpperCase() : "--")}</td>
                     <td>{item.side ?? "--"}</td>
                     <td>{fmt(item.triggerPrice)}</td>
                     <td>{fmt(item.quantity, 3)}</td>
@@ -5765,12 +5917,84 @@ function SztabIntervalPanel({
                     <td>{item.reason ?? item.failureClassification ?? item.event ?? "--"}</td>
                   </tr>
                 )) : (
-                  <tr><td colSpan="8">No setup/order journal entries yet.</td></tr>
+                  <tr><td colSpan="9">No setup/order journal entries yet.</td></tr>
                 )}
               </tbody>
             </table>
           </div>
         </details>
+        {runtime.orderFingerprintMatchesLatestSetup === false && runtime.pendingTriggerOrder?.setupFingerprint && runtime.latestSetupEvent?.setupFingerprint && (
+          <MiniStatus>
+            Fresh setup is not linked to the old trigger order: CTP id may match, but setup fingerprints differ.
+          </MiniStatus>
+        )}
+        {platformTriggerMode && triggerOrderStatus === "platform_armed" && (
+          <MiniStatus>
+            {reversalTrigger
+              ? "Pozycja aktywna. Bot czeka na przeciwny trigger do odwrócenia."
+              : "Bot pilnuje triggera lokalnie. Po przebiciu ceny BingX mark wyśle MARKET."}
+          </MiniStatus>
+        )}
+        {platformTriggerMode && runtime.reversalStatus === "completed" && (
+          <MiniStatus tone="good">
+            Reversal wykonany.
+          </MiniStatus>
+        )}
+        {platformTriggerMode && triggerOrderStatus === "reversal_close_failed" && (
+          <MiniStatus tone="bad">
+            Przeciwny trigger przebity, ale nie udało się zamknąć starej pozycji. Nowa pozycja nie została otwarta.
+          </MiniStatus>
+        )}
+        {platformTriggerMode && triggerOrderStatus === "reversal_close_succeeded_entry_failed" && (
+          <MiniStatus tone="bad">
+            Zamknięto starą pozycję, ale nie udało się otworzyć nowej.
+          </MiniStatus>
+        )}
+        {platformTriggerMode && runtime.platformMarketEntrySent && (
+          <MiniStatus tone="good">
+            Trigger przebity — wysłano MARKET.
+          </MiniStatus>
+        )}
+        {platformTriggerMode && triggerOrderStatus === "trigger_crossed_but_price_too_far" && (
+          <MiniStatus tone="bad">
+            Trigger przebity, ale cena odjechała za daleko — wejście pominięte.
+          </MiniStatus>
+        )}
+        {platformTriggerMode && triggerOrderStatus === "setup_invalidated_before_platform_trigger" && (
+          <MiniStatus tone="bad">
+            Setup anulowany — poziom negacji został dotknięty przed triggerem.
+          </MiniStatus>
+        )}
+        {cleanupFailureClassification && cleanupFailureClassification !== "cancel_open_orders_ok" && (
+          <MiniStatus tone={cleanupFailureClassification === "cancel_open_orders_failed_transient" ? "neutral" : "bad"}>
+            Nie udało się anulować starych zleceń na BingX — runner działa dalej / wymaga kontroli.
+          </MiniStatus>
+        )}
+        {detectedLegacyTakeProfitState && (
+          <MiniStatus tone="bad">
+            Wykryto TP z poprzedniej wersji — rozważ ręczne anulowanie na BingX. Sztab nie zakłada już TP automatycznie.
+          </MiniStatus>
+        )}
+        {marginWarnings.includes("order_too_large_for_available_margin") && (
+          <MiniStatus tone="bad">
+            Balance exists, but the estimated required margin is larger than available margin for this subaccount.
+          </MiniStatus>
+        )}
+        {marginWarnings.includes("margin_safety_cap_applied") && (
+          <MiniStatus>
+            Bufor marginu zmniejszył pozycję. Realne ryzyko SL spadło z {fmt(marginDiagnostics.requestedRiskPercent)}% do {fmt(marginDiagnostics.actualRiskPercent)}%.
+          </MiniStatus>
+        )}
+        {marginWarnings.includes("margin_safety_cap_below_min_order_size") && (
+          <MiniStatus tone="bad">
+            Zlecenie zablokowane: brak wystarczającego marginu po buforze dla minimalnej ilości/notional.
+          </MiniStatus>
+        )}
+        {marginWarnings.includes("margin_headroom_below_diagnostic_buffer") && (
+          <MiniStatus>
+            Margin headroom is very small. BingX may reject or fail the trigger at activation even though balance is visible.
+          </MiniStatus>
+        )}
         {globalBlockers.length > 0 && (
           <MiniStatus tone="bad">
             Global execution blocker active: {globalBlockers.map((blocker) => blocker.reason).join("; ")}.
@@ -5793,6 +6017,8 @@ function SztabIntervalPanel({
             intervalBlockers,
             lastError: runtime.lastError || runtime.error || "",
             lastExchangeResponse: runtime.lastExchangeResponse ?? null,
+            triggerMarginDiagnostics: runtime.triggerMarginDiagnostics ?? null,
+            lastTriggerFailureDiagnostics: runtime.lastTriggerFailureDiagnostics ?? null,
             lastOrderAttempt: runtime.lastOrderAttempt ?? null,
             legacySafetyWarnings: runtime.legacySafetyWarnings ?? [],
             latestEntryEvent: runtime.latestEntryEvent ?? null,

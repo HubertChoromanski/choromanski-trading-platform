@@ -1,4 +1,5 @@
 import { cancelLivePendingTriggerOrder, processLiveProfileExecution } from "../execution/executionEngine.js";
+import { withSetupFingerprint } from "../execution/setupFingerprint.js";
 import { runStrategyForProfile, runStrategyOnCandles } from "../strategy/strategyRunner.js";
 
 export const SZTAB_INTERVALS = ["10m", "15m", "20m", "30m", "1h"];
@@ -10,6 +11,53 @@ const DEFAULT_SZTAB_CANDLE_LIMITS = {
   "30m": 10000,
   "1h": 10000,
 };
+
+function sztabExecutionMode() {
+  return String(process.env.SZTAB_EXECUTION_MODE ?? "exchange_trigger").toLowerCase() === "platform_market_trigger"
+    ? "platform_market_trigger"
+    : "exchange_trigger";
+}
+
+function triggerWatchMs() {
+  const configured = Number(process.env.SZTAB_TRIGGER_WATCH_MS);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  return sztabExecutionMode() === "platform_market_trigger" ? 1000 : 5000;
+}
+
+function autoRecoverRunners() {
+  return String(process.env.SZTAB_AUTO_RECOVER_RUNNERS ?? "true").toLowerCase() !== "false";
+}
+
+function runnerRecoveryCooldownMs() {
+  const configured = Number(process.env.SZTAB_RUNNER_RECOVERY_COOLDOWN_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 10_000;
+}
+
+function maxTransientErrorsBeforePause() {
+  const configured = Number(process.env.SZTAB_MAX_TRANSIENT_ERRORS_BEFORE_PAUSE);
+  return Number.isFinite(configured) && configured > 0 ? configured : 20;
+}
+
+function isRunningStatus(status) {
+  return ["running", "degraded", "recovering"].includes(String(status ?? "").toLowerCase());
+}
+
+function isTransientRunnerError(error) {
+  const message = String(error?.message ?? error ?? "").toLowerCase();
+  const code = String(error?.code ?? error?.status ?? error?.payload?.code ?? "").toLowerCase();
+  return Boolean(error?.transient || error?.priceFeedDegraded) ||
+    error?.status === 429 ||
+    code === "429" ||
+    error?.name === "AbortError" ||
+    ["etimedout", "econnreset", "econnrefused", "enotfound", "eai_again"].includes(code) ||
+    message.includes("429") ||
+    message.includes("too many request") ||
+    message.includes("rate limit") ||
+    message.includes("fetch failed") ||
+    message.includes("network") ||
+    message.includes("timeout") ||
+    error?.status >= 500;
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -40,19 +88,52 @@ function normalizeExchangeList(value) {
   return value ? [value] : [];
 }
 
-function eventSummary(event) {
+function calculateSetupTakeProfit(event = {}, risk = {}) {
+  if (risk.takeProfitEnabled !== true) return null;
+  const entry = Number(event.trigger ?? event.triggerPrice);
+  const stopLoss = Number(event.stopLoss ?? event.invalidationPrice);
+  const rr = Number(risk.takeProfitRr ?? 2);
+  const riskDistance = Math.abs(entry - stopLoss);
+  if (!Number.isFinite(entry) || !Number.isFinite(stopLoss) || !Number.isFinite(rr) || rr <= 0 || riskDistance <= 0) {
+    return null;
+  }
+  return String(event.direction ?? "").toUpperCase() === "LONG"
+    ? entry + riskDistance * rr
+    : entry - riskDistance * rr;
+}
+
+function eventSummary(event, profile = null) {
   if (!event) return null;
+  const fingerprinted = profile
+    ? withSetupFingerprint(
+        {
+          ...event,
+          interval: profile.timeframe,
+          symbol: profile.symbol,
+          takeProfit: calculateSetupTakeProfit(event, profile.risk),
+        },
+        {
+          interval: profile.timeframe,
+          strategyParameters: profile.strategyParameters,
+          symbol: profile.symbol,
+          takeProfit: calculateSetupTakeProfit(event, profile.risk),
+        },
+      )
+    : event;
   return {
-    direction: event.direction ?? null,
-    index: event.index ?? null,
-    price: event.price ?? null,
-    setupId: event.setupId ?? "",
-    signalTime: event.signalTime ?? null,
-    status: event.status ?? "",
-    stopLoss: event.stopLoss ?? null,
-    time: event.time ?? null,
-    trigger: event.trigger ?? null,
-    type: event.type ?? "",
+    direction: fingerprinted.direction ?? null,
+    index: fingerprinted.index ?? null,
+    price: fingerprinted.price ?? null,
+    setupFingerprint: fingerprinted.setupFingerprint ?? "",
+    setupFingerprintShort: fingerprinted.setupFingerprintShort ?? "",
+    setupId: fingerprinted.setupId ?? "",
+    signalTime: fingerprinted.signalTime ?? null,
+    status: fingerprinted.status ?? "",
+    stopLoss: fingerprinted.stopLoss ?? null,
+    takeProfit: fingerprinted.takeProfit ?? null,
+    time: fingerprinted.time ?? null,
+    trigger: fingerprinted.trigger ?? null,
+    type: fingerprinted.type ?? "",
   };
 }
 
@@ -119,16 +200,24 @@ function terminalPendingStatus(status) {
     "cancelled",
     "expired",
     "filled_but_position_missing",
+    "invalidated_before_fill",
+    "market_sent_position_missing",
     "missing",
+    "platform_blocked_existing_position",
+    "platform_market_order_rejected",
     "rejected",
+    "reversal_close_failed",
+    "reversal_close_succeeded_entry_failed",
+    "setup_invalidated_before_platform_trigger",
     "simulated_only",
     "terminal_failed",
+    "trigger_crossed_but_price_too_far",
     "trigger_order_rejected",
   ].includes(String(status ?? "").toLowerCase());
 }
 
 function isActivePendingTrigger(order) {
-  return ["accepted", "placed", "new", "partially_filled", "pending_sync"].includes(String(order?.status ?? "").toLowerCase());
+  return ["accepted", "placed", "new", "partially_filled", "pending_sync", "platform_armed"].includes(String(order?.status ?? "").toLowerCase());
 }
 
 function reconcileLocalScenarioWithExchange(profile, exchangePositions = []) {
@@ -190,6 +279,8 @@ function reconcileLocalScenarioWithExchange(profile, exchangePositions = []) {
       direction: localPosition.direction ?? positionSideFromPosition(localPosition),
       failureClassification: staleReason,
       protectionSource: "stale_local",
+      setupFingerprint: localPosition.setupFingerprint ?? null,
+      setupFingerprintShort: localPosition.setupFingerprintShort ?? null,
       setupId: localPosition.setupId,
       status: staleReason,
       terminal: true,
@@ -205,6 +296,8 @@ function reconcileLocalScenarioWithExchange(profile, exchangePositions = []) {
     interval: profile.timeframe,
     reason: "Fresh BingX sync did not find the local live position; scenario will not block a newer setup.",
     setupId: pending?.setupId ?? localPosition?.setupId ?? null,
+    setupFingerprint: pending?.setupFingerprint ?? localPosition?.setupFingerprint ?? null,
+    setupFingerprintShort: pending?.setupFingerprintShort ?? localPosition?.setupFingerprintShort ?? null,
     side: pending?.side ?? positionSideFromPosition(localPosition),
     status: staleReason,
     triggerPrice: pending?.triggerPrice ?? localPosition?.entryPrice ?? null,
@@ -254,12 +347,25 @@ function defaultIntervalConfig(interval) {
       pendingTriggerOrder: null,
       activeScenarioCanBlockNewSetup: false,
       canArmNextSetup: true,
+      executionMode: sztabExecutionMode(),
+      executionPrice: null,
       exchangeTerminalStatus: "",
+      lastMarkPrice: null,
       lastExchangeStatus: "",
+      lastPriceSource: null,
       lastStatusCheckAt: null,
       lastTriggerFailureReason: "",
+      orderFingerprintMatchesLatestSetup: null,
       lastBlockedReason: "",
+      lastTriggerFailureCandidate: "",
+      lastTriggerFailureDiagnostics: null,
       pendingOrderAgeSeconds: null,
+      platformMarketEntrySent: false,
+      platformTriggerCrossed: false,
+      platformTriggerCrossedAt: null,
+      platformTriggerDiagnostics: null,
+      platformTriggerSkippedReason: "",
+      platformTriggerSlippagePct: null,
       livePositionConfirmed: false,
       liveProtectionConfirmed: false,
       protectionOrderId: null,
@@ -267,7 +373,12 @@ function defaultIntervalConfig(interval) {
       scenarioTerminalReason: "",
       slPlacementStatus: "",
       setupOrderJournal: [],
+      setupFingerprint: "",
+      setupFingerprintShort: "",
       supersededBySetupId: null,
+      supersededBySetupFingerprint: null,
+      triggerDistanceAtFailurePct: null,
+      triggerDistanceAtPlacementPct: null,
       triggerFailureClassification: "",
       triggerOrderFillDetected: false,
       triggerOrderExecutedQty: null,
@@ -379,6 +490,7 @@ function configToProfile(config, existing = {}) {
     executionMode: "live",
     id: `sztab-${config.interval}`,
     live: {
+      lastProcessedSetupFingerprint: null,
       lastProcessedSetupId: null,
       openPosition: null,
       orderLog: [],
@@ -403,7 +515,8 @@ function configToProfile(config, existing = {}) {
       positionSizeMode: "risk-based",
       riskPerTradePercent: riskPerSl,
       startingBalance: 0,
-      takeProfitRr: 2,
+      takeProfitEnabled: false,
+      takeProfitRr: null,
     },
     runner: "sztab",
     status: "Sztab live ready",
@@ -471,7 +584,8 @@ function statusFromConfig(config) {
       const current = config.intervals[interval];
       const heartbeatAgeSeconds = secondsSinceIso(current.runtime?.heartbeatAt ?? current.runtime?.lastTickAt);
       const staleThreshold = Number(process.env.SZTAB_RUNNER_STALE_SECONDS || 120);
-      const runnerStale = current.runtime?.status === "running" && heartbeatAgeSeconds !== null && heartbeatAgeSeconds > staleThreshold;
+      const runnerActive = isRunningStatus(current.runtime?.status);
+      const runnerStale = runnerActive && heartbeatAgeSeconds !== null && heartbeatAgeSeconds > staleThreshold;
       return [
         interval,
         {
@@ -482,8 +596,8 @@ function statusFromConfig(config) {
             ...current.runtime,
             heartbeatAgeSeconds,
             runnerStale,
-            watchdogStatus: current.runtime?.status === "running"
-              ? runnerStale ? "stale" : "healthy"
+            watchdogStatus: runnerActive
+              ? runnerStale ? "stale" : current.runtime?.runnerDegraded ? "degraded" : "healthy"
               : current.runtime?.status ?? "idle",
           },
           strategySavedAt: current.strategySavedAt,
@@ -499,12 +613,35 @@ export function createSztabRunner({
   buildLivestreamPayload,
   getApiProfileClient,
   maxCandlesPerTimeframe = DEFAULT_SZTAB_CANDLE_LIMITS,
+  priceService = null,
   publicApiProfiles,
   store,
 }) {
   const timers = new Map();
   const triggerWatchers = new Map();
+  const executionLocks = new Map();
   const liveProfiles = new Map();
+
+  async function withIntervalExecutionLock(interval, fn) {
+    const previous = executionLocks.get(interval) ?? Promise.resolve();
+    let release = () => {};
+    const currentLock = previous
+      .catch(() => {})
+      .then(() => new Promise((resolve) => {
+        release = resolve;
+      }));
+    executionLocks.set(interval, currentLock);
+    await previous.catch(() => {});
+
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (executionLocks.get(interval) === currentLock) {
+        executionLocks.delete(interval);
+      }
+    }
+  }
 
   async function persistRuntime(interval, patch) {
     const config = normalizeConfig(store.getSztabConfig());
@@ -525,6 +662,23 @@ export function createSztabRunner({
 
   function candleLimitForInterval(interval) {
     return Math.max(10000, Number(maxCandlesPerTimeframe?.[interval] ?? DEFAULT_SZTAB_CANDLE_LIMITS[interval] ?? 10000));
+  }
+
+  function priceFeedRuntime(symbol, source = "bingx_mark") {
+    const snapshot = typeof priceService?.snapshot === "function"
+      ? priceService.snapshot({ source, symbol: normalizeSymbol(symbol) })
+      : null;
+    return {
+      priceFeedAgeMs: snapshot?.ageMs ?? null,
+      priceFeedBackoffUntil: snapshot?.backoffUntil ?? null,
+      priceFeedLastError: snapshot?.lastError ?? null,
+      priceFeedMode: snapshot?.mode ?? "rest",
+      priceFeedRateLimitCount: snapshot?.rateLimitCount ?? 0,
+      priceFeedRequestCount: snapshot?.requestCount ?? 0,
+      priceFeedSource: snapshot?.source ?? source,
+      priceFeedStatus: snapshot?.status ?? "unknown",
+      priceFeedWebsocketStatus: snapshot?.websocketStatus ?? "unknown",
+    };
   }
 
   function globalExecutionDiagnostics() {
@@ -589,7 +743,7 @@ export function createSztabRunner({
 
     for (const interval of SZTAB_INTERVALS) {
       const runtime = config.intervals[interval].runtime;
-      if (runtime.status === "running" || runtime.status === "starting") {
+      if (isRunningStatus(runtime.status) || runtime.status === "starting") {
         if (autoResume) {
           runtime.status = "recovering";
           runtime.error = "";
@@ -802,7 +956,7 @@ export function createSztabRunner({
     const loopStartedAt = Date.now();
     const config = normalizeConfig(store.getSztabConfig());
     const current = config.intervals[interval];
-    if (!current || current.runtime?.status !== "running") return null;
+    if (!current || !isRunningStatus(current.runtime?.status)) return null;
     const candlesRequested = candleLimitForInterval(interval);
     const executionDiagnostics = globalExecutionDiagnostics();
 
@@ -849,10 +1003,10 @@ export function createSztabRunner({
       const strategyResult = await runStrategyForProfile(profile, { limit: candlesRequested });
       const lastCandle = strategyResult.sourceCandles.at(-1);
       const lastSignal = strategyResult.latestEvent
-        ? eventSummary(strategyResult.latestEvent)
+        ? eventSummary(strategyResult.latestEvent, profile)
         : null;
-      const latestEntryEvent = eventSummary(strategyResult.latestEntryEvent);
-      const latestSetupEvent = eventSummary(strategyResult.latestSetupEvent);
+      const latestEntryEvent = eventSummary(strategyResult.latestEntryEvent, profile);
+      const latestSetupEvent = eventSummary(strategyResult.latestSetupEvent, profile);
 
       if (lastSignal && executionDiagnostics.globalBlockers.length > 0) {
         const blockedReason = executionDiagnostics.globalBlockers.map((blocker) => blocker.reason).join("; ");
@@ -895,12 +1049,20 @@ export function createSztabRunner({
         return profile;
       }
 
-      const updatedProfile = await processLiveProfileExecution({
-        bingxClient: client,
-        logger: (message, context) => appendLog(message, { interval, profileId: profile.id, ...context }),
-        profile,
-        store,
-        strategyResult,
+      const updatedProfile = await withIntervalExecutionLock(interval, async () => {
+        const lockedExistingProfile = liveProfiles.get(interval) ?? profile;
+        const lockedProfile = configToProfile({
+          ...current,
+          apiProfileLabel: current.apiProfile,
+        }, lockedExistingProfile);
+        return processLiveProfileExecution({
+          bingxClient: client,
+          logger: (message, context) => appendLog(message, { interval, profileId: lockedProfile.id, ...context }),
+          priceService,
+          profile: lockedProfile,
+          store,
+          strategyResult,
+        });
       });
       liveProfiles.set(interval, updatedProfile);
 
@@ -917,6 +1079,11 @@ export function createSztabRunner({
       const pendingTriggerOrder = updatedProfile.live?.pendingTriggerOrder ?? null;
       const triggerOrderState = pendingTriggerOrder?.status ?? "none";
       const triggerSummary = triggerRuntimeSummary(pendingTriggerOrder, updatedProfile.live);
+      const orderFingerprintMatchesLatestSetup = Boolean(
+        pendingTriggerOrder?.setupFingerprint &&
+        latestSetupEvent?.setupFingerprint &&
+        pendingTriggerOrder.setupFingerprint === latestSetupEvent.setupFingerprint,
+      );
       if (isActivePendingTrigger(pendingTriggerOrder)) {
         scheduleTriggerWatcher(interval);
       } else {
@@ -931,6 +1098,8 @@ export function createSztabRunner({
           : "no_entry_signal";
       await persistRuntime(interval, {
         ...executionDiagnostics,
+        ...priceFeedRuntime(updatedProfile.symbol ?? current.symbol, pendingTriggerOrder?.priceSource ?? "bingx_mark"),
+        autoRecoveryStatus: current.runtime?.runnerDegraded ? "recovered" : current.runtime?.autoRecoveryStatus ?? "",
         candlesLoaded: strategyResult.rawCandles.length,
         candlesRequested,
         closedCandlesUsed: strategyResult.sourceCandles.length,
@@ -967,22 +1136,48 @@ export function createSztabRunner({
         lastOrderAttempt,
         lastSignal,
         lastSyncAt: nowIso(),
+        nextRecoveryAt: null,
         pendingTriggerOrder,
+        runnerDegraded: false,
         activeScenarioCanBlockNewSetup: triggerSummary.activeScenarioCanBlockNewSetup,
         canArmNextSetup: triggerSummary.canArmNextSetup,
         exchangeTerminalStatus: triggerSummary.exchangeTerminalStatus,
         lastExchangeStatus: triggerSummary.lastExchangeStatus,
         lastStatusCheckAt: triggerSummary.lastStatusCheckAt,
+        orderFingerprintMatchesLatestSetup: pendingTriggerOrder?.setupFingerprint && latestSetupEvent?.setupFingerprint
+          ? orderFingerprintMatchesLatestSetup
+          : null,
+        cleanupFailureClassification: triggerSummary.cleanupFailureClassification,
+        cleanupFailureMessage: triggerSummary.cleanupFailureMessage,
+        cleanupFailureReason: triggerSummary.cleanupFailureReason,
+        executionMode: triggerSummary.executionMode,
+        executionPrice: triggerSummary.executionPrice,
+        lastMarkPrice: triggerSummary.lastMarkPrice,
+        lastPriceSource: triggerSummary.lastPriceSource,
+        lastTriggerFailureCandidate: triggerSummary.lastTriggerFailureCandidate,
+        lastTriggerFailureDiagnostics: triggerSummary.lastTriggerFailureDiagnostics,
         lastTriggerFailureReason: triggerSummary.lastTriggerFailureReason,
         livePositionConfirmed: triggerSummary.livePositionConfirmed,
         liveProtectionConfirmed: triggerSummary.liveProtectionConfirmed,
         latestEntryEvent,
         latestSetupEvent,
         pendingOrderAgeSeconds: triggerSummary.pendingOrderAgeSeconds,
+        platformMarketEntrySent: triggerSummary.marketOrderSent,
+        platformTriggerCrossed: triggerSummary.platformTriggerCrossed,
+        platformTriggerCrossedAt: triggerSummary.platformTriggerCrossedAt,
+        platformTriggerDiagnostics: triggerSummary.platformTriggerDiagnostics,
+        platformTriggerSkippedReason: triggerSummary.platformTriggerSkippedReason,
+        platformTriggerSlippagePct: triggerSummary.platformTriggerSlippagePct,
         protectionOrderId: triggerSummary.protectionOrderId,
         protectionSource: triggerSummary.protectionSource,
+        reversalFromDirection: triggerSummary.reversalFromDirection,
+        reversalReason: triggerSummary.reversalReason,
+        reversalStatus: triggerSummary.reversalStatus,
+        reversalTrigger: triggerSummary.reversalTrigger,
         profileConnected: publicProfile?.status === "connected",
         scenarioTerminalReason: triggerSummary.scenarioTerminalReason,
+        setupFingerprint: triggerSummary.setupFingerprint || latestSetupEvent?.setupFingerprint || "",
+        setupFingerprintShort: triggerSummary.setupFingerprintShort || latestSetupEvent?.setupFingerprintShort || "",
         slPlacementStatus: pendingTriggerOrder?.status === "filled_protected"
           ? "placed"
           : pendingTriggerOrder?.status === "filled_sl_failed"
@@ -991,11 +1186,16 @@ export function createSztabRunner({
               ? "placed"
               : "not_placed",
         setupOrderJournal: triggerSummary.setupOrderJournal,
+        supersededBySetupFingerprint: triggerSummary.supersededBySetupFingerprint,
         supersededBySetupId: triggerSummary.supersededBySetupId,
+        triggerDistanceAtFailurePct: triggerSummary.triggerDistanceAtFailurePct,
+        triggerDistanceAtPlacementPct: triggerSummary.triggerDistanceAtPlacementPct,
+        triggerMarginDiagnostics: triggerSummary.triggerMarginDiagnostics,
         triggerFailureClassification: triggerSummary.triggerFailureClassification,
         triggerOrderExecutedQty: triggerSummary.triggerOrderExecutedQty,
         triggerOrderFillDetected: triggerSummary.triggerOrderFillDetected,
         triggerOrderState,
+        status: "running",
         validNweBandCount: strategyResult.diagnostics?.validNweBandCount ?? 0,
       });
 
@@ -1004,26 +1204,49 @@ export function createSztabRunner({
       const message = error instanceof Error ? error.message : String(error);
       const consecutiveErrors = Number(current.runtime?.consecutiveErrors ?? 0) + 1;
       const maxConsecutiveErrors = Number(process.env.SZTAB_MAX_CONSECUTIVE_ERRORS || 5);
-      const terminalError = consecutiveErrors >= maxConsecutiveErrors;
+      const transientError = isTransientRunnerError(error);
+      const autoRecover = autoRecoverRunners() && transientError;
+      const transientLimit = maxTransientErrorsBeforePause();
+      const terminalError = !autoRecover && consecutiveErrors >= maxConsecutiveErrors;
+      const recoveryCooldown = runnerRecoveryCooldownMs();
+      const nextRecoveryAt = autoRecover
+        ? new Date(Date.now() + recoveryCooldown).toISOString()
+        : null;
+      const degradedStatus = autoRecover && consecutiveErrors >= transientLimit ? "degraded" : "running";
       await persistRuntime(interval, {
+        ...priceFeedRuntime(current.symbol, current.runtime?.lastPriceSource ?? "bingx_mark"),
+        autoRecoveryStatus: autoRecover ? "cooldown" : "",
         consecutiveErrors,
         intervalBlockers: [{
-          reason: terminalError
+          reason: autoRecover
+            ? "Runner zwolnił przez limit API lub chwilowy błąd sieci, ale nadal działa."
+            : terminalError
             ? "Sztab interval runner failed repeatedly"
             : "Sztab interval runner tick failed; retry is scheduled",
-          source: terminalError ? "runner_error" : "runner_retry",
-          type: terminalError ? "runner_error" : "runner_retry",
+          source: autoRecover ? "runner_auto_recovery" : terminalError ? "runner_error" : "runner_retry",
+          type: autoRecover ? "runner_auto_recovery" : terminalError ? "runner_error" : "runner_retry",
         }],
         lastError: message,
         lastLoopDurationMs: Date.now() - loopStartedAt,
-        error: message,
-        lastDecision: terminalError
+        error: autoRecover ? "" : message,
+        lastDecision: autoRecover
+          ? `Runner zwolnił przez limit API/błąd sieci (${consecutiveErrors}/${transientLimit}); automatycznie spróbuje dalej.`
+          : terminalError
           ? "Sztab interval runner failed repeatedly and was stopped."
           : `Sztab interval tick failed (${consecutiveErrors}/${maxConsecutiveErrors}); retrying next cycle.`,
-        lastDecisionReason: terminalError ? "runner_error" : "runner_retry",
-        status: terminalError ? "error" : "running",
+        lastDecisionReason: autoRecover ? "runner_auto_recovery" : terminalError ? "runner_error" : "runner_retry",
+        nextRecoveryAt,
+        runnerDegraded: Boolean(autoRecover),
+        status: terminalError ? "error" : degradedStatus,
       });
-      await appendLog("Sztab interval runner error", { consecutiveErrors, error: message, interval, terminalError });
+      await appendLog(autoRecover ? "Sztab interval runner transient error; auto recovery active" : "Sztab interval runner error", {
+        autoRecover,
+        consecutiveErrors,
+        error: message,
+        interval,
+        terminalError,
+        transientError,
+      });
       if (terminalError) {
         clearTimer(interval);
         throw error;
@@ -1040,26 +1263,61 @@ export function createSztabRunner({
     }
   }
 
+  function triggerFailureCandidate(pending = {}) {
+    if (pending?.failureDiagnostics?.triggerAlreadyCrossed) return "trigger_price_invalid_or_crossed";
+    return pending?.failureCandidate ?? "";
+  }
+
   function triggerRuntimeSummary(pending, live = {}) {
     const isActive = isActivePendingTrigger(pending);
     const status = String(pending?.status ?? "none");
     return {
       activeScenarioCanBlockNewSetup: Boolean(live?.activeScenarioCanBlockNewSetup ?? isActive),
       canArmNextSetup: pending ? Boolean(pending.canArmNextSetup ?? !isActive) : true,
+      executionMode: pending?.executionMode ?? sztabExecutionMode(),
       exchangeTerminalStatus: pending?.exchangeTerminalStatus ?? (pending?.terminal ? pending?.lastExchangeStatus ?? status : ""),
+      executionPrice: pending?.executionPrice ?? null,
       lastExchangeStatus: pending?.lastExchangeStatus ?? "",
+      lastMarkPrice: pending?.lastMarkPrice ?? pending?.platformTriggerDiagnostics?.markPrice ?? null,
+      lastPriceSource: pending?.lastPriceSource ?? pending?.priceSource ?? pending?.platformTriggerDiagnostics?.priceSource ?? null,
       lastStatusCheckAt: pending?.lastStatusCheckAt ?? null,
+      cleanupFailureClassification: live?.lastCleanupWarning?.classification ?? "",
+      cleanupFailureMessage: live?.lastCleanupWarning?.message ?? "",
+      cleanupFailureReason: live?.lastCleanupWarning?.reason ?? "",
+      lastTriggerFailureCandidate: triggerFailureCandidate(pending),
+      lastTriggerFailureDiagnostics: pending?.failureDiagnostics ?? null,
       lastTriggerFailureReason: pending?.terminalReason ?? pending?.failureClassification ?? pending?.critical ?? "",
       livePositionConfirmed: Boolean(live?.livePositionConfirmed),
       liveProtectionConfirmed: Boolean(live?.liveProtectionConfirmed),
+      marketOrderSent: Boolean(pending?.marketOrderSent),
       pendingOrderAgeSeconds: pending?.acceptedAt || pending?.updatedAt || pending?.createdAt
         ? secondsSinceIso(pending.acceptedAt ?? pending.updatedAt ?? pending.createdAt)
         : null,
+      priceFeedAgeMs: pending?.platformTriggerDiagnostics?.priceFeed?.ageMs ?? null,
+      priceFeedMode: pending?.platformTriggerDiagnostics?.priceFeed?.mode ?? null,
+      priceFeedRateLimitCount: pending?.platformTriggerDiagnostics?.priceFeed?.rateLimitCount ?? null,
+      priceFeedStatus: pending?.platformTriggerDiagnostics?.priceFeed?.status ?? null,
+      priceFeedWebsocketStatus: pending?.platformTriggerDiagnostics?.priceFeed?.websocketStatus ?? null,
+      platformTriggerCrossed: Boolean(pending?.triggerCrossed),
+      platformTriggerCrossedAt: pending?.triggerCrossedAt ?? null,
+      platformTriggerDiagnostics: pending?.platformTriggerDiagnostics ?? null,
+      platformTriggerSkippedReason: pending?.skippedReason ?? "",
+      platformTriggerSlippagePct: pending?.triggerSlippagePct ?? null,
       protectionOrderId: live?.protectionOrderId ?? pending?.stopOrder?.orderId ?? pending?.stopOrder?.data?.orderId ?? null,
       protectionSource: live?.protectionSource ?? pending?.protectionSource ?? (pending ? "local_planned" : "none"),
+      reversalFromDirection: pending?.reversalFromDirection ?? "",
+      reversalReason: pending?.reversalReason ?? "",
+      reversalStatus: pending?.reversalStatus ?? "",
+      reversalTrigger: Boolean(pending?.isReversal),
       scenarioTerminalReason: live?.scenarioTerminalReason ?? pending?.terminalReason ?? "",
+      setupFingerprint: pending?.setupFingerprint ?? "",
+      setupFingerprintShort: pending?.setupFingerprintShort ?? "",
       setupOrderJournal: (live?.setupOrderJournal ?? []).slice(-100),
+      supersededBySetupFingerprint: live?.supersededBySetupFingerprint ?? pending?.supersededBySetupFingerprint ?? null,
       supersededBySetupId: live?.supersededBySetupId ?? pending?.supersededBySetupId ?? null,
+      triggerDistanceAtFailurePct: pending?.failureDiagnostics?.distanceFromMarkToTriggerPct ?? null,
+      triggerDistanceAtPlacementPct: pending?.placementDiagnostics?.distanceFromMarkToTriggerPct ?? null,
+      triggerMarginDiagnostics: pending?.failureDiagnostics ?? pending?.placementDiagnostics ?? null,
       triggerFailureClassification: pending?.failureClassification ?? "",
       triggerOrderExecutedQty: pending?.executedQty ?? null,
       triggerOrderFillDetected: ["filled_protected", "filled_sl_failed", "filled_but_position_missing"].includes(status.toLowerCase()),
@@ -1070,10 +1328,24 @@ export function createSztabRunner({
   function triggerOrderDecisionText(pending) {
     const status = String(pending?.status ?? "none").toLowerCase();
     if (!pending) return "No pending trigger order.";
+    if (status === "platform_armed" && pending.isReversal) {
+      return "Pozycja aktywna. Bot czeka na przeciwny trigger do odwrócenia.";
+    }
+    if (status === "platform_armed") return "Platform trigger watcher is armed and waiting for BingX mark price to cross the trigger.";
+    if (status === "setup_invalidated_before_platform_trigger") return "Setup invalidated before platform trigger; no market order was sent.";
+    if (status === "trigger_crossed_but_price_too_far") return "Platform trigger crossed, but price moved too far from trigger; market entry skipped.";
+    if (status === "platform_market_order_rejected") return "Platform trigger crossed, but BingX rejected the MARKET entry.";
+    if (status === "market_sent_position_missing") return "Platform MARKET was sent, but no matching live position was found after sync.";
+    if (status === "platform_blocked_existing_position") return "Platform trigger crossed, but a matching live position already exists.";
+    if (status === "filled_protected" && pending.isReversal) return "Reversal wykonany.";
     if (status === "filled_protected") return "Trigger order fill detected; SL protection placement requested.";
+    if (status === "filled_sl_failed" && pending.isReversal) return "Reversal wykonał wejście, ale SL nie został potwierdzony. Wymagana kontrola ręczna.";
     if (status === "filled_sl_failed") return "Trigger order filled but SL placement failed. Manual crisis management required.";
     if (status === "filled_but_position_missing") return "Trigger order reports fill, but no matching position was found after sync.";
-    if (pending.terminal || ["terminal_failed", "canceled", "cancelled", "expired", "rejected", "missing"].includes(status)) {
+    if (status === "invalidated_before_fill") return "Setup invalidated before trigger fill; pending trigger order was cancelled.";
+    if (status === "reversal_close_failed") return "Przeciwny trigger przebity, ale nie udało się zamknąć starej pozycji. Nowa pozycja nie została otwarta.";
+    if (status === "reversal_close_succeeded_entry_failed") return "Zamknięto starą pozycję, ale nie udało się otworzyć nowej.";
+    if (pending.terminal || ["terminal_failed", "canceled", "cancelled", "expired", "rejected", "missing", "invalidated_before_fill"].includes(status)) {
       return `Trigger order terminal: ${pending.terminalReason ?? pending.failureClassification ?? status}.`;
     }
     return "Pending trigger order is still waiting for fill.";
@@ -1091,21 +1363,47 @@ export function createSztabRunner({
     if (triggerWatchers.has(interval)) return;
     triggerWatchers.set(interval, setInterval(() => {
       pollPendingTrigger(interval).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        const transientError = isTransientRunnerError(error);
+        persistRuntime(interval, {
+          ...priceFeedRuntime(normalizeConfig(store.getSztabConfig()).intervals[interval]?.symbol, "bingx_mark"),
+          autoRecoveryStatus: transientError ? "cooldown" : "",
+          intervalBlockers: transientError
+            ? [{
+                reason: "Runner zwolnił przez limit API, ale nadal działa.",
+                source: "trigger_watcher_auto_recovery",
+                type: "trigger_watcher_auto_recovery",
+              }]
+            : [{
+                reason: "Trigger watcher error",
+                source: "trigger_watcher_error",
+                type: "trigger_watcher_error",
+              }],
+          lastError: message,
+          lastDecision: transientError
+            ? "Runner zwolnił przez limit API, ale nadal działa."
+            : `Trigger watcher error: ${message}`,
+          lastDecisionReason: transientError ? "trigger_watcher_auto_recovery" : "trigger_watcher_error",
+          runnerDegraded: Boolean(transientError),
+          status: transientError ? "degraded" : "running",
+        }).catch(() => {});
         appendLog("Sztab trigger watcher error", {
-          error: error instanceof Error ? error.message : String(error),
+          error: message,
           interval,
+          transientError,
         }).catch(() => {});
       });
-    }, Number(process.env.SZTAB_TRIGGER_WATCH_MS || 5_000)));
+    }, triggerWatchMs()));
   }
 
   async function pollPendingTrigger(interval) {
+    return withIntervalExecutionLock(interval, async () => {
     const config = normalizeConfig(store.getSztabConfig());
     const current = config.intervals[interval];
     const existingProfile = liveProfiles.get(interval);
     const pending = existingProfile?.live?.pendingTriggerOrder ?? current?.runtime?.pendingTriggerOrder ?? null;
 
-    if (!current || current.runtime?.status !== "running" || !isActivePendingTrigger(pending)) {
+    if (!current || !isRunningStatus(current.runtime?.status) || !isActivePendingTrigger(pending)) {
       clearTriggerWatcher(interval);
       return null;
     }
@@ -1119,6 +1417,7 @@ export function createSztabRunner({
     const updatedProfile = await processLiveProfileExecution({
       bingxClient: client,
       logger: (message, context) => appendLog(message, { interval, profileId: profile.id, ...context }),
+      priceService,
       profile,
       store,
       strategyResult: {
@@ -1133,6 +1432,7 @@ export function createSztabRunner({
     const lastOrderAttempt = updatedProfile.live?.orderLog?.at?.(-1) ?? null;
     const triggerSummary = triggerRuntimeSummary(nextPending, updatedProfile.live);
     await persistRuntime(interval, {
+      ...priceFeedRuntime(updatedProfile.symbol ?? current.symbol, nextPending?.priceSource ?? "bingx_mark"),
       heartbeatAt: nowIso(),
       lastDecision: triggerOrderDecisionText(nextPending),
       lastDecisionReason: `trigger_order_${nextPending?.status ?? "none"}`,
@@ -1149,29 +1449,55 @@ export function createSztabRunner({
               orderStatus: nextPending.lastOrderStatus,
               triggerOrder: nextPending.exchangeResponse ?? null,
               time: nextPending.lastStatusCheckAt ?? nextPending.updatedAt ?? nowIso(),
-            }
-          : current.runtime?.lastExchangeResponse ?? null,
+          }
+        : current.runtime?.lastExchangeResponse ?? null,
       lastOrderAttempt,
       pendingTriggerOrder: nextPending,
       activeScenarioCanBlockNewSetup: triggerSummary.activeScenarioCanBlockNewSetup,
       canArmNextSetup: triggerSummary.canArmNextSetup,
+      cleanupFailureClassification: triggerSummary.cleanupFailureClassification,
+      cleanupFailureMessage: triggerSummary.cleanupFailureMessage,
+      cleanupFailureReason: triggerSummary.cleanupFailureReason,
+      executionMode: triggerSummary.executionMode,
+      executionPrice: triggerSummary.executionPrice,
       exchangeTerminalStatus: triggerSummary.exchangeTerminalStatus,
+      lastMarkPrice: triggerSummary.lastMarkPrice,
       lastExchangeStatus: triggerSummary.lastExchangeStatus,
+      lastPriceSource: triggerSummary.lastPriceSource,
       lastStatusCheckAt: triggerSummary.lastStatusCheckAt,
+      lastTriggerFailureCandidate: triggerSummary.lastTriggerFailureCandidate,
+      lastTriggerFailureDiagnostics: triggerSummary.lastTriggerFailureDiagnostics,
       lastTriggerFailureReason: triggerSummary.lastTriggerFailureReason,
       livePositionConfirmed: triggerSummary.livePositionConfirmed,
       liveProtectionConfirmed: triggerSummary.liveProtectionConfirmed,
       pendingOrderAgeSeconds: triggerSummary.pendingOrderAgeSeconds,
+      platformMarketEntrySent: triggerSummary.marketOrderSent,
+      platformTriggerCrossed: triggerSummary.platformTriggerCrossed,
+      platformTriggerCrossedAt: triggerSummary.platformTriggerCrossedAt,
+      platformTriggerDiagnostics: triggerSummary.platformTriggerDiagnostics,
+      platformTriggerSkippedReason: triggerSummary.platformTriggerSkippedReason,
+      platformTriggerSlippagePct: triggerSummary.platformTriggerSlippagePct,
       protectionOrderId: triggerSummary.protectionOrderId,
       protectionSource: triggerSummary.protectionSource,
+      reversalFromDirection: triggerSummary.reversalFromDirection,
+      reversalReason: triggerSummary.reversalReason,
+      reversalStatus: triggerSummary.reversalStatus,
+      reversalTrigger: triggerSummary.reversalTrigger,
       scenarioTerminalReason: triggerSummary.scenarioTerminalReason,
+      setupFingerprint: triggerSummary.setupFingerprint,
+      setupFingerprintShort: triggerSummary.setupFingerprintShort,
       setupOrderJournal: triggerSummary.setupOrderJournal,
       slPlacementStatus: nextPending?.status === "filled_protected"
         ? "placed"
         : nextPending?.status === "filled_sl_failed"
           ? "failed"
           : "not_placed",
+      status: "running",
       supersededBySetupId: triggerSummary.supersededBySetupId,
+      supersededBySetupFingerprint: triggerSummary.supersededBySetupFingerprint,
+      triggerDistanceAtFailurePct: triggerSummary.triggerDistanceAtFailurePct,
+      triggerDistanceAtPlacementPct: triggerSummary.triggerDistanceAtPlacementPct,
+      triggerMarginDiagnostics: triggerSummary.triggerMarginDiagnostics,
       triggerFailureClassification: triggerSummary.triggerFailureClassification,
       triggerOrderExecutedQty: triggerSummary.triggerOrderExecutedQty,
       triggerOrderFillDetected: triggerSummary.triggerOrderFillDetected,
@@ -1183,6 +1509,7 @@ export function createSztabRunner({
     }
 
     return updatedProfile;
+    });
   }
 
   async function cancelPendingTriggerForInterval(interval, reason = "interval_stopped") {
@@ -1191,7 +1518,7 @@ export function createSztabRunner({
     const existingProfile = liveProfiles.get(interval);
     const pending = existingProfile?.live?.pendingTriggerOrder ?? current?.runtime?.pendingTriggerOrder ?? null;
 
-    if (!pending || !["accepted", "placed", "new", "partially_filled"].includes(String(pending.status ?? "").toLowerCase())) {
+    if (!pending || !["accepted", "placed", "new", "partially_filled", "pending_sync"].includes(String(pending.status ?? "").toLowerCase())) {
       return null;
     }
 
@@ -1216,13 +1543,31 @@ export function createSztabRunner({
         lastDecisionReason: "pending_trigger_cancelled",
         pendingTriggerOrder: pendingAfterCancel,
         canArmNextSetup: triggerSummary.canArmNextSetup,
+        executionMode: triggerSummary.executionMode,
+        executionPrice: triggerSummary.executionPrice,
         exchangeTerminalStatus: triggerSummary.exchangeTerminalStatus,
+        lastMarkPrice: triggerSummary.lastMarkPrice,
         lastExchangeStatus: triggerSummary.lastExchangeStatus,
+        lastPriceSource: triggerSummary.lastPriceSource,
         lastStatusCheckAt: triggerSummary.lastStatusCheckAt,
+        lastTriggerFailureCandidate: triggerSummary.lastTriggerFailureCandidate,
+        lastTriggerFailureDiagnostics: triggerSummary.lastTriggerFailureDiagnostics,
         lastTriggerFailureReason: triggerSummary.lastTriggerFailureReason,
         pendingOrderAgeSeconds: triggerSummary.pendingOrderAgeSeconds,
+        platformMarketEntrySent: triggerSummary.marketOrderSent,
+        platformTriggerCrossed: triggerSummary.platformTriggerCrossed,
+        platformTriggerCrossedAt: triggerSummary.platformTriggerCrossedAt,
+        platformTriggerDiagnostics: triggerSummary.platformTriggerDiagnostics,
+        platformTriggerSkippedReason: triggerSummary.platformTriggerSkippedReason,
+        platformTriggerSlippagePct: triggerSummary.platformTriggerSlippagePct,
+        setupFingerprint: triggerSummary.setupFingerprint,
+        setupFingerprintShort: triggerSummary.setupFingerprintShort,
         setupOrderJournal: triggerSummary.setupOrderJournal,
+        supersededBySetupFingerprint: triggerSummary.supersededBySetupFingerprint,
         triggerFailureClassification: triggerSummary.triggerFailureClassification,
+        triggerDistanceAtFailurePct: triggerSummary.triggerDistanceAtFailurePct,
+        triggerDistanceAtPlacementPct: triggerSummary.triggerDistanceAtPlacementPct,
+        triggerMarginDiagnostics: triggerSummary.triggerMarginDiagnostics,
         triggerOrderExecutedQty: triggerSummary.triggerOrderExecutedQty,
         triggerOrderFillDetected: triggerSummary.triggerOrderFillDetected,
         triggerOrderState: triggerSummary.triggerOrderState,
@@ -1267,10 +1612,13 @@ export function createSztabRunner({
     clearTimer(interval);
     await persistRuntime(interval, {
       ...clearTransientBlockers(),
+      autoRecoveryStatus: "",
       error: "",
       intervalBlockers: [],
       lastDecision: "Starting Sztab interval runner.",
       lastDecisionReason: "starting",
+      nextRecoveryAt: null,
+      runnerDegraded: false,
       startedAt: nowIso(),
       status: "running",
       stoppedAt: null,
@@ -1309,6 +1657,7 @@ export function createSztabRunner({
     await cancelPendingTriggerForInterval(interval, "interval_stopped_by_operator");
     await persistRuntime(interval, {
       ...clearTransientBlockers(),
+      autoRecoveryStatus: "",
       intervalBlockers: [{
         reason: "Sztab interval runner is stopped by operator",
         source: "operator_stop",
@@ -1316,6 +1665,8 @@ export function createSztabRunner({
       }],
       lastDecision: "Sztab interval runner stopped by operator.",
       lastDecisionReason: "stopped_by_operator",
+      nextRecoveryAt: null,
+      runnerDegraded: false,
       status: "stopped",
       stoppedAt: nowIso(),
       tradingEnabled: false,

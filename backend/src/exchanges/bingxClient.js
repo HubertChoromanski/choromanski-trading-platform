@@ -376,7 +376,7 @@ export function createBingxClient({
     },
 
     async cancelOpenOrders(symbol) {
-      return request("POST", "/openApi/swap/v2/trade/allOpenOrders", {
+      return request("DELETE", "/openApi/swap/v2/trade/allOpenOrders", {
         symbol: normalizeSymbol(symbol),
       });
     },
@@ -391,6 +391,18 @@ export function createBingxClient({
 
     async getOpenOrders(symbol) {
       return request("GET", "/openApi/swap/v2/trade/openOrders", {
+        symbol: symbol ? normalizeSymbol(symbol) : undefined,
+      });
+    },
+
+    async getOrderHistory(symbol, options = {}) {
+      const endTime = Number(options.endTime ?? Date.now());
+      const startTime = Number(options.startTime ?? endTime - 7 * 24 * 60 * 60 * 1000);
+      return request("GET", "/openApi/swap/v2/trade/allOrders", {
+        endTime,
+        limit: options.limit ?? 100,
+        orderId: options.orderId,
+        startTime,
         symbol: symbol ? normalizeSymbol(symbol) : undefined,
       });
     },

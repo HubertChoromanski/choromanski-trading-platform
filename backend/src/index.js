@@ -11,6 +11,7 @@ import { reportToCsv } from "./ai/aiReportBuilder.js";
 import { createBotRunner } from "./botRunner.js";
 import { createBingxClient } from "./exchanges/bingxClient.js";
 import { reconcileBingxState } from "./execution/reconciliation.js";
+import { createPriceService } from "./market/priceService.js";
 import { createStateStore } from "./state/store.js";
 import { fetchCandles } from "./strategy/strategyRunner.js";
 import { createSztabRunner, SZTAB_INTERVALS } from "./sztab/sztabRunner.js";
@@ -66,6 +67,7 @@ process.on("exit", (code) => {
   logRuntimeEvent("exit", { code });
 });
 const bingxClient = createBingxClient();
+const priceService = createPriceService({ defaultClient: bingxClient });
 await store.setState({
   bingx: {
     apiConfigured: bingxClient.auth.configured,
@@ -500,7 +502,12 @@ async function loadPublicApiProfiles() {
         [...new Set(openPositions.map((position) => compactSymbol(position.symbol)).filter(Boolean))]
           .map(async (symbol) => {
             try {
-              markPrices[symbol] = extractMarkPrice(await profile.client.getMarkPrice(symbol));
+              const sample = await priceService.getPrice({
+                client: profile.client,
+                source: "bingx_mark",
+                symbol,
+              });
+              markPrices[symbol] = sample.price;
             } catch {
               markPrices[symbol] = null;
             }
@@ -2022,6 +2029,7 @@ const sztabRunner = createSztabRunner({
   buildLivestreamPayload,
   getApiProfileClient,
   maxCandlesPerTimeframe,
+  priceService,
   publicApiProfiles,
   store,
 });

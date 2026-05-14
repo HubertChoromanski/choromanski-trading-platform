@@ -209,14 +209,22 @@ function polishStatus(value = "") {
     filled_but_position_missing: "fill zgłoszony, ale brak pozycji live",
     filled_protected: "pozycja wykryta, ochrona założona",
     filled_sl_failed: "pozycja wykryta, SL niepotwierdzony",
+    invalidated_before_fill: "setup anulowany przed triggerem",
     missing: "brak zlecenia na BingX",
     new: "nowe",
     partially_filled: "częściowo wykonane",
     pending_sync: "czeka na potwierdzenie BingX",
+    platform_armed: "platforma pilnuje triggera",
+    platform_blocked_existing_position: "pozycja live już istnieje",
+    platform_market_order_rejected: "MARKET odrzucony przez BingX",
     placed: "wystawione",
     rejected: "odrzucone",
+    reversal_close_failed: "odwrócenie przerwane: nie zamknięto starej pozycji",
+    reversal_close_succeeded_entry_failed: "stara pozycja zamknięta, nowe wejście nieudane",
     risk_blocked: "zablokowane przez ryzyko",
+    setup_invalidated_before_platform_trigger: "setup anulowany przed lokalnym triggerem",
     terminal_failed: "zakończone błędem na BingX",
+    trigger_crossed_but_price_too_far: "trigger przebity, cena za daleko",
     trigger_order_rejected: "trigger odrzucony przez BingX",
     healthy: "zdrowy",
     idle: "bezczynny",
@@ -247,13 +255,28 @@ function polishReason(value = "") {
   const normalized = String(value || "").toLowerCase();
   if (!normalized) return "--";
   if (normalized.includes("filled_but_position_missing")) return "BingX nie potwierdza pozycji live dla tego scenariusza.";
+  if (normalized.includes("setup_invalidated_before_fill") || normalized.includes("invalidated_before_fill")) return "Cena dotknęła poziomu negacji przed wykonaniem triggera.";
   if (normalized.includes("missing")) return "Zlecenie nie istnieje już na BingX.";
   if (normalized.includes("expired")) return "Zlecenie trigger wygasło na BingX.";
   if (normalized.includes("rejected")) return "BingX odrzucił zlecenie trigger.";
+  if (normalized.includes("trigger_order_failed_exchange") || normalized === "terminal_failed") return "Trigger zakończył się na BingX: FAILED.";
+  if (normalized.includes("margin_unavailable")) return "Najbardziej prawdopodobne: brak wolnego marginu przy aktywacji triggera.";
+  if (normalized.includes("market_moved_too_far")) return "Najbardziej prawdopodobne: rynek odjechał za daleko od triggera przy aktywacji.";
+  if (normalized.includes("trigger_price_invalid_or_crossed")) return "Najbardziej prawdopodobne: trigger był już przekroczony albo niepoprawny przy wysyłce.";
+  if (normalized.includes("precision_or_min_qty")) return "Najbardziej prawdopodobne: precyzja albo minimalna ilość zlecenia.";
+  if (normalized.includes("unknown_exchange_failed")) return "BingX zwrócił FAILED bez jednoznacznego powodu w dostępnych danych.";
   if (normalized.includes("canceled") || normalized.includes("cancelled")) return "Zlecenie zostało anulowane.";
   if (normalized.includes("risk")) return "Setup został zablokowany przez warstwę ryzyka.";
+  if (normalized.includes("reversal_close_failed")) return "Przeciwny trigger został przebity, ale zamknięcie starej pozycji nie powiodło się.";
+  if (normalized.includes("reversal_close_succeeded_entry_failed")) return "Stara pozycja została zamknięta, ale nie udało się otworzyć nowej pozycji.";
   if (normalized.includes("blocked")) return "Setup został zablokowany przed wysłaniem zlecenia.";
   return value;
+}
+
+function resolvedTriggerFailureCandidate(runtime = {}, pending = {}) {
+  const diagnostics = runtime.lastTriggerFailureDiagnostics ?? pending?.failureDiagnostics ?? {};
+  if (diagnostics.triggerAlreadyCrossed) return "trigger_price_invalid_or_crossed";
+  return runtime.lastTriggerFailureCandidate || pending?.failureCandidate || "";
 }
 
 function polishLifecycleText(item = {}) {
@@ -261,6 +284,7 @@ function polishLifecycleText(item = {}) {
   const normalized = message.toLowerCase();
   if (!message) return "Aktualizacja zlecenia trigger.";
   if (normalized.includes("exchange accepted trigger-market")) return "BingX zaakceptował zlecenie trigger-market.";
+  if (normalized.includes("invalidated before fill")) return "Cena dotknęła poziomu negacji przed wykonaniem triggera. Zlecenie trigger zostało anulowane.";
   if (normalized.includes("still pending")) return `Trigger nadal czeka na BingX (${polishStatus(item.status)}).`;
   if (normalized.includes("terminal on exchange")) return `Trigger zakończył się na BingX: ${polishReason(message)}`;
   if (normalized.includes("reported filled") && normalized.includes("no matching live position")) {
@@ -368,6 +392,13 @@ function stopProtectionOrder(position = {}) {
   }) ?? null;
 }
 
+function takeProfitProtectionOrder(position = {}) {
+  return (position.attachedOrders ?? []).find((order) => {
+    const type = orderType(order);
+    return type.includes("TAKE") || type.includes("PROFIT");
+  }) ?? null;
+}
+
 function pendingTriggerStartTime(pending = {}, firstTime) {
   return Math.max(
     firstTime,
@@ -461,7 +492,7 @@ function positionsForOperationalState(livestream, config = {}) {
 }
 
 function isActivePendingStatus(status) {
-  return ["accepted", "placed", "new", "partially_filled", "pending_sync"].includes(String(status ?? "").toLowerCase());
+  return ["accepted", "placed", "new", "partially_filled", "pending_sync", "platform_armed"].includes(String(status ?? "").toLowerCase());
 }
 
 function isTerminalExchangeStatus(status) {
@@ -473,6 +504,14 @@ function isTerminalExchangeStatus(status) {
     "rejected",
     "missing",
     "filled_but_position_missing",
+    "invalidated_before_fill",
+    "market_sent_position_missing",
+    "platform_blocked_existing_position",
+    "platform_market_order_rejected",
+    "reversal_close_failed",
+    "reversal_close_succeeded_entry_failed",
+    "setup_invalidated_before_platform_trigger",
+    "trigger_crossed_but_price_too_far",
     "cancel_failed",
   ].includes(String(status ?? "").toLowerCase());
 }
@@ -482,6 +521,7 @@ function semanticOverlayLabel(line = {}) {
   const side = direction ? ` — ${direction}` : "";
   if (line.type === "trigger") {
     if (line.state === "active_live") return `TRIGGER LIVE — ZLECENIE NA BINGX${side}`;
+    if (line.state === "invalidated") return `SETUP ANULOWANY — NEGACJA PRZED TRIGGEREM${side}`;
     if (line.state === "failed") return `NIEUDANY TRIGGER ${direction || ""} — BingX nie wykonał zlecenia`.trim();
     if (line.state === "current_setup") return `SETUP W STRATEGII — BRAK AKTYWNEGO ZLECENIA BINGX${side}`;
     if (line.state === "historical") return `HISTORYCZNY TRIGGER — BRAK AKTYWNEGO ZLECENIA${side}`;
@@ -489,12 +529,12 @@ function semanticOverlayLabel(line = {}) {
   }
   if (line.type === "sl") {
     if (line.state === "live_confirmed") return "LIVE SL — POTWIERDZONY NA BINGX";
-    if (line.state === "planned") return "PLANOWANY SL — NIEPOTWIERDZONY";
+    if (line.state === "planned") return "POZIOM NEGACJI / SL SETUPU — NIEPOTWIERDZONY NA BINGX";
     return "HISTORYCZNY SL";
   }
   if (line.type === "tp") {
-    if (line.state === "live_confirmed") return "LIVE TP";
-    if (line.state === "setup_target") return "CEL SETUPU / TP SCENARIUSZA";
+    if (line.state === "live_confirmed") return "TP WYKRYTY NA BINGX";
+    if (line.state === "setup_target") return "SYMULOWANY TP — HISTORIA/DEBUG";
     return "SYMULOWANY TP";
   }
   if (line.type === "entry") {
@@ -559,7 +599,7 @@ function shouldRenderSemanticOverlay(line = {}, mode = "live") {
   if (line.state === "live_confirmed" || line.state === "active_live") return true;
   if (normalizedMode === "live") return false;
   if (normalizedMode === "operational") {
-    return line.state === "current_setup" || line.state === "setup_target";
+    return line.state === "current_setup" || (line.type === "sl" && line.state === "planned");
   }
   return normalizedMode === "history" || normalizedMode === "debug";
 }
@@ -586,7 +626,7 @@ function buildSemanticLiveOverlays({
     warnDirectionLabelMismatch(line, label);
     const key = [
       interval,
-      line.setupId ?? line.orderId ?? "overlay",
+      line.setupFingerprint ?? line.setupId ?? line.orderId ?? "overlay",
       line.type,
       Number(line.value).toFixed(4),
       line.sourceTime ?? line.startTime ?? firstTime,
@@ -610,6 +650,7 @@ function buildSemanticLiveOverlays({
 
   if (livePosition) {
     const direction = canonicalDirection(positionSide(livePosition), livePosition?.positionSide, livePosition?.side);
+    const tpOrder = takeProfitProtectionOrder(livePosition) ?? pending?.takeProfitOrder ?? null;
     addLine({
       direction,
       sourceField: "entryPrice",
@@ -627,13 +668,16 @@ function buildSemanticLiveOverlays({
         value: protection.price,
       });
     }
-    addLine({
-      direction,
-      sourceField: "takeProfit",
-      state: "live_confirmed",
-      type: "tp",
-      value: livePosition.takeProfit,
-    });
+    if (tpOrder) {
+      addLine({
+        direction,
+        orderId: orderIdentifier(tpOrder),
+        sourceField: "takeProfit",
+        state: "live_confirmed",
+        type: "tp",
+        value: livePosition.takeProfit,
+      });
+    }
   }
 
   if (pending) {
@@ -642,6 +686,7 @@ function buildSemanticLiveOverlays({
       addLine({
         direction: pendingDirection,
         orderId: pending.orderId,
+        setupFingerprint: pending.setupFingerprint,
         setupId: pending.setupId,
         sourceField: "triggerPrice",
         startTime,
@@ -651,39 +696,32 @@ function buildSemanticLiveOverlays({
       });
       addLine({
         direction: pendingDirection,
+        setupFingerprint: pending.setupFingerprint,
         setupId: pending.setupId,
-        sourceField: "takeProfit",
+        sourceField: "stopLoss",
         startTime,
-        state: "setup_target",
-        type: "tp",
-        value: pending.takeProfit,
+        state: "planned",
+        type: "sl",
+        value: pending.stopLoss,
       });
-      if (normalizeOverlayMode(mode) !== "operational") {
-        addLine({
-          direction: pendingDirection,
-          setupId: pending.setupId,
-          sourceField: "stopLoss",
-          startTime,
-          state: "planned",
-          type: "sl",
-          value: pending.stopLoss,
-        });
-      }
     } else if (terminalPending) {
       const failedTrigger = pending.terminalReason || pending.failureClassification || pending.lastExchangeStatus;
+      const invalidatedBeforeFill = pendingStatus === "invalidated_before_fill" || String(failedTrigger ?? "").includes("invalidated_before_fill");
       addLine({
         direction: pendingDirection,
         orderId: pending.orderId,
+        setupFingerprint: pending.setupFingerprint,
         setupId: pending.setupId,
         sourceField: "triggerPrice",
         startTime,
-        state: failedTrigger ? "failed" : "historical",
+        state: invalidatedBeforeFill ? "invalidated" : failedTrigger ? "failed" : "historical",
         terminalReason: failedTrigger || "",
         type: "trigger",
         value: pending.triggerPrice,
       });
       addLine({
         direction: pendingDirection,
+        setupFingerprint: pending.setupFingerprint,
         setupId: pending.setupId,
         sourceField: "stopLoss",
         startTime,
@@ -691,26 +729,21 @@ function buildSemanticLiveOverlays({
         type: "sl",
         value: pending.stopLoss,
       });
-      addLine({
-        direction: pendingDirection,
-        setupId: pending.setupId,
-        sourceField: "takeProfit",
-        startTime,
-        state: "historical",
-        type: "tp",
-        value: pending.takeProfit,
-      });
     }
   }
 
   const setupDirection = canonicalDirection(setup?.direction);
   const setupTrigger = Number(setup?.trigger);
   const setupIsActive = setup?.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE || String(setup?.status ?? "").toUpperCase() === "PENDING";
-  const pendingSetupStillCurrent = pending && setup?.setupId && pending.setupId === setup.setupId && canonicalDirection(pendingDirection) === setupDirection && activePending;
+  const pendingSetupStillCurrent = pending && activePending && canonicalDirection(pendingDirection) === setupDirection && (
+    (pending.setupFingerprint && setup?.setupFingerprint && pending.setupFingerprint === setup.setupFingerprint) ||
+    (!pending.setupFingerprint && !setup?.setupFingerprint && setup?.setupId && pending.setupId === setup.setupId)
+  );
   if (setupIsActive && setup?.setupId && setupDirection && Number.isFinite(setupTrigger) && !livePosition && !pendingSetupStillCurrent) {
     const startTime = Number(setup.benchmarkTime ?? setup.time ?? firstTime);
     addLine({
       direction: setupDirection,
+      setupFingerprint: setup.setupFingerprint,
       setupId: setup.setupId,
       sourceField: "trigger",
       sourceInterval: interval,
@@ -722,14 +755,15 @@ function buildSemanticLiveOverlays({
     });
     addLine({
       direction: setupDirection,
+      setupFingerprint: setup.setupFingerprint,
       setupId: setup.setupId,
-      sourceField: "takeProfit",
+      sourceField: "stopLoss",
       sourceInterval: interval,
       sourceTime: setup.time,
       startTime: Math.max(firstTime, startTime),
-      state: "setup_target",
-      type: "tp",
-      value: setup.takeProfit ?? setup.targetPrice,
+      state: "planned",
+      type: "sl",
+      value: setup.stopLoss ?? setup.invalidationPrice,
     });
   }
 
@@ -770,7 +804,7 @@ function timelineFromRuntime(runtime = {}) {
   const setup = runtime.latestSetupEvent
     ? [{
         time: runtime.latestSetupEvent.time,
-        text: `Strategia zobaczyła setup ${polishSide(runtime.latestSetupEvent.direction)} (${runtime.latestSetupEvent.setupId ?? "bez id"}).`,
+        text: `Strategia zobaczyła setup ${polishSide(runtime.latestSetupEvent.direction)} (${runtime.latestSetupEvent.setupId ?? "bez id"}${runtime.latestSetupEvent.setupFingerprintShort ? ` · ${runtime.latestSetupEvent.setupFingerprintShort}` : ""}).`,
       }]
     : [];
   return [...setup, ...journal, ...lifecycle]
@@ -791,7 +825,9 @@ function readableJournalText(item = {}) {
     case "order_accepted":
       return `BingX zaakceptował trigger${side}${setup}${trigger}.`;
     case "order_terminal":
-      return `Zlecenie trigger zakończyło się na BingX: ${polishReason(item.reason ?? item.status ?? "terminal")}`;
+      return `Zlecenie trigger zakończyło się na BingX: ${polishStatus(item.status ?? "terminal")}. ${polishReason(item.failureCandidate ?? item.reason ?? item.status ?? "terminal")}`;
+    case "setup_invalidated_before_fill":
+      return `Cena dotknęła poziomu negacji${Number.isFinite(Number(item.invalidationPrice)) ? ` ${formatChartPrice(item.invalidationPrice)}` : ""} przed wykonaniem triggera${setup}. Zlecenie trigger zostało anulowane.`;
     case "order_missing":
       return `Zlecenie trigger${setup} nie istnieje już na BingX.`;
     case "order_canceled":
@@ -806,6 +842,18 @@ function readableJournalText(item = {}) {
       return `Ryzyko zablokowało setup${setup}: ${polishReason(item.reason ?? "risk manager")}`;
     case "order_rejected":
       return `BingX odrzucił trigger${setup}: ${polishReason(item.reason ?? "exchange rejection")}`;
+    case "platform_reversal_trigger_armed":
+      return `Pozycja live jest aktywna. Bot czeka na przeciwny trigger${side}${trigger}, żeby odwrócić pozycję.`;
+    case "live_reversal_trigger_crossed":
+      return `Przeciwny trigger${side}${trigger} został przebity. Bot zamknął starą pozycję i przygotowuje nowe wejście.`;
+    case "live_reversal_completed":
+      return `Reversal wykonany${side}: stara pozycja zamknięta, nowa pozycja otwarta, SL wysłany.`;
+    case "live_reversal_sl_failed":
+      return `Reversal otworzył nową pozycję${side}, ale SL nie został potwierdzony. Wymagana kontrola ręczna.`;
+    case "reversal_close_failed":
+      return `Przeciwny trigger${side}${trigger} został przebity, ale zamknięcie starej pozycji nie powiodło się.`;
+    case "reversal_close_succeeded_entry_failed":
+      return `Stara pozycja została zamknięta, ale nowe wejście${side} nie powiodło się.`;
     case "cancel_failed":
       return `Nie udało się anulować triggera${setup}; sprawdź status BingX.`;
     default:
@@ -944,24 +992,38 @@ function deriveOperationalState({
 
   if (pending && isTerminalExchangeStatus(pendingStatus) && !setupIsActive) {
     const superseded = Boolean(runtime.supersededBySetupId ?? pending.supersededBySetupId);
-    const failedTriggerLabel = `${superseded ? "SETUP ZASTĄPIONY PRZEZ NOWY" : `NIEUDANY TRIGGER ${sideText}`}`;
+    const invalidatedBeforeFill = pendingStatus === "invalidated_before_fill" || String(pending.terminalReason ?? pending.failureClassification ?? "").includes("invalidated_before_fill");
+    const failureCandidate = resolvedTriggerFailureCandidate(runtime, pending);
+    const terminalReasonText = polishReason(failureCandidate || pending.terminalReason || pending.failureClassification || pendingStatus);
+    const failedTriggerLabel = superseded
+      ? "SETUP ZASTĄPIONY PRZEZ NOWY"
+      : invalidatedBeforeFill
+        ? "SETUP ANULOWANY — CENA DOTKNĘŁA POZIOMU NEGACJI PRZED TRIGGEREM"
+        : `NIEUDANY TRIGGER ${sideText}`;
     return {
       ...base,
       headline: superseded
         ? `${intervalName}: poprzedni setup został zastąpiony`
+        : invalidatedBeforeFill
+        ? `${intervalName}: setup martwy, bot czeka na nowy sygnał`
         : pendingStatus === "filled_but_position_missing"
         ? `${intervalName}: fill zgłoszony, ale brak pozycji live`
         : `${intervalName}: trigger zakończył się bez pozycji`,
       detail: superseded
         ? "Pojawił się nowy setup, więc poprzedni scenariusz i jego trigger zostały anulowane. To nie jest aktywna pozycja live."
+        : invalidatedBeforeFill
+        ? "Cena dotknęła poziomu negacji przed wykonaniem triggera. Pending trigger został anulowany, więc setup nie powinien wejść później."
         : pendingStatus === "filled_but_position_missing"
         ? "BingX zgłosił wykonanie, ale świeży sync nie znalazł odpowiadającej pozycji live. Ten scenariusz nie powinien blokować nowego setupu."
-        : `Zlecenie trigger zakończyło się terminalnie: ${polishReason(pending.terminalReason ?? pending.failureClassification ?? pendingStatus)}`,
+        : `Zlecenie trigger zakończyło się na BingX statusem ${polishStatus(runtime.lastExchangeStatus || pending.exchangeTerminalStatus || pendingStatus)}. ${terminalReasonText}`,
       rows: [
         ["Ostatni trigger", formatChartPrice(pending.triggerPrice)],
+        ["Poziom negacji", formatChartPrice(pending.invalidationPrice ?? pending.stopLoss)],
         ["Zlecenie", pending.orderId ? compactId(pending.orderId) : "--"],
         ["Status BingX", polishStatus(runtime.lastExchangeStatus || pending.exchangeTerminalStatus || pendingStatus)],
         ["Wykonana ilość", pending.executedQty ?? runtime.triggerOrderExecutedQty ?? "--"],
+        ["Kandydat przyczyny", failureCandidate || "--"],
+        ["Dystans przy awarii", runtime.triggerDistanceAtFailurePct !== null && runtime.triggerDistanceAtFailurePct !== undefined ? `${Number(runtime.triggerDistanceAtFailurePct).toFixed(4)}%` : "--"],
         ["Blokuje nowy setup", takNie(runtime.activeScenarioCanBlockNewSetup)],
         ["Powód zakończenia", polishReason(runtime.scenarioTerminalReason || pending.terminalReason || pending.failureClassification || pendingStatus)],
         ["Zastąpiony przez", runtime.supersededBySetupId ? compactId(runtime.supersededBySetupId) : "--"],
@@ -1009,7 +1071,7 @@ function deriveOperationalState({
         ["Cena teraz", formatChartPrice(currentPrice)],
       ],
       tags: [
-        { label: "AKTYWNY CEL SETUPU", tone: "simulated" },
+        { label: "SETUP STRATEGII", tone: "simulated" },
         { label: "BRAK LIVE TRIGGERA", tone: "stale" },
       ],
       tone: "neutral",
@@ -2974,6 +3036,7 @@ export default function TradingViewChart() {
         mode: overlayMode,
         price: line.value,
         semanticType: line.type,
+        setupFingerprint: line.setupFingerprint ?? pending?.setupFingerprint ?? setup?.setupFingerprint ?? "",
         setupId: line.setupId ?? pending?.setupId ?? setup?.setupId ?? "",
         sourceDirection: canonicalDirection(line.direction),
         sourceEventTimestamp: line.sourceTime ?? setup?.time ?? pending?.entryEvent?.time ?? null,
