@@ -664,7 +664,7 @@ export function createSztabRunner({
     return Math.max(10000, Number(maxCandlesPerTimeframe?.[interval] ?? DEFAULT_SZTAB_CANDLE_LIMITS[interval] ?? 10000));
   }
 
-  function priceFeedRuntime(symbol, source = "bingx_mark") {
+  function priceFeedRuntime(symbol, source = "binance_futures") {
     const snapshot = typeof priceService?.snapshot === "function"
       ? priceService.snapshot({ source, symbol: normalizeSymbol(symbol) })
       : null;
@@ -1098,7 +1098,7 @@ export function createSztabRunner({
           : "no_entry_signal";
       await persistRuntime(interval, {
         ...executionDiagnostics,
-        ...priceFeedRuntime(updatedProfile.symbol ?? current.symbol, pendingTriggerOrder?.priceSource ?? "bingx_mark"),
+        ...priceFeedRuntime(updatedProfile.symbol ?? current.symbol, pendingTriggerOrder?.priceSource ?? "binance_futures"),
         autoRecoveryStatus: current.runtime?.runnerDegraded ? "recovered" : current.runtime?.autoRecoveryStatus ?? "",
         candlesLoaded: strategyResult.rawCandles.length,
         candlesRequested,
@@ -1214,7 +1214,7 @@ export function createSztabRunner({
         : null;
       const degradedStatus = autoRecover && consecutiveErrors >= transientLimit ? "degraded" : "running";
       await persistRuntime(interval, {
-        ...priceFeedRuntime(current.symbol, current.runtime?.lastPriceSource ?? "bingx_mark"),
+        ...priceFeedRuntime(current.symbol, current.runtime?.lastPriceSource ?? "binance_futures"),
         autoRecoveryStatus: autoRecover ? "cooldown" : "",
         consecutiveErrors,
         intervalBlockers: [{
@@ -1331,7 +1331,7 @@ export function createSztabRunner({
     if (status === "platform_armed" && pending.isReversal) {
       return "Pozycja aktywna. Bot czeka na przeciwny trigger do odwrócenia.";
     }
-    if (status === "platform_armed") return "Platform trigger watcher is armed and waiting for BingX mark price to cross the trigger.";
+    if (status === "platform_armed") return "Bot pilnuje triggera po stronie Binance Futures; BingX zostanie użyty tylko do egzekucji MARKET.";
     if (status === "setup_invalidated_before_platform_trigger") return "Setup invalidated before platform trigger; no market order was sent.";
     if (status === "trigger_crossed_but_price_too_far") return "Platform trigger crossed, but price moved too far from trigger; market entry skipped.";
     if (status === "platform_market_order_rejected") return "Platform trigger crossed, but BingX rejected the MARKET entry.";
@@ -1366,7 +1366,7 @@ export function createSztabRunner({
         const message = error instanceof Error ? error.message : String(error);
         const transientError = isTransientRunnerError(error);
         persistRuntime(interval, {
-          ...priceFeedRuntime(normalizeConfig(store.getSztabConfig()).intervals[interval]?.symbol, "bingx_mark"),
+          ...priceFeedRuntime(normalizeConfig(store.getSztabConfig()).intervals[interval]?.symbol, "binance_futures"),
           autoRecoveryStatus: transientError ? "cooldown" : "",
           intervalBlockers: transientError
             ? [{
@@ -1432,7 +1432,7 @@ export function createSztabRunner({
     const lastOrderAttempt = updatedProfile.live?.orderLog?.at?.(-1) ?? null;
     const triggerSummary = triggerRuntimeSummary(nextPending, updatedProfile.live);
     await persistRuntime(interval, {
-      ...priceFeedRuntime(updatedProfile.symbol ?? current.symbol, nextPending?.priceSource ?? "bingx_mark"),
+      ...priceFeedRuntime(updatedProfile.symbol ?? current.symbol, nextPending?.priceSource ?? "binance_futures"),
       heartbeatAt: nowIso(),
       lastDecision: triggerOrderDecisionText(nextPending),
       lastDecisionReason: `trigger_order_${nextPending?.status ?? "none"}`,

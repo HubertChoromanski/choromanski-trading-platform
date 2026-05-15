@@ -12,6 +12,7 @@
     "status": "pm2 status choromanski-trading-backend",
     "test:ai-intent": "node scripts/ai-intent-regression.mjs",
     "test:sztab-cancel-cleanup": "node scripts/sztab-cancel-cleanup-regression.mjs",
+    "test:sztab-live-parity": "node scripts/sztab-live-parity-regression.mjs",
     "stop:prod": "pm2 stop choromanski-trading-backend"
   },
   "dependencies": {

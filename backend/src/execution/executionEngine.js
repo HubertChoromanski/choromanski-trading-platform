@@ -187,7 +187,7 @@ export async function processLiveProfileExecution({
     await store.upsertTrade(trade);
     await logger("position closed", { mode: "live", profileId: profile.id, setupId: openPosition.setupId });
   } else if (openPosition && exitEventIsReversal) {
-    await logger("core reversal exit observed; live Sztab waits for opposite trigger watcher", {
+    await logger("core reversal exit observed; live Sztab will execute paired opposite entry event", {
       exitReason: exitEvent.exitReason,
       mode: "live",
       profileId: profile.id,
@@ -195,20 +195,20 @@ export async function processLiveProfileExecution({
     });
   }
 
-  updatedProfile = await syncPendingTriggerFill({
-    bingxClient,
-    logger,
-    priceService,
-    profile: updatedProfile,
-    store,
-  });
-
   updatedProfile = await cancelPendingTriggerIfInvalidated({
     bingxClient,
     logger,
     priceService,
     profile: updatedProfile,
     strategyResult,
+  });
+
+  updatedProfile = await syncPendingTriggerFill({
+    bingxClient,
+    logger,
+    priceService,
+    profile: updatedProfile,
+    store,
   });
 
   const rawActiveSetupEvent = setupEventForTriggerOrder(strategyResult);
@@ -242,6 +242,13 @@ export async function processLiveProfileExecution({
   }
 
   if (
+    activeSetupEvent.strategyEventFingerprint &&
+    updatedProfile.live?.lastProcessedStrategyEventFingerprint === activeSetupEvent.strategyEventFingerprint
+  ) {
+    return updatedProfile;
+  }
+
+  if (
     pendingOrderMatchesSetup(updatedProfile.live?.pendingTriggerOrder, activeSetupEvent) &&
     nonRetryPendingStatuses().includes(String(updatedProfile.live.pendingTriggerOrder.status ?? "").toLowerCase())
   ) {
@@ -249,6 +256,29 @@ export async function processLiveProfileExecution({
   }
 
   if (pendingOrderMatchesSetup(pendingTriggerOrder, activeSetupEvent)) {
+    if (
+      executionMode === "platform_market_trigger" &&
+      activeSetupEvent.strategyEventTrigger === true &&
+      isPlatformMarketTriggerPending(pendingTriggerOrder)
+    ) {
+      updatedProfile.live.pendingTriggerOrder = {
+        ...pendingTriggerOrder,
+        lastStatusCheckAt: new Date().toISOString(),
+        priceSource: sztabStrategyPriceSource(),
+        strategyEventFingerprint: activeSetupEvent.strategyEventFingerprint ?? pendingTriggerOrder.strategyEventFingerprint ?? null,
+        strategyEventTime: activeSetupEvent.strategyEventTime ?? activeSetupEvent.time ?? pendingTriggerOrder.strategyEventTime ?? null,
+        strategyEventTrigger: true,
+        triggerTruthSource: "strategy_event_closed_candle",
+        updatedAt: new Date().toISOString(),
+      };
+      return processPlatformMarketTrigger({
+        bingxClient,
+        logger,
+        priceService,
+        profile: updatedProfile,
+        store,
+      });
+    }
     await logger("trigger order already armed", {
       fingerprint: activeSetupEvent.setupFingerprint,
       mode: "live",
@@ -437,7 +467,7 @@ export async function processLiveProfileExecution({
   const positionSide = activeSetupEvent.direction === "LONG" ? "LONG" : "SHORT";
 
   if (executionMode === "platform_market_trigger") {
-    return armPlatformMarketTrigger({
+    const armedProfile = await armPlatformMarketTrigger({
       activeSetupEvent,
       desiredQuantity,
       finalSizing,
@@ -452,6 +482,16 @@ export async function processLiveProfileExecution({
       side,
       updatedProfile,
     });
+    if (activeSetupEvent.strategyEventTrigger === true) {
+      return processPlatformMarketTrigger({
+        bingxClient,
+        logger,
+        priceService,
+        profile: armedProfile,
+        store,
+      });
+    }
+    return armedProfile;
   }
 
   await logger("risk approved; placing trigger-market entry order", {
@@ -658,8 +698,10 @@ async function armPlatformMarketTrigger({
   updatedProfile,
 }) {
   const armedAt = new Date().toISOString();
-  const priceSource = sztabPriceSource();
+  const priceSource = sztabStrategyPriceSource();
   const maxSlippagePct = maxTriggerSlippagePct();
+  const strategyEventTrigger = activeSetupEvent.strategyEventTrigger === true ||
+    activeSetupEvent.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED;
   const reversalFromDirection = livePositionDirection(reversalFromPosition);
   const isReversal = Boolean(
     reversalFromPosition &&
@@ -677,6 +719,7 @@ async function armPlatformMarketTrigger({
     payload: {
       action: "ARM_PLATFORM_MARKET_TRIGGER",
       priceSource,
+      strategyEventTrigger,
       triggerPrice: activeSetupEvent.trigger,
       type: "LOCAL_PLATFORM_TRIGGER",
     },
@@ -701,8 +744,12 @@ async function armPlatformMarketTrigger({
     orderLifecycle: [{
       diagnostics: placementDiagnostics,
       message: isReversal
-        ? "Live position is active; platform armed opposite trigger watcher for reversal."
-        : "Platform armed local trigger watcher; no BingX trigger order was placed.",
+        ? strategyEventTrigger
+          ? "Strategia potwierdziła przeciwny trigger; przygotowuję reversal MARKET przez BingX."
+          : "Live position is active; platform armed opposite trigger watcher for reversal."
+        : strategyEventTrigger
+          ? "Strategia potwierdziła trigger; przygotowuję MARKET przez BingX."
+          : "Platform armed local trigger watcher; no BingX trigger order was placed.",
       status: "platform_armed",
       time: armedAt,
     }],
@@ -733,9 +780,13 @@ async function armPlatformMarketTrigger({
     signalTime: activeSetupEvent.signalTime ?? null,
     status: "platform_armed",
     stopLoss: activeSetupEvent.stopLoss,
+    strategyEventFingerprint: activeSetupEvent.strategyEventFingerprint ?? null,
+    strategyEventTime: activeSetupEvent.strategyEventTime ?? activeSetupEvent.time ?? null,
+    strategyEventTrigger,
     strategyParamsHash: activeSetupEvent.strategyParamsHash,
     takeProfit: order.takeProfit,
     takeProfitEnabled: order.takeProfitEnabled,
+    triggerTruthSource: strategyEventTrigger ? "strategy_event_closed_candle" : "binance_futures_live_price",
     triggerPrice: activeSetupEvent.trigger,
     updatedAt: armedAt,
   };
@@ -750,7 +801,11 @@ async function armPlatformMarketTrigger({
     placementDiagnostics,
     priceSource,
     quantity,
-    reason: isReversal ? "waiting_for_opposite_trigger" : "platform_market_trigger_armed",
+    reason: strategyEventTrigger
+      ? "strategy_entry_event_triggered"
+      : isReversal
+        ? "waiting_for_opposite_trigger"
+        : "platform_market_trigger_armed",
     reversalFromDirection: isReversal ? reversalFromDirection : "",
     setupFingerprint: activeSetupEvent.setupFingerprint,
     setupFingerprintShort: activeSetupEvent.setupFingerprintShort,
@@ -767,6 +822,7 @@ async function armPlatformMarketTrigger({
     priceSource,
     profileId: updatedProfile.id,
     setupId: activeSetupEvent.setupId,
+    strategyEventTrigger,
     trigger: activeSetupEvent.trigger,
   });
   return updatedProfile;
@@ -866,6 +922,11 @@ function sztabExecutionMode() {
 function sztabPriceSource() {
   const value = String(process.env.SZTAB_PRICE_SOURCE ?? "bingx_mark").toLowerCase();
   return ["bingx_mark", "bingx_last", "binance_futures"].includes(value) ? value : "bingx_mark";
+}
+
+function sztabStrategyPriceSource() {
+  // Strategic trigger truth must stay on the Binance Futures side; BingX is only the execution venue.
+  return "binance_futures";
 }
 
 function maxTriggerSlippagePct() {
@@ -1164,6 +1225,27 @@ async function collectTriggerDiagnostics({
 }
 
 function setupEventForTriggerOrder(strategyResult) {
+  const latestEntryEvent = strategyResult.latestEvent;
+  if (
+    latestEntryEvent &&
+    latestEntryEvent.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED &&
+    Number.isFinite(Number(latestEntryEvent.trigger)) &&
+    Number.isFinite(Number(latestEntryEvent.stopLoss))
+  ) {
+    return {
+      ...latestEntryEvent,
+      strategyEventFingerprint: [
+        STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED,
+        latestEntryEvent.setupId ?? "",
+        latestEntryEvent.time ?? "",
+        latestEntryEvent.trigger ?? "",
+      ].join(":"),
+      strategyEventTime: latestEntryEvent.time ?? null,
+      strategyEventTrigger: true,
+      triggerTruthSource: "strategy_event_closed_candle",
+    };
+  }
+
   const setupEvent = strategyResult.latestSetupEvent;
 
   if (
@@ -1413,29 +1495,6 @@ function triggerSlippagePct(pending = {}, price) {
   return Math.abs(marketPrice - triggerPrice) / triggerPrice * 100;
 }
 
-async function pendingMarkInvalidation({ bingxClient, pending, priceService = null, symbol }) {
-  try {
-    const payload = await getPlatformTriggerPrice({
-      bingxClient,
-      priceService,
-      source: "bingx_mark",
-      symbol,
-    });
-    const markPrice = numericValue(payload.price ?? extractMarketPrice(payload));
-    if (!invalidationTouchedByPrice(pending, markPrice)) return null;
-    return {
-      event: null,
-      invalidationPrice: pendingInvalidationPrice(pending),
-      invalidationSource: "mark_price",
-      invalidationTime: Math.floor(Date.now() / 1000),
-      markPrice,
-      raw: payload,
-    };
-  } catch {
-    return null;
-  }
-}
-
 async function cancelPendingTriggerIfInvalidated({
   bingxClient,
   logger = async () => {},
@@ -1457,7 +1516,7 @@ async function cancelPendingTriggerIfInvalidated({
         markPrice: null,
         raw: null,
       }
-    : await pendingMarkInvalidation({ bingxClient, pending, priceService, symbol: updatedProfile.symbol });
+    : null;
 
   if (!invalidation) return updatedProfile;
 
@@ -2263,7 +2322,9 @@ async function processPlatformMarketTrigger({
   let pending = activePendingTriggerOrder(updatedProfile.live?.pendingTriggerOrder);
   if (!isPlatformMarketTriggerPending(pending)) return updatedProfile;
 
-  const priceSource = pending.priceSource ?? sztabPriceSource();
+  const priceSource = pending.priceSource ?? sztabStrategyPriceSource();
+  const strategyEventTrigger = pending.strategyEventTrigger === true ||
+    pending.triggerTruthSource === "strategy_event_closed_candle";
   let sample = null;
   try {
     sample = await getPlatformTriggerPrice({
@@ -2273,27 +2334,44 @@ async function processPlatformMarketTrigger({
       symbol: updatedProfile.symbol,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    updatedProfile.live.pendingTriggerOrder = {
-      ...pending,
-      lastPriceError: message,
-      platformTriggerDiagnostics: {
-        ...(pending.platformTriggerDiagnostics ?? {}),
-        error: error?.details ?? { message },
-        priceFeedStatus: "degraded",
+    if (strategyEventTrigger) {
+      sample = {
+        ageMs: null,
+        degraded: false,
+        lastError: null,
+        mode: "strategy_event",
+        price: pendingTriggerPrice(pending),
+        raw: { reason: "strategy_event_triggered_price_fallback" },
+        rateLimitCount: 0,
+        source: "strategy_event_closed_candle",
+        stale: false,
+        status: "ok",
+        time: new Date().toISOString(),
+        websocketStatus: "not_required",
+      };
+    } else {
+      const message = error instanceof Error ? error.message : String(error);
+      updatedProfile.live.pendingTriggerOrder = {
+        ...pending,
+        lastPriceError: message,
+        platformTriggerDiagnostics: {
+          ...(pending.platformTriggerDiagnostics ?? {}),
+          error: error?.details ?? { message },
+          priceFeedStatus: "degraded",
+          priceSource,
+        },
+        lastStatusCheckAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      await logger("platform trigger price sample failed", {
+        error: message,
+        mode: "live",
         priceSource,
-      },
-      lastStatusCheckAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    await logger("platform trigger price sample failed", {
-      error: message,
-      mode: "live",
-      priceSource,
-      profileId: updatedProfile.id,
-      setupId: pending.setupId,
-    });
-    return updatedProfile;
+        profileId: updatedProfile.id,
+        setupId: pending.setupId,
+      });
+      return updatedProfile;
+    }
   }
 
   const markPrice = numericValue(sample.price);
@@ -2308,8 +2386,9 @@ async function processPlatformMarketTrigger({
     websocketStatus: sample.websocketStatus ?? "unknown",
   };
   const maxStaleMs = Number(process.env.SZTAB_PRICE_MAX_STALE_MS || 3_000);
-  const touchedInvalidation = invalidationTouchedByPrice(pending, markPrice);
-  const touchedTrigger = triggerTouchedByPrice(pending, markPrice);
+  const diagnosticInvalidationTouched = invalidationTouchedByPrice(pending, markPrice);
+  const touchedInvalidation = false;
+  const touchedTrigger = strategyEventTrigger || triggerTouchedByPrice(pending, markPrice);
   const slippagePct = triggerSlippagePct(pending, markPrice);
   const maxSlippagePct = Number(pending.maxSlippagePct ?? maxTriggerSlippagePct());
   const baseDiagnostics = {
@@ -2322,6 +2401,10 @@ async function processPlatformMarketTrigger({
     priceSource: sample.source,
     priceTime: sample.time,
     slippagePct: numericValue(slippagePct),
+    strategyEventFingerprint: pending.strategyEventFingerprint ?? null,
+    strategyEventTrigger,
+    triggerTruthSource: strategyEventTrigger ? "strategy_event_closed_candle" : "binance_futures_live_price",
+    diagnosticInvalidationTouched,
     touchedInvalidation,
     touchedTrigger,
     triggerPrice: pendingTriggerPrice(pending),
@@ -2355,48 +2438,6 @@ async function processPlatformMarketTrigger({
     return updatedProfile;
   }
 
-  if (touchedInvalidation && !touchedTrigger) {
-    updatedProfile.live.pendingTriggerOrder = platformTriggerTerminalUpdate(pending, {
-      diagnostics: baseDiagnostics,
-      extraPending: {
-        canArmNextSetup: true,
-        invalidatedAt: new Date().toISOString(),
-        invalidationPrice: pendingInvalidationPrice(pending),
-        invalidationSource: sample.source,
-        markPriceAtInvalidation: markPrice,
-        platformTriggerDiagnostics: baseDiagnostics,
-        skippedReason: "setup_invalidated_before_platform_trigger",
-      },
-      message: "Setup invalidated before platform trigger; no market order was sent.",
-      reason: "setup_invalidated_before_platform_trigger",
-      status: "setup_invalidated_before_platform_trigger",
-    });
-    appendSetupOrderJournal(updatedProfile, {
-      event: "setup_invalidated_before_platform_trigger",
-      failureClassification: "setup_invalidated_before_platform_trigger",
-      interval: updatedProfile.timeframe,
-      markPrice,
-      priceSource: sample.source,
-      quantity: pending.quantity,
-      reason: "setup_invalidated_before_platform_trigger",
-      setupFingerprint: pending.setupFingerprint,
-      setupFingerprintShort: pending.setupFingerprintShort,
-      setupId: pending.setupId,
-      side: pending.side,
-      status: "setup_invalidated_before_platform_trigger",
-      triggerPrice: pending.triggerPrice,
-    });
-    await logger("platform trigger invalidated before cross", {
-      fingerprint: pending.setupFingerprint,
-      markPrice,
-      mode: "live",
-      priceSource: sample.source,
-      profileId: updatedProfile.id,
-      setupId: pending.setupId,
-    });
-    return updatedProfile;
-  }
-
   if (!touchedTrigger) {
     updatedProfile.live.pendingTriggerOrder = {
       ...pending,
@@ -2412,7 +2453,7 @@ async function processPlatformMarketTrigger({
     return updatedProfile;
   }
 
-  if (slippagePct !== null && slippagePct > maxSlippagePct) {
+  if (!strategyEventTrigger && slippagePct !== null && slippagePct > maxSlippagePct) {
     updatedProfile.live.pendingTriggerOrder = platformTriggerTerminalUpdate(pending, {
       diagnostics: baseDiagnostics,
       extraPending: {
@@ -2844,6 +2885,7 @@ async function processPlatformMarketTrigger({
   });
   updatedProfile.live.lastProcessedSetupId = pending.setupId;
   updatedProfile.live.lastProcessedSetupFingerprint = pending.setupFingerprint ?? null;
+  updatedProfile.live.lastProcessedStrategyEventFingerprint = pending.strategyEventFingerprint ?? null;
   updatedProfile.live.pendingTriggerOrder = {
     ...pending,
     canArmNextSetup: false,
