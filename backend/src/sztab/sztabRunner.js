@@ -76,6 +76,17 @@ function numberValue(value, fallback = 0) {
   return Number.isFinite(numeric) ? numeric : fallback;
 }
 
+function timeValueMs(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "number" || (typeof value === "string" && /^-?\d+(\.\d+)?$/u.test(value.trim()))) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return null;
+    return numeric > 10_000_000_000 ? Math.round(numeric) : Math.round(numeric * 1000);
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function compactSymbol(symbol) {
   return String(symbol ?? "").replace("-", "").toUpperCase();
 }
@@ -1027,11 +1038,21 @@ export function createSztabRunner({
 
       const strategyResult = await runStrategyForProfile(profile, { limit: candlesRequested });
       const lastCandle = strategyResult.sourceCandles.at(-1);
-      const lastSignal = strategyResult.latestEvent
+      const rawLastSignal = strategyResult.latestEvent
         ? eventSummary(strategyResult.latestEvent, profile)
         : null;
-      const latestEntryEvent = eventSummary(strategyResult.latestEntryEvent, profile);
+      const rawLatestEntryEvent = eventSummary(strategyResult.latestEntryEvent, profile);
       const latestSetupEvent = eventSummary(strategyResult.latestSetupEvent, profile);
+      const latestEntryFingerprint = rawLatestEntryEvent?.setupFingerprint ?? "";
+      const latestSetupFingerprint = latestSetupEvent?.setupFingerprint ?? "";
+      const staleEntryIgnoredReason = rawLatestEntryEvent && latestSetupEvent && latestEntryFingerprint && latestSetupFingerprint && latestEntryFingerprint !== latestSetupFingerprint
+        ? "latest_entry_fingerprint_mismatch_with_current_setup"
+        : "";
+      const latestEntryEvent = staleEntryIgnoredReason ? null : rawLatestEntryEvent;
+      const lastSignalStaleReason = rawLastSignal && latestSetupEvent && rawLastSignal.setupFingerprint && latestSetupFingerprint && rawLastSignal.setupFingerprint !== latestSetupFingerprint
+        ? "latest_signal_fingerprint_mismatch_with_current_setup"
+        : "";
+      const lastSignal = lastSignalStaleReason ? null : rawLastSignal;
 
       if (lastSignal && executionDiagnostics.globalBlockers.length > 0) {
         const blockedReason = executionDiagnostics.globalBlockers.map((blocker) => blocker.reason).join("; ");
@@ -1061,8 +1082,12 @@ export function createSztabRunner({
           lastSignal,
           lastSyncAt: nowIso(),
           latestEntryEvent,
+          latestEntryFingerprint,
           latestSetupEvent,
+          latestSetupFingerprint,
           profileConnected: publicProfile?.status === "connected",
+          staleEntryIgnoredReason: staleEntryIgnoredReason || lastSignalStaleReason,
+          staleLatestEntryFingerprint: latestEntryFingerprint,
           validNweBandCount: strategyResult.diagnostics?.validNweBandCount ?? 0,
         });
         await appendLog("Sztab signal blocked by global execution lock", {
@@ -1177,6 +1202,7 @@ export function createSztabRunner({
         cleanupFailureReason: triggerSummary.cleanupFailureReason,
         executionMode: triggerSummary.executionMode,
         executionPrice: triggerSummary.executionPrice,
+        ignoredPreEligibilityTriggerTicks: triggerSummary.ignoredPreEligibilityTriggerTicks,
         lastMarkPrice: triggerSummary.lastMarkPrice,
         lastPriceSource: triggerSummary.lastPriceSource,
         lastTriggerFailureCandidate: triggerSummary.lastTriggerFailureCandidate,
@@ -1184,8 +1210,12 @@ export function createSztabRunner({
         lastTriggerFailureReason: triggerSummary.lastTriggerFailureReason,
         livePositionConfirmed: triggerSummary.livePositionConfirmed,
         liveProtectionConfirmed: triggerSummary.liveProtectionConfirmed,
+        activeSetupFingerprint: triggerSummary.activeSetupFingerprint,
+        activeSetupFingerprintShort: triggerSummary.activeSetupFingerprintShort,
         latestEntryEvent,
+        latestEntryFingerprint,
         latestSetupEvent,
+        latestSetupFingerprint,
         pendingOrderAgeSeconds: triggerSummary.pendingOrderAgeSeconds,
         platformMarketEntrySent: triggerSummary.marketOrderSent,
         platformTriggerCrossed: triggerSummary.platformTriggerCrossed,
@@ -1201,8 +1231,8 @@ export function createSztabRunner({
         reversalTrigger: triggerSummary.reversalTrigger,
         profileConnected: publicProfile?.status === "connected",
         scenarioTerminalReason: triggerSummary.scenarioTerminalReason,
-        setupFingerprint: triggerSummary.setupFingerprint || latestSetupEvent?.setupFingerprint || "",
-        setupFingerprintShort: triggerSummary.setupFingerprintShort || latestSetupEvent?.setupFingerprintShort || "",
+        setupFingerprint: latestSetupFingerprint || triggerSummary.setupFingerprint || "",
+        setupFingerprintShort: latestSetupEvent?.setupFingerprintShort || triggerSummary.setupFingerprintShort || "",
         slPlacementStatus: pendingTriggerOrder?.status === "filled_protected"
           ? "placed"
           : pendingTriggerOrder?.status === "filled_sl_failed"
@@ -1211,10 +1241,13 @@ export function createSztabRunner({
               ? "placed"
               : "not_placed",
         setupOrderJournal: triggerSummary.setupOrderJournal,
+        staleEntryIgnoredReason: staleEntryIgnoredReason || lastSignalStaleReason,
         supersededBySetupFingerprint: triggerSummary.supersededBySetupFingerprint,
         supersededBySetupId: triggerSummary.supersededBySetupId,
         triggerDistanceAtFailurePct: triggerSummary.triggerDistanceAtFailurePct,
         triggerDistanceAtPlacementPct: triggerSummary.triggerDistanceAtPlacementPct,
+        triggerEligibleFrom: triggerSummary.triggerEligibleFrom,
+        triggerEligibleFromIso: triggerSummary.triggerEligibleFromIso,
         triggerMarginDiagnostics: triggerSummary.triggerMarginDiagnostics,
         triggerFailureClassification: triggerSummary.triggerFailureClassification,
         triggerOrderExecutedQty: triggerSummary.triggerOrderExecutedQty,
@@ -1298,6 +1331,8 @@ export function createSztabRunner({
     const status = String(pending?.status ?? "none");
     return {
       activeScenarioCanBlockNewSetup: Boolean(live?.activeScenarioCanBlockNewSetup ?? isActive),
+      activeSetupFingerprint: pending?.setupFingerprint ?? "",
+      activeSetupFingerprintShort: pending?.setupFingerprintShort ?? "",
       canArmNextSetup: pending ? Boolean(pending.canArmNextSetup ?? !isActive) : true,
       executionMode: pending?.executionMode ?? sztabExecutionMode(),
       exchangeTerminalStatus: pending?.exchangeTerminalStatus ?? (pending?.terminal ? pending?.lastExchangeStatus ?? status : ""),
@@ -1318,6 +1353,7 @@ export function createSztabRunner({
       pendingOrderAgeSeconds: pending?.acceptedAt || pending?.updatedAt || pending?.createdAt
         ? secondsSinceIso(pending.acceptedAt ?? pending.updatedAt ?? pending.createdAt)
         : null,
+      ignoredPreEligibilityTriggerTicks: pending?.ignoredPreEligibilityTriggerTicks ?? pending?.platformTriggerDiagnostics?.ignoredPreEligibilityTriggerTicks ?? 0,
       priceFeedAgeMs: pending?.platformTriggerDiagnostics?.priceFeed?.ageMs ?? null,
       priceFeedFallbackActive: Boolean(pending?.platformTriggerDiagnostics?.priceFeed?.fallbackActive),
       priceFeedLastWebsocketTickAt: pending?.platformTriggerDiagnostics?.priceFeed?.lastWebsocketTickAt ?? null,
@@ -1344,6 +1380,10 @@ export function createSztabRunner({
       setupFingerprint: pending?.setupFingerprint ?? "",
       setupFingerprintShort: pending?.setupFingerprintShort ?? "",
       setupOrderJournal: (live?.setupOrderJournal ?? []).slice(-100),
+      staleEntryIgnoredReason: pending?.staleEntryIgnoredReason ?? pending?.platformTriggerDiagnostics?.staleEntryIgnoredReason ?? "",
+      staleLatestEntryFingerprint: pending?.staleLatestEntryFingerprint ?? pending?.platformTriggerDiagnostics?.staleLatestEntryFingerprint ?? "",
+      triggerEligibleFrom: pending?.triggerEligibleFrom ?? null,
+      triggerEligibleFromIso: pending?.triggerEligibleFromIso ?? null,
       supersededBySetupFingerprint: live?.supersededBySetupFingerprint ?? pending?.supersededBySetupFingerprint ?? null,
       supersededBySetupId: live?.supersededBySetupId ?? pending?.supersededBySetupId ?? null,
       triggerDistanceAtFailurePct: pending?.failureDiagnostics?.distanceFromMarkToTriggerPct ?? null,
@@ -1382,13 +1422,22 @@ export function createSztabRunner({
     return "Pending trigger order is still waiting for fill.";
   }
 
-  function pendingTriggerTouchedByTick(pending = {}, price) {
+  function pendingTriggerTouchedByTick(pending = {}, price, time = null) {
     const triggerPrice = Number(pending.triggerPrice ?? pending.entryEvent?.trigger);
     const tickPrice = Number(price);
-    if (!Number.isFinite(triggerPrice) || !Number.isFinite(tickPrice)) return false;
+    if (!Number.isFinite(triggerPrice) || !Number.isFinite(tickPrice)) {
+      return { ignoredPreEligibility: false, touched: false };
+    }
     const direction = String(pending.direction ?? pending.positionSide ?? pending.side ?? "").toUpperCase();
     const isShort = direction.includes("SHORT") || direction === "SELL";
-    return isShort ? tickPrice <= triggerPrice : tickPrice >= triggerPrice;
+    const touched = isShort ? tickPrice <= triggerPrice : tickPrice >= triggerPrice;
+    if (!touched) return { ignoredPreEligibility: false, touched: false };
+    const triggerEligibleFromMs = timeValueMs(pending.triggerEligibleFrom ?? pending.triggerEligibleFromIso ?? pending.setupCandleCloseTime);
+    const tickTimeMs = timeValueMs(time);
+    if (triggerEligibleFromMs !== null && tickTimeMs !== null && tickTimeMs < triggerEligibleFromMs) {
+      return { ignoredPreEligibility: true, touched: false };
+    }
+    return { ignoredPreEligibility: false, touched: true };
   }
 
   function clearTriggerWatcher(interval) {
@@ -1510,6 +1559,9 @@ export function createSztabRunner({
       lastTriggerFailureReason: triggerSummary.lastTriggerFailureReason,
       livePositionConfirmed: triggerSummary.livePositionConfirmed,
       liveProtectionConfirmed: triggerSummary.liveProtectionConfirmed,
+      activeSetupFingerprint: triggerSummary.activeSetupFingerprint,
+      activeSetupFingerprintShort: triggerSummary.activeSetupFingerprintShort,
+      ignoredPreEligibilityTriggerTicks: triggerSummary.ignoredPreEligibilityTriggerTicks,
       pendingOrderAgeSeconds: triggerSummary.pendingOrderAgeSeconds,
       platformMarketEntrySent: triggerSummary.marketOrderSent,
       platformTriggerCrossed: triggerSummary.platformTriggerCrossed,
@@ -1527,6 +1579,8 @@ export function createSztabRunner({
       setupFingerprint: triggerSummary.setupFingerprint,
       setupFingerprintShort: triggerSummary.setupFingerprintShort,
       setupOrderJournal: triggerSummary.setupOrderJournal,
+      staleEntryIgnoredReason: triggerSummary.staleEntryIgnoredReason,
+      staleLatestEntryFingerprint: triggerSummary.staleLatestEntryFingerprint,
       slPlacementStatus: nextPending?.status === "filled_protected"
         ? "placed"
         : nextPending?.status === "filled_sl_failed"
@@ -1537,6 +1591,8 @@ export function createSztabRunner({
       supersededBySetupFingerprint: triggerSummary.supersededBySetupFingerprint,
       triggerDistanceAtFailurePct: triggerSummary.triggerDistanceAtFailurePct,
       triggerDistanceAtPlacementPct: triggerSummary.triggerDistanceAtPlacementPct,
+      triggerEligibleFrom: triggerSummary.triggerEligibleFrom,
+      triggerEligibleFromIso: triggerSummary.triggerEligibleFromIso,
       triggerMarginDiagnostics: triggerSummary.triggerMarginDiagnostics,
       triggerFailureClassification: triggerSummary.triggerFailureClassification,
       triggerOrderExecutedQty: triggerSummary.triggerOrderExecutedQty,
@@ -1562,7 +1618,16 @@ export function createSztabRunner({
         const pending = existingProfile?.live?.pendingTriggerOrder ?? current?.runtime?.pendingTriggerOrder ?? null;
         if (!current || !isRunningStatus(current.runtime?.status) || !isActivePendingTrigger(pending)) continue;
         if (normalizeSymbol(current.symbol) !== normalizeSymbol(tick.symbol)) continue;
-        if (!pendingTriggerTouchedByTick(pending, tick.price)) continue;
+        const touch = pendingTriggerTouchedByTick(pending, tick.price, tick.time);
+        if (touch.ignoredPreEligibility) {
+          persistRuntime(interval, {
+            ignoredPreEligibilityTriggerTicks: Number(current.runtime?.ignoredPreEligibilityTriggerTicks ?? 0) + 1,
+            lastDecision: "Tick przebił trigger przed czasem aktywacji setupu; ignoruję go.",
+            lastDecisionReason: "pre_eligibility_trigger_tick_ignored",
+          }).catch(() => {});
+          continue;
+        }
+        if (!touch.touched) continue;
         pollPendingTrigger(interval).catch((error) => {
           appendLog("Sztab websocket trigger wake failed", {
             error: error instanceof Error ? error.message : String(error),

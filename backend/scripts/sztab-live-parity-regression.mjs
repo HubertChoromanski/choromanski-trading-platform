@@ -116,8 +116,9 @@ function createStore() {
 
 const store = createStore();
 
-function createPriceService({ mode = "websocket", price = 101, recentTicks = null, source = "binance_futures" } = {}) {
+function createPriceService({ mode = "websocket", price = 101, recentTicks = null, source = "binance_futures", time = null } = {}) {
   const calls = [];
+  const sampleTime = time ?? new Date().toISOString();
   return {
     calls,
     getPrice: async ({ source: requestedSource }) => {
@@ -141,7 +142,7 @@ function createPriceService({ mode = "websocket", price = 101, recentTicks = nul
         source,
         stale: false,
         status: "ok",
-        time: new Date().toISOString(),
+        time: sampleTime,
         websocketAgeMs: mode === "websocket" ? 0 : null,
         websocketStatus: mode === "websocket" ? "connected" : "unconfigured",
       };
@@ -347,8 +348,143 @@ async function assertStrategyInvalidationCancelsSetup() {
   assert(!client.calls.some((call) => call.type === "placeMarketOrder"), "Invalidated setup still sent market order.");
 }
 
+async function assertStaleEntryDifferentFingerprintDoesNotExecuteCurrentSetup() {
+  process.env.SZTAB_EXECUTION_MODE = "platform_market_trigger";
+  const client = createBingxClient();
+  const priceService = createPriceService({ price: 90 });
+  const currentSetup = setupEvent({
+    direction: "LONG",
+    setupId: "CTP-0471",
+    time: 2_000,
+    trigger: 100,
+    stopLoss: 95,
+  });
+  const armed = await processLiveProfileExecution({
+    bingxClient: client,
+    logger: async () => {},
+    priceService,
+    profile: baseProfile(),
+    store,
+    strategyResult: strategyResult({ latestSetupEvent: currentSetup }),
+  });
+  assert(armed.live.pendingTriggerOrder?.status === "platform_armed", "Current setup was not armed.");
+
+  const staleEntry = entryEvent({
+    direction: "SHORT",
+    setupId: "CTP-0471",
+    time: 1_200,
+    trigger: 90,
+    stopLoss: 105,
+  });
+  const result = await processLiveProfileExecution({
+    bingxClient: client,
+    logger: async () => {},
+    priceService,
+    profile: armed,
+    store,
+    strategyResult: strategyResult({
+      events: [staleEntry],
+      latestEvent: staleEntry,
+      latestSetupEvent: currentSetup,
+    }),
+  });
+  assert(!client.calls.some((call) => call.type === "placeMarketOrder"), "Stale ENTRY_TRIGGERED with different fingerprint executed current setup.");
+  assert(
+    result.live.pendingTriggerOrder?.setupFingerprint === armed.live.pendingTriggerOrder?.setupFingerprint,
+    "Stale entry replaced the current pending setup fingerprint.",
+  );
+  assert(
+    result.live.pendingTriggerOrder?.staleEntryIgnoredReason === "latest_entry_fingerprint_mismatch_with_current_setup",
+    "Stale entry mismatch was not recorded.",
+  );
+}
+
+async function assertPreEligibilityWebsocketTickDoesNotExecute() {
+  process.env.SZTAB_EXECUTION_MODE = "platform_market_trigger";
+  const client = createBingxClient();
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const setup = setupEvent({
+    direction: "LONG",
+    setupId: "future-setup",
+    time: nowSeconds + 600,
+    trigger: 100,
+    stopLoss: 95,
+  });
+  const preEligibilityTickTime = new Date((nowSeconds + 900) * 1000).toISOString();
+  const priceService = createPriceService({
+    price: 101,
+    recentTicks: [{ price: 101, time: preEligibilityTickTime }],
+    time: preEligibilityTickTime,
+  });
+  const armed = await processLiveProfileExecution({
+    bingxClient: client,
+    logger: async () => {},
+    priceService,
+    profile: baseProfile(),
+    store,
+    strategyResult: strategyResult({ latestSetupEvent: setup }),
+  });
+  const watched = await processLiveProfileExecution({
+    bingxClient: client,
+    logger: async () => {},
+    priceService,
+    profile: armed,
+    store,
+    strategyResult: strategyResult(),
+  });
+  assert(!client.calls.some((call) => call.type === "placeMarketOrder"), "Pre-eligibility websocket tick sent MARKET.");
+  assert(watched.live.pendingTriggerOrder?.status === "platform_armed", "Pre-eligibility tick should keep setup armed.");
+  assert(
+    watched.live.pendingTriggerOrder?.ignoredPreEligibilityTriggerTicks >= 2,
+    `Pre-eligibility trigger ticks were not counted: ${JSON.stringify(watched.live.pendingTriggerOrder?.platformTriggerDiagnostics)}`,
+  );
+}
+
+async function assertPostEligibilityWebsocketTickExecutes() {
+  process.env.SZTAB_EXECUTION_MODE = "platform_market_trigger";
+  const client = createBingxClient();
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const setup = setupEvent({
+    direction: "LONG",
+    setupId: "eligible-setup",
+    time: nowSeconds - 1_200,
+    trigger: 100,
+    stopLoss: 95,
+  });
+  const postEligibilityTickTime = new Date((nowSeconds + 10) * 1000).toISOString();
+  const priceService = createPriceService({
+    price: 100.02,
+    recentTicks: [{ price: 100.05, time: postEligibilityTickTime }],
+    time: postEligibilityTickTime,
+  });
+  const armed = await processLiveProfileExecution({
+    bingxClient: client,
+    logger: async () => {},
+    priceService,
+    profile: baseProfile(),
+    store,
+    strategyResult: strategyResult({ latestSetupEvent: setup }),
+  });
+  const executed = await processLiveProfileExecution({
+    bingxClient: client,
+    logger: async () => {},
+    priceService,
+    profile: armed,
+    store,
+    strategyResult: strategyResult(),
+  });
+  assert(
+    executed.live.pendingTriggerOrder?.status === "filled_protected",
+    `Post-eligibility websocket trigger did not execute: ${JSON.stringify(executed.live.pendingTriggerOrder?.platformTriggerDiagnostics ?? executed.live.pendingTriggerOrder)}`,
+  );
+  assert(client.calls.some((call) => call.type === "placeMarketOrder" && call.side === "BUY"), "Post-eligibility trigger did not send MARKET.");
+}
+
 await assertArmedSetupBinanceCrossSendsMarket();
 await assertStrategyEntryDoesNotRequireLivePriceCross();
 await assertReversalClosesThenOpensOpposite();
 await assertStrategyInvalidationCancelsSetup();
+await assertStaleEntryDifferentFingerprintDoesNotExecuteCurrentSetup();
+await assertPreEligibilityWebsocketTickDoesNotExecute();
+await assertPostEligibilityWebsocketTickExecutes();
 console.log("Sztab live parity regression passed");

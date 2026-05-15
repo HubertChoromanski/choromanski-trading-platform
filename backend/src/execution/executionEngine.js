@@ -211,9 +211,11 @@ export async function processLiveProfileExecution({
     store,
   });
 
-  const rawActiveSetupEvent = setupEventForTriggerOrder(strategyResult);
+  const rawActiveSetupEvent = setupEventForTriggerOrder(strategyResult, updatedProfile);
   const activeSetupEvent = rawActiveSetupEvent
-    ? buildLiveSetupEvent(rawActiveSetupEvent, updatedProfile)
+    ? rawActiveSetupEvent.setupFingerprint
+      ? rawActiveSetupEvent
+      : buildLiveSetupEvent(rawActiveSetupEvent, updatedProfile)
     : null;
   const pendingTriggerOrder = activePendingTriggerOrder(updatedProfile.live?.pendingTriggerOrder);
   openPosition = updatedProfile.live?.openPosition;
@@ -278,6 +280,20 @@ export async function processLiveProfileExecution({
         profile: updatedProfile,
         store,
       });
+    }
+    if (activeSetupEvent.staleEntryIgnoredReason) {
+      updatedProfile.live.pendingTriggerOrder = {
+        ...pendingTriggerOrder,
+        lastStatusCheckAt: new Date().toISOString(),
+        platformTriggerDiagnostics: {
+          ...(pendingTriggerOrder.platformTriggerDiagnostics ?? {}),
+          staleEntryIgnoredReason: activeSetupEvent.staleEntryIgnoredReason,
+          staleLatestEntryFingerprint: activeSetupEvent.staleLatestEntryFingerprint ?? null,
+        },
+        staleEntryIgnoredReason: activeSetupEvent.staleEntryIgnoredReason,
+        staleLatestEntryFingerprint: activeSetupEvent.staleLatestEntryFingerprint ?? null,
+        updatedAt: new Date().toISOString(),
+      };
     }
     await logger("trigger order already armed", {
       fingerprint: activeSetupEvent.setupFingerprint,
@@ -376,7 +392,7 @@ export async function processLiveProfileExecution({
     takeProfitEnabled: liveTakeProfitEnabled(updatedProfile),
   };
   if (!marginSafety.allowed) {
-    updatedProfile.live.pendingTriggerOrder = {
+  updatedProfile.live.pendingTriggerOrder = {
       direction: activeSetupEvent.direction,
       marginSafety,
       orderLifecycle: [{
@@ -704,6 +720,7 @@ async function armPlatformMarketTrigger({
   const strategyEventTrigger = activeSetupEvent.strategyEventTrigger === true ||
     activeSetupEvent.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED;
   const reversalFromDirection = livePositionDirection(reversalFromPosition);
+  const triggerEligibility = triggerEligibilityForSetup(activeSetupEvent, updatedProfile);
   const isReversal = Boolean(
     reversalFromPosition &&
       isOppositeDirection(reversalFromDirection, activeSetupEvent.direction),
@@ -730,7 +747,7 @@ async function armPlatformMarketTrigger({
     triggerPrice: activeSetupEvent.trigger,
   };
 
-  updatedProfile.live.pendingTriggerOrder = {
+    updatedProfile.live.pendingTriggerOrder = {
     armedAt,
     benchmarkTime: activeSetupEvent.benchmarkTime ?? activeSetupEvent.time ?? null,
     canArmNextSetup: false,
@@ -787,7 +804,10 @@ async function armPlatformMarketTrigger({
     strategyParamsHash: activeSetupEvent.strategyParamsHash,
     takeProfit: order.takeProfit,
     takeProfitEnabled: order.takeProfitEnabled,
+    setupCandleCloseTime: triggerEligibility.setupCandleCloseTime,
     triggerTruthSource: strategyEventTrigger ? "strategy_event_closed_candle" : "binance_futures_live_price",
+    triggerEligibleFrom: triggerEligibility.triggerEligibleFrom,
+    triggerEligibleFromIso: triggerEligibility.triggerEligibleFromIso,
     triggerPrice: activeSetupEvent.trigger,
     updatedAt: armedAt,
   };
@@ -1234,16 +1254,20 @@ async function collectTriggerDiagnostics({
   };
 }
 
-function setupEventForTriggerOrder(strategyResult) {
+function setupEventForTriggerOrder(strategyResult, profile = null) {
   const latestEntryEvent = strategyResult.latestEvent;
+  const setupEvent = strategyResult.latestSetupEvent;
+  const latestSetupContext = setupEvent && profile ? buildLiveSetupEvent(setupEvent, profile) : setupEvent;
+  const setupCandidate = setupEventForPendingTrigger(strategyResult, profile);
   if (
     latestEntryEvent &&
     latestEntryEvent.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED &&
     Number.isFinite(Number(latestEntryEvent.trigger)) &&
     Number.isFinite(Number(latestEntryEvent.stopLoss))
   ) {
-    return {
-      ...latestEntryEvent,
+    const entryCandidate = profile ? buildLiveSetupEvent(latestEntryEvent, profile) : latestEntryEvent;
+    const entryWithTriggerMetadata = {
+      ...entryCandidate,
       strategyEventFingerprint: [
         STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED,
         latestEntryEvent.setupId ?? "",
@@ -1254,10 +1278,32 @@ function setupEventForTriggerOrder(strategyResult) {
       strategyEventTrigger: true,
       triggerTruthSource: "strategy_event_closed_candle",
     };
+
+    const setupContextIsSameOrNewer = timeValueMs(latestSetupContext?.time) === null ||
+      timeValueMs(entryCandidate.time) === null ||
+      timeValueMs(latestSetupContext?.time) >= timeValueMs(entryCandidate.time);
+    if (
+      latestSetupContext?.setupFingerprint &&
+      entryCandidate.setupFingerprint &&
+      entryCandidate.setupFingerprint !== latestSetupContext.setupFingerprint &&
+      setupContextIsSameOrNewer
+    ) {
+      if (!setupCandidate) return null;
+      return {
+        ...setupCandidate,
+        staleEntryIgnoredReason: "latest_entry_fingerprint_mismatch_with_current_setup",
+        staleLatestEntryFingerprint: entryCandidate.setupFingerprint,
+      };
+    }
+
+    return entryWithTriggerMetadata;
   }
 
-  const setupEvent = strategyResult.latestSetupEvent;
+  return setupCandidate;
+}
 
+function setupEventForPendingTrigger(strategyResult, profile = null) {
+  const setupEvent = strategyResult.latestSetupEvent;
   if (
     !setupEvent ||
     ![STRATEGY_EVENT_TYPES.SETUP_ACTIVE, STRATEGY_EVENT_TYPES.BENCHMARK_CONFIRMED].includes(setupEvent.type) ||
@@ -1267,13 +1313,18 @@ function setupEventForTriggerOrder(strategyResult) {
     return null;
   }
 
-  const alreadyTriggered = (strategyResult.strategy?.events ?? []).some(
-    (event) =>
-      event.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED &&
-      event.setupId === setupEvent.setupId,
-  );
+  const fingerprintedSetup = profile ? buildLiveSetupEvent(setupEvent, profile) : setupEvent;
+  const alreadyTriggered = (strategyResult.strategy?.events ?? []).some((event) => {
+    if (event.type !== STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED) return false;
+    if (profile) {
+      const fingerprintedEntry = buildLiveSetupEvent(event, profile);
+      return Boolean(fingerprintedEntry.setupFingerprint && fingerprintedEntry.setupFingerprint === fingerprintedSetup.setupFingerprint);
+    }
+    return event.setupId === setupEvent.setupId;
+  });
 
-  return alreadyTriggered ? null : setupEvent;
+  if (alreadyTriggered) return null;
+  return fingerprintedSetup;
 }
 
 function activePendingTriggerOrder(order) {
@@ -1313,6 +1364,44 @@ function nonRetryPendingStatuses() {
 function numericValue(value) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : null;
+}
+
+function timeValueMs(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "number" || (typeof value === "string" && /^-?\d+(\.\d+)?$/u.test(value.trim()))) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return null;
+    return numeric > 10_000_000_000 ? Math.round(numeric) : Math.round(numeric * 1000);
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function intervalSeconds(interval) {
+  const normalized = String(interval ?? "").trim().toLowerCase();
+  const numeric = Number.parseFloat(normalized);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  if (normalized.endsWith("h")) return Math.round(numeric * 60 * 60);
+  if (normalized.endsWith("d")) return Math.round(numeric * 24 * 60 * 60);
+  return Math.round(numeric * 60);
+}
+
+function triggerEligibilityForSetup(setup = {}, profile = {}) {
+  const benchmarkSeconds = numericValue(setup.benchmarkTime ?? setup.setupCandleTime ?? setup.time);
+  const seconds = intervalSeconds(setup.interval ?? setup.timeframe ?? profile.timeframe);
+  if (benchmarkSeconds === null || seconds === null) {
+    return {
+      setupCandleCloseTime: null,
+      triggerEligibleFrom: null,
+      triggerEligibleFromIso: null,
+    };
+  }
+  const eligibleFrom = benchmarkSeconds + seconds;
+  return {
+    setupCandleCloseTime: eligibleFrom,
+    triggerEligibleFrom: eligibleFrom,
+    triggerEligibleFromIso: new Date(eligibleFrom * 1000).toISOString(),
+  };
 }
 
 function nearlyEqual(left, right, tolerance = 1e-6) {
@@ -1507,14 +1596,54 @@ function triggerTouchedByPrice(pending = {}, price) {
     : marketPrice <= triggerPrice;
 }
 
+function triggerEligibilityDiagnostics(pending = {}, sample = {}) {
+  const eligibleFromMs = timeValueMs(pending.triggerEligibleFrom ?? pending.triggerEligibleFromIso ?? pending.setupCandleCloseTime);
+  const sampleTimeMs = timeValueMs(sample.time);
+  return {
+    sampleEligible: eligibleFromMs === null || sampleTimeMs === null || sampleTimeMs >= eligibleFromMs,
+    sampleTimeMs,
+    triggerEligibleFrom: pending.triggerEligibleFrom ?? null,
+    triggerEligibleFromIso: pending.triggerEligibleFromIso ?? null,
+    triggerEligibleFromMs: eligibleFromMs,
+  };
+}
+
 function triggerTouchedByRecentTicks(pending = {}, ticks = []) {
-  if (!Array.isArray(ticks) || ticks.length === 0) return false;
+  if (!Array.isArray(ticks) || ticks.length === 0) {
+    return {
+      ignoredPreEligibilityTriggerTicks: 0,
+      touched: false,
+      touchedAt: null,
+    };
+  }
   const armedAtMs = Date.parse(pending.armedAt ?? pending.updatedAt ?? 0);
-  return ticks.some((tick) => {
+  const eligibleFromMs = timeValueMs(pending.triggerEligibleFrom ?? pending.triggerEligibleFromIso ?? pending.setupCandleCloseTime);
+  let ignoredPreEligibilityTriggerTicks = 0;
+  let touchedAt = null;
+  const touched = ticks.some((tick) => {
     const tickTime = Date.parse(tick?.time ?? 0);
     if (Number.isFinite(armedAtMs) && Number.isFinite(tickTime) && tickTime < armedAtMs) return false;
-    return triggerTouchedByPrice(pending, tick?.price);
+    const tickTouchesTrigger = triggerTouchedByPrice(pending, tick?.price);
+    if (
+      tickTouchesTrigger &&
+      eligibleFromMs !== null &&
+      Number.isFinite(tickTime) &&
+      tickTime < eligibleFromMs
+    ) {
+      ignoredPreEligibilityTriggerTicks += 1;
+      return false;
+    }
+    if (tickTouchesTrigger) {
+      touchedAt = tick?.time ?? null;
+      return true;
+    }
+    return false;
   });
+  return {
+    ignoredPreEligibilityTriggerTicks,
+    touched,
+    touchedAt,
+  };
 }
 
 function triggerSlippagePct(pending = {}, price) {
@@ -2423,12 +2552,19 @@ async function processPlatformMarketTrigger({
   const maxStaleMs = Number(process.env.SZTAB_PRICE_MAX_STALE_MS || 3_000);
   const diagnosticInvalidationTouched = invalidationTouchedByPrice(pending, markPrice);
   const touchedInvalidation = false;
-  const recentTickTriggerTouched = triggerTouchedByRecentTicks(pending, sample.recentTicks);
-  const touchedTrigger = strategyEventTrigger || triggerTouchedByPrice(pending, markPrice) || recentTickTriggerTouched;
+  const triggerEligibility = triggerEligibilityDiagnostics(pending, sample);
+  const recentTickTrigger = triggerTouchedByRecentTicks(pending, sample.recentTicks);
+  const currentPriceTriggerTouched = triggerEligibility.sampleEligible && triggerTouchedByPrice(pending, markPrice);
+  const preEligibilitySampleTriggerTouched = !triggerEligibility.sampleEligible && triggerTouchedByPrice(pending, markPrice);
+  const recentTickTriggerTouched = recentTickTrigger.touched;
+  const ignoredPreEligibilityTriggerTicks = recentTickTrigger.ignoredPreEligibilityTriggerTicks +
+    (preEligibilitySampleTriggerTouched ? 1 : 0);
+  const touchedTrigger = strategyEventTrigger || currentPriceTriggerTouched || recentTickTriggerTouched;
   const slippagePct = triggerSlippagePct(pending, markPrice);
   const maxSlippagePct = Number(pending.maxSlippagePct ?? maxTriggerSlippagePct());
   const baseDiagnostics = {
     executionMode: "platform_market_trigger",
+    ignoredPreEligibilityTriggerTicks,
     invalidationPrice: pendingInvalidationPrice(pending),
     markPrice,
     maxSlippagePct,
@@ -2441,9 +2577,13 @@ async function processPlatformMarketTrigger({
     slippagePct: numericValue(slippagePct),
     strategyEventFingerprint: pending.strategyEventFingerprint ?? null,
     strategyEventTrigger,
+    triggerEligibleFrom: triggerEligibility.triggerEligibleFrom,
+    triggerEligibleFromIso: triggerEligibility.triggerEligibleFromIso,
+    triggerSampleEligible: triggerEligibility.sampleEligible,
     triggerTruthSource: strategyEventTrigger ? "strategy_event_closed_candle" : "binance_futures_live_price",
     diagnosticInvalidationTouched,
     recentTickTriggerTouched,
+    recentTickTriggerTouchedAt: recentTickTrigger.touchedAt,
     touchedInvalidation,
     touchedTrigger,
     triggerPrice: pendingTriggerPrice(pending),
@@ -2486,6 +2626,7 @@ async function processPlatformMarketTrigger({
       lastPriceTime: sample.time,
       lastStatusCheckAt: new Date().toISOString(),
       platformTriggerDiagnostics: baseDiagnostics,
+      ignoredPreEligibilityTriggerTicks,
       triggerCrossed: false,
       updatedAt: new Date().toISOString(),
     };
