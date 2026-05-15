@@ -13,19 +13,21 @@ const CUSTOM_INTERVALS = {
 };
 
 function normalizeKline(kline) {
+  const closeTime = Number(kline[6]);
   return {
     time: Math.floor(kline[0] / 1000),
     openTime: kline[0],
+    closeTime,
     open: Number(kline[1]),
     high: Number(kline[2]),
     low: Number(kline[3]),
     close: Number(kline[4]),
     volume: Number(kline[5]),
-    isClosed: kline[6] < Date.now(),
+    isClosed: closeTime <= Date.now(),
   };
 }
 
-function aggregateCandles(candles, targetMinutes) {
+export function aggregateCandles(candles, targetMinutes, nowMs = Date.now()) {
   const bucketMs = targetMinutes * 60 * 1000;
   const buckets = new Map();
 
@@ -34,15 +36,17 @@ function aggregateCandles(candles, targetMinutes) {
     const existing = buckets.get(bucketOpenTime);
 
     if (!existing) {
+      const closeTime = bucketOpenTime + bucketMs;
       buckets.set(bucketOpenTime, {
         time: Math.floor(bucketOpenTime / 1000),
         openTime: bucketOpenTime,
+        closeTime,
         open: candle.open,
         high: candle.high,
         low: candle.low,
         close: candle.close,
         volume: candle.volume,
-        isClosed: candle.isClosed,
+        isClosed: closeTime <= nowMs && candle.isClosed !== false,
       });
       return;
     }
@@ -51,7 +55,7 @@ function aggregateCandles(candles, targetMinutes) {
     existing.low = Math.min(existing.low, candle.low);
     existing.close = candle.close;
     existing.volume += candle.volume;
-    existing.isClosed = existing.isClosed && candle.isClosed;
+    existing.isClosed = existing.closeTime <= nowMs && existing.isClosed && candle.isClosed !== false;
   });
 
   return [...buckets.values()].sort((left, right) => left.time - right.time);

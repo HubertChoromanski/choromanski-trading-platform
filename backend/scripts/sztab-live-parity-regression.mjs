@@ -406,17 +406,17 @@ async function assertPreEligibilityWebsocketTickDoesNotExecute() {
   const setup = setupEvent({
     direction: "LONG",
     setupId: "future-setup",
-    time: nowSeconds + 600,
+    time: nowSeconds - 300,
     trigger: 100,
     stopLoss: 95,
   });
-  const preEligibilityTickTime = new Date((nowSeconds + 900) * 1000).toISOString();
+  const preEligibilityTickTime = new Date(nowSeconds * 1000).toISOString();
   const priceService = createPriceService({
     price: 101,
     recentTicks: [{ price: 101, time: preEligibilityTickTime }],
     time: preEligibilityTickTime,
   });
-  const armed = await processLiveProfileExecution({
+  const watched = await processLiveProfileExecution({
     bingxClient: client,
     logger: async () => {},
     priceService,
@@ -424,19 +424,12 @@ async function assertPreEligibilityWebsocketTickDoesNotExecute() {
     store,
     strategyResult: strategyResult({ latestSetupEvent: setup }),
   });
-  const watched = await processLiveProfileExecution({
-    bingxClient: client,
-    logger: async () => {},
-    priceService,
-    profile: armed,
-    store,
-    strategyResult: strategyResult(),
-  });
   assert(!client.calls.some((call) => call.type === "placeMarketOrder"), "Pre-eligibility websocket tick sent MARKET.");
-  assert(watched.live.pendingTriggerOrder?.status === "platform_armed", "Pre-eligibility tick should keep setup armed.");
+  assert(!watched.live.pendingTriggerOrder, "Pre-eligibility setup should not create an active pending trigger.");
+  assert(watched.live.formingSetupCandidate?.setupId === "future-setup", "Pre-eligibility setup was not retained as a forming candidate.");
   assert(
-    watched.live.pendingTriggerOrder?.ignoredPreEligibilityTriggerTicks >= 2,
-    `Pre-eligibility trigger ticks were not counted: ${JSON.stringify(watched.live.pendingTriggerOrder?.platformTriggerDiagnostics)}`,
+    watched.live.formingSetupCandidate?.waitingForBenchmarkClose === true,
+    `Pre-eligibility setup was not gated: ${JSON.stringify(watched.live.formingSetupCandidate)}`,
   );
 }
 

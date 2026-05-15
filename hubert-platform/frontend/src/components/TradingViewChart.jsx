@@ -696,7 +696,8 @@ function buildSemanticLiveOverlays({
 
   if (pending) {
     const startTime = pendingTriggerStartTime(pending, firstTime);
-    if (activePending) {
+    const pendingGate = activePending ? setupActionability(pending, interval) : { actionable: true };
+    if (activePending && pendingGate.actionable) {
       addLine({
         direction: pendingDirection,
         orderId: pending.orderId,
@@ -749,11 +750,12 @@ function buildSemanticLiveOverlays({
   const setupDirection = canonicalDirection(setup?.direction);
   const setupTrigger = Number(setup?.trigger);
   const setupIsActive = setup?.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE || String(setup?.status ?? "").toUpperCase() === "PENDING";
+  const setupGate = setupIsActive ? setupActionability(setup, interval) : { actionable: true };
   const pendingSetupStillCurrent = pending && activePending && canonicalDirection(pendingDirection) === setupDirection && (
     (pending.setupFingerprint && setup?.setupFingerprint && pending.setupFingerprint === setup.setupFingerprint) ||
     (!pending.setupFingerprint && !setup?.setupFingerprint && setup?.setupId && pending.setupId === setup.setupId)
   );
-  if (setupIsActive && setup?.setupId && setupDirection && Number.isFinite(setupTrigger) && !livePosition && !pendingSetupStillCurrent) {
+  if (setupIsActive && setupGate.actionable && setup?.setupId && setupDirection && Number.isFinite(setupTrigger) && !livePosition && !pendingSetupStillCurrent) {
     const startTime = Number(setup.benchmarkTime ?? setup.time ?? firstTime);
     addLine({
       direction: setupDirection,
@@ -844,6 +846,8 @@ function readableDecisionText(item = {}) {
       return "Runner działa i czeka na nowy setup strategii.";
     case "setup_detected":
       return `Strategia wykryła setup ${polishSide(item.direction)}${item.setupId ? ` ${compactId(item.setupId)}` : ""}.`;
+    case "waiting_for_benchmark_close":
+      return `Kandydat setupu ${polishSide(item.direction)} czeka na zamknięcie świecy benchmarkowej${item.triggerEligibleFromIso ? ` do ${formatChartTime(item.triggerEligibleFromIso)}` : ""}.`;
     case "setup_armed":
       return `Setup jest uzbrojony${Number.isFinite(Number(item.triggerPrice)) ? ` przy ${formatChartPrice(item.triggerPrice)}` : ""}.`;
     case "trigger_waiting":
@@ -1023,10 +1027,11 @@ function deriveOperationalState({
   const pendingStatus = String(pending?.status ?? runtime.triggerOrderState ?? "").toLowerCase();
   const markerReality = classifyMarkerReality({ activeAnalysisSession, markerSource, selectedHistoricalWindow });
   const setup = runtime.latestSetupEvent ?? null;
+  const formingCandidate = runtime.formingSetupCandidate ?? null;
   const setupIsActive = setup?.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE || String(setup?.status ?? "").toUpperCase() === "PENDING";
   const intervalName = displayInterval(interval);
-  const triggerPrice = Number(pending?.triggerPrice ?? setup?.trigger);
-  const side = canonicalDirection(pending?.direction, pending?.positionSide, pending?.side, setup?.direction, positionSide(livePosition ?? {}));
+  const triggerPrice = Number(pending?.triggerPrice ?? setup?.trigger ?? formingCandidate?.trigger);
+  const side = canonicalDirection(pending?.direction, pending?.positionSide, pending?.side, setup?.direction, formingCandidate?.direction, positionSide(livePosition ?? {}));
   const blockedReason = runtime.lastBlockedReason || pending?.terminalReason || pending?.failureClassification || runtime.lastDecisionReason || "";
   const sideText = polishSide(side);
   const base = {
@@ -1154,6 +1159,31 @@ function deriveOperationalState({
       ],
       tone: "pending",
       visualObjects: [{ label: "LIVE TRIGGER NA BINGX", note: "To live zlecenie trigger/stop-market powiązane ze Sztabem i statusem BingX.", tone: "pending" }],
+    };
+  }
+
+  if (formingCandidate?.setupId) {
+    return {
+      ...base,
+      headline: `${intervalName}: kandydat setupu czeka na zamknięcie świecy`,
+      detail: "Strategia widzi formujący się setup, ale benchmark candle nie jest jeszcze zamknięta. Nie ma aktywnego triggera, pending order ani wejścia live.",
+      rows: [
+        ["Kandydat", `${polishSide(formingCandidate.direction)} ${compactId(formingCandidate.setupId)}`],
+        ["Trigger po zamknięciu", formatChartPrice(formingCandidate.trigger)],
+        ["Aktywny od", formingCandidate.triggerEligibleFromIso ? formatChartTime(formingCandidate.triggerEligibleFromIso) : "--"],
+        ["Pending order", "nie"],
+        ["BingX order", "nie"],
+      ],
+      tags: [
+        { label: "KANDYDAT — CZEKAMY NA ZAMKNIĘCIE ŚWIECY", tone: "pending" },
+        { label: "BRAK AKTYWNEGO TRIGGERA", tone: "neutral" },
+      ],
+      tone: "neutral",
+      visualObjects: [{
+        label: "KANDYDAT SETUPU",
+        note: "To tylko diagnostyka formującej się świecy. Trigger live pojawi się dopiero po zamknięciu benchmark candle.",
+        tone: "neutral",
+      }],
     };
   }
 
@@ -1654,6 +1684,41 @@ function intervalMinutes(interval) {
   };
 
   return minutesByInterval[interval] ?? 15;
+}
+
+function timeMsForActionability(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "number" || (typeof value === "string" && /^-?\d+(\.\d+)?$/u.test(value.trim()))) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return null;
+    return numeric > 10_000_000_000 ? Math.round(numeric) : Math.round(numeric * 1000);
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function setupActionability(setup = {}, interval = "15m", nowMs = Date.now()) {
+  const benchmarkMs = timeMsForActionability(setup.benchmarkTime ?? setup.setupCandleTime ?? setup.time);
+  const minutes = intervalMinutes(setup.interval ?? setup.timeframe ?? interval);
+  if (benchmarkMs === null || !Number.isFinite(minutes) || minutes <= 0) {
+    return {
+      actionable: true,
+      reason: "",
+      triggerEligibleFrom: null,
+      triggerEligibleFromIso: null,
+      waitingForBenchmarkClose: false,
+    };
+  }
+  const triggerEligibleFromMs = benchmarkMs + minutes * 60 * 1000;
+  const actionable = nowMs >= triggerEligibleFromMs;
+  return {
+    actionable,
+    reason: actionable ? "" : "waiting_for_benchmark_candle_close",
+    triggerEligibleFrom: Math.floor(triggerEligibleFromMs / 1000),
+    triggerEligibleFromIso: new Date(triggerEligibleFromMs).toISOString(),
+    triggerEligibleFromMs,
+    waitingForBenchmarkClose: !actionable,
+  };
 }
 
 function chartWindowLimit(interval, days = DEFAULT_CHART_WINDOW_DAYS) {
@@ -2501,6 +2566,7 @@ export default function TradingViewChart() {
 
       overlayModeStrategyEvents(events, normalizedMode)
         .filter((event) => {
+          if (event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE && !setupActionability(event, selectedInterval).actionable) return false;
           if (event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE) return normalizedMode === "operational" || settings.showBenchmarks || normalizedMode === "debug";
           if (event.type === STRATEGY_EVENT_TYPES.SETUP_INVALIDATED) return normalizedMode === "operational" || settings.showNegated || normalizedMode === "debug";
           return true;
@@ -2571,6 +2637,7 @@ export default function TradingViewChart() {
       settings.showBenchmarks,
       settings.showNegated,
       settings.showTrigger,
+      selectedInterval,
     ],
   );
 
@@ -2750,19 +2817,23 @@ export default function TradingViewChart() {
         }
 
 		        const markerEvents = canonicalStrategyOverlayEvents(strategyEvents);
-		        const cappedMarkerEvents = overlayModeMarkerEvents(markerEvents, currentOverlayMode);
+            const actionableMarkerEvents = markerEvents.filter((event) =>
+              event.type !== STRATEGY_EVENT_TYPES.SETUP_ACTIVE ||
+              setupActionability(event, selectedInterval).actionable,
+            );
+		        const cappedMarkerEvents = overlayModeMarkerEvents(actionableMarkerEvents, currentOverlayMode);
         const markerLabelPrefix = selectedHistoricalWindowRef.current?.mode === "historical" ? "HISTORIA" : "SYMULACJA";
 	        const strategyMarkers = sanitizeMarkers(labelMarkers(toStrategyMarkers(cappedMarkerEvents), markerLabelPrefix), "strategy markers");
 
 	        strategyMarkersRef.current?.setMarkers(strategyMarkers);
 		        renderStrategyLines(strategyEvents, closedCandles, currentOverlayMode);
 		        setChartRenderStats({
-		          cappedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
+		          cappedMarkers: Math.max(0, actionableMarkerEvents.length - cappedMarkerEvents.length),
 		          debugMarkers: 0,
 		          durationMs: Math.round(performance.now() - renderStartedAt),
-              hiddenInModeReason: currentOverlayMode === "live" && markerEvents.length > 0
+              hiddenInModeReason: currentOverlayMode === "live" && actionableMarkerEvents.length > 0
                 ? "Sygnały strategii są ukryte w LIVE ONLY, bo ten tryb pokazuje tylko realny stan live."
-                : currentOverlayMode === "operational" && markerEvents.length > cappedMarkerEvents.length
+                : currentOverlayMode === "operational" && actionableMarkerEvents.length > cappedMarkerEvents.length
                 ? "Tryb OPERACYJNY pokazuje tylko najnowszy istotny sygnał; starsze są w HISTORIA/DEBUG."
                 : "",
               markerNote: currentOverlayMode === "live"
@@ -2775,7 +2846,7 @@ export default function TradingViewChart() {
                 : `${overlayModeText} · ${displayInterval(selectedInterval)} · okno live/najnowszych sygnałów`,
 		          markers: strategyMarkers.length,
 		          renderedCandles: chartCandles.length,
-		          skippedMarkers: Math.max(0, markerEvents.length - cappedMarkerEvents.length),
+		          skippedMarkers: Math.max(0, actionableMarkerEvents.length - cappedMarkerEvents.length),
 		          slTpLines: strategyLineSeriesRef.current.length,
 	        });
       }

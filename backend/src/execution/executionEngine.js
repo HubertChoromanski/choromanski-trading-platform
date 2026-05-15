@@ -2,6 +2,12 @@ import { STRATEGY_EVENT_TYPES } from "../../../hubert-platform/frontend/src/engi
 import { validateOrder } from "../risk/riskManager.js";
 import { buildSetupFingerprint, sameSetupFingerprint, withSetupFingerprint } from "./setupFingerprint.js";
 import {
+  isSetupActionable,
+  timeValueMs,
+  triggerEligibilityDiagnostics,
+  triggerEligibilityForSetup,
+} from "./setupActionability.js";
+import {
   calculatePaperPositionSize,
   closePaperPosition,
   createPaperPosition,
@@ -217,6 +223,90 @@ export async function processLiveProfileExecution({
       ? rawActiveSetupEvent
       : buildLiveSetupEvent(rawActiveSetupEvent, updatedProfile)
     : null;
+  if (activeSetupEvent) {
+    const setupActionability = isSetupActionable(activeSetupEvent, updatedProfile.timeframe, Date.now());
+    if (!setupActionability.actionable) {
+      const existingPrematurePending = activePendingTriggerOrder(updatedProfile.live?.pendingTriggerOrder);
+      if (existingPrematurePending && pendingOrderMatchesSetup(existingPrematurePending, activeSetupEvent)) {
+        if (
+          existingPrematurePending.orderId &&
+          String(existingPrematurePending.executionMode ?? "").toLowerCase() !== "platform_market_trigger"
+        ) {
+          updatedProfile = await cancelLivePendingTriggerOrder({
+            bingxClient,
+            extraJournal: {
+              triggerEligibleFrom: setupActionability.triggerEligibleFrom,
+              triggerEligibleFromIso: setupActionability.triggerEligibleFromIso,
+            },
+            extraPending: {
+              triggerEligibleFrom: setupActionability.triggerEligibleFrom,
+              triggerEligibleFromIso: setupActionability.triggerEligibleFromIso,
+            },
+            failureClassification: "benchmark_candle_not_closed",
+            journalEvent: "setup_waiting_benchmark_close",
+            logger,
+            profile: updatedProfile,
+            reason: "benchmark_candle_not_closed",
+            terminalReason: "benchmark_candle_not_closed",
+            terminalStatus: "waiting_benchmark_close",
+          });
+        } else {
+          updatedProfile.live.pendingTriggerOrder = {
+            ...existingPrematurePending,
+            canArmNextSetup: true,
+            orderLifecycle: [
+              ...(existingPrematurePending.orderLifecycle ?? []),
+              {
+                diagnostics: setupActionability,
+                message: "Setup candidate is waiting for benchmark candle close; local trigger is not actionable yet.",
+                status: "waiting_benchmark_close",
+                time: new Date().toISOString(),
+              },
+            ].slice(-20),
+            status: "waiting_benchmark_close",
+            terminal: true,
+            terminalReason: "benchmark_candle_not_closed",
+            triggerEligibleFrom: setupActionability.triggerEligibleFrom,
+            triggerEligibleFromIso: setupActionability.triggerEligibleFromIso,
+            updatedAt: new Date().toISOString(),
+          };
+          appendSetupOrderJournal(updatedProfile, {
+            event: "setup_waiting_benchmark_close",
+            interval: updatedProfile.timeframe,
+            reason: "benchmark_candle_not_closed",
+            setupFingerprint: activeSetupEvent.setupFingerprint,
+            setupFingerprintShort: activeSetupEvent.setupFingerprintShort,
+            setupId: activeSetupEvent.setupId,
+            side: sideForDirection(activeSetupEvent.direction),
+            status: "waiting_benchmark_close",
+            triggerEligibleFrom: setupActionability.triggerEligibleFrom,
+            triggerEligibleFromIso: setupActionability.triggerEligibleFromIso,
+            triggerPrice: activeSetupEvent.trigger,
+          });
+        }
+      }
+      updatedProfile.live.formingSetupCandidate = {
+        ...activeSetupEvent,
+        actionable: false,
+        reason: setupActionability.reason,
+        triggerEligibleFrom: setupActionability.triggerEligibleFrom,
+        triggerEligibleFromIso: setupActionability.triggerEligibleFromIso,
+        waitingForBenchmarkClose: true,
+      };
+      updatedProfile.live.latestSetupEventActionable = false;
+      await logger("setup candidate waiting for benchmark candle close", {
+        direction: activeSetupEvent.direction,
+        fingerprint: activeSetupEvent.setupFingerprint,
+        mode: "live",
+        profileId: updatedProfile.id,
+        setupId: activeSetupEvent.setupId,
+        triggerEligibleFrom: setupActionability.triggerEligibleFromIso,
+      });
+      return updatedProfile;
+    }
+    updatedProfile.live.formingSetupCandidate = null;
+    updatedProfile.live.latestSetupEventActionable = true;
+  }
   const pendingTriggerOrder = activePendingTriggerOrder(updatedProfile.live?.pendingTriggerOrder);
   openPosition = updatedProfile.live?.openPosition;
   const activeSetupDirection = activeSetupEvent?.direction ?? "";
@@ -229,6 +319,15 @@ export async function processLiveProfileExecution({
   );
 
   if (!activeSetupEvent) {
+    if (isPlatformMarketTriggerPending(pendingTriggerOrder)) {
+      return processPlatformMarketTrigger({
+        bingxClient,
+        logger,
+        priceService,
+        profile: updatedProfile,
+        store,
+      });
+    }
     return updatedProfile;
   }
 
@@ -722,6 +821,40 @@ async function armPlatformMarketTrigger({
     activeSetupEvent.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED;
   const reversalFromDirection = livePositionDirection(reversalFromPosition);
   const triggerEligibility = triggerEligibilityForSetup(activeSetupEvent, updatedProfile);
+  const setupActionability = isSetupActionable(activeSetupEvent, updatedProfile.timeframe, Date.now());
+  if (!setupActionability.actionable) {
+    updatedProfile.live.formingSetupCandidate = {
+      ...activeSetupEvent,
+      actionable: false,
+      reason: setupActionability.reason,
+      triggerEligibleFrom: setupActionability.triggerEligibleFrom,
+      triggerEligibleFromIso: setupActionability.triggerEligibleFromIso,
+      waitingForBenchmarkClose: true,
+    };
+    updatedProfile.live.latestSetupEventActionable = false;
+    appendSetupOrderJournal(updatedProfile, {
+      event: "setup_waiting_benchmark_close",
+      interval: updatedProfile.timeframe,
+      reason: "benchmark_candle_not_closed",
+      setupFingerprint: activeSetupEvent.setupFingerprint,
+      setupFingerprintShort: activeSetupEvent.setupFingerprintShort,
+      setupId: activeSetupEvent.setupId,
+      side,
+      status: "waiting_benchmark_close",
+      triggerEligibleFrom: setupActionability.triggerEligibleFrom,
+      triggerEligibleFromIso: setupActionability.triggerEligibleFromIso,
+      triggerPrice: activeSetupEvent.trigger,
+    });
+    await logger("setup candidate waiting for benchmark candle close; platform trigger not armed", {
+      direction: activeSetupEvent.direction,
+      fingerprint: activeSetupEvent.setupFingerprint,
+      mode: "live",
+      profileId: updatedProfile.id,
+      setupId: activeSetupEvent.setupId,
+      triggerEligibleFrom: setupActionability.triggerEligibleFromIso,
+    });
+    return updatedProfile;
+  }
   const isReversal = Boolean(
     reversalFromPosition &&
       isOppositeDirection(reversalFromDirection, activeSetupEvent.direction),
@@ -1389,44 +1522,6 @@ function numericValue(value) {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
-function timeValueMs(value) {
-  if (value === null || value === undefined || value === "") return null;
-  if (typeof value === "number" || (typeof value === "string" && /^-?\d+(\.\d+)?$/u.test(value.trim()))) {
-    const numeric = Number(value);
-    if (!Number.isFinite(numeric)) return null;
-    return numeric > 10_000_000_000 ? Math.round(numeric) : Math.round(numeric * 1000);
-  }
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function intervalSeconds(interval) {
-  const normalized = String(interval ?? "").trim().toLowerCase();
-  const numeric = Number.parseFloat(normalized);
-  if (!Number.isFinite(numeric) || numeric <= 0) return null;
-  if (normalized.endsWith("h")) return Math.round(numeric * 60 * 60);
-  if (normalized.endsWith("d")) return Math.round(numeric * 24 * 60 * 60);
-  return Math.round(numeric * 60);
-}
-
-function triggerEligibilityForSetup(setup = {}, profile = {}) {
-  const benchmarkSeconds = numericValue(setup.benchmarkTime ?? setup.setupCandleTime ?? setup.time);
-  const seconds = intervalSeconds(setup.interval ?? setup.timeframe ?? profile.timeframe);
-  if (benchmarkSeconds === null || seconds === null) {
-    return {
-      setupCandleCloseTime: null,
-      triggerEligibleFrom: null,
-      triggerEligibleFromIso: null,
-    };
-  }
-  const eligibleFrom = benchmarkSeconds + seconds;
-  return {
-    setupCandleCloseTime: eligibleFrom,
-    triggerEligibleFrom: eligibleFrom,
-    triggerEligibleFromIso: new Date(eligibleFrom * 1000).toISOString(),
-  };
-}
-
 function nearlyEqual(left, right, tolerance = 1e-6) {
   const a = numericValue(left);
   const b = numericValue(right);
@@ -1617,18 +1712,6 @@ function triggerTouchedByPrice(pending = {}, price) {
   return pendingDirection(pending) === "LONG"
     ? marketPrice >= triggerPrice
     : marketPrice <= triggerPrice;
-}
-
-function triggerEligibilityDiagnostics(pending = {}, sample = {}) {
-  const eligibleFromMs = timeValueMs(pending.triggerEligibleFrom ?? pending.triggerEligibleFromIso ?? pending.setupCandleCloseTime);
-  const sampleTimeMs = timeValueMs(sample.time);
-  return {
-    sampleEligible: eligibleFromMs === null || sampleTimeMs === null || sampleTimeMs >= eligibleFromMs,
-    sampleTimeMs,
-    triggerEligibleFrom: pending.triggerEligibleFrom ?? null,
-    triggerEligibleFromIso: pending.triggerEligibleFromIso ?? null,
-    triggerEligibleFromMs: eligibleFromMs,
-  };
 }
 
 function triggerTouchedByRecentTicks(pending = {}, ticks = []) {

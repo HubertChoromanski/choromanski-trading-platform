@@ -1,5 +1,6 @@
 import { cancelLivePendingTriggerOrder, processLiveProfileExecution } from "../execution/executionEngine.js";
 import { withSetupFingerprint } from "../execution/setupFingerprint.js";
+import { isSetupActionable, triggerEligibilityForSetup } from "../execution/setupActionability.js";
 import { runStrategyForProfile, runStrategyOnCandles } from "../strategy/strategyRunner.js";
 
 export const SZTAB_INTERVALS = ["10m", "15m", "20m", "30m", "1h"];
@@ -196,6 +197,19 @@ function currentDecisionTimeline({ latestSetupEvent = null, pending = null, runt
       time: latestSetupEvent.time ?? null,
     });
   }
+  if (!latestSetupEvent && runtime.formingSetupCandidate) {
+    timeline.push({
+      direction: runtime.formingSetupCandidate.direction ?? null,
+      event: "waiting_for_benchmark_close",
+      setupFingerprint: runtime.formingSetupCandidate.setupFingerprint ?? "",
+      setupId: runtime.formingSetupCandidate.setupId ?? "",
+      text: `Strategia widzi formujący się setup ${runtime.formingSetupCandidate.direction ?? ""}, ale świeca benchmarkowa nie jest jeszcze zamknięta.`,
+      time: runtime.formingSetupCandidate.time ?? null,
+      triggerEligibleFrom: runtime.formingSetupCandidate.triggerEligibleFrom ?? null,
+      triggerEligibleFromIso: runtime.formingSetupCandidate.triggerEligibleFromIso ?? null,
+      triggerPrice: runtime.formingSetupCandidate.trigger ?? null,
+    });
+  }
   if (pending) {
     timeline.push({
       direction: pending.direction ?? pending.positionSide ?? null,
@@ -261,7 +275,7 @@ function currentDecisionTimeline({ latestSetupEvent = null, pending = null, runt
       });
     }
   }
-  if (!pending && !latestSetupEvent && ["running", "degraded", "recovering"].includes(String(runtime.status ?? "").toLowerCase())) {
+  if (!pending && !latestSetupEvent && !runtime.formingSetupCandidate && ["running", "degraded", "recovering"].includes(String(runtime.status ?? "").toLowerCase())) {
     timeline.push({
       event: "waiting_for_setup",
       text: "Runner działa i czeka na nowy setup strategii.",
@@ -348,9 +362,12 @@ function eventSummary(event, profile = null) {
         },
       )
     : event;
+  const eligibility = profile ? triggerEligibilityForSetup(fingerprinted, profile) : triggerEligibilityForSetup(fingerprinted, fingerprinted.interval ?? fingerprinted.timeframe);
   return {
+    benchmarkTime: fingerprinted.benchmarkTime ?? fingerprinted.setupCandleTime ?? fingerprinted.time ?? null,
     direction: fingerprinted.direction ?? null,
     index: fingerprinted.index ?? null,
+    interval: profile?.timeframe ?? fingerprinted.interval ?? fingerprinted.timeframe ?? null,
     price: fingerprinted.price ?? null,
     setupFingerprint: fingerprinted.setupFingerprint ?? "",
     setupFingerprintShort: fingerprinted.setupFingerprintShort ?? "",
@@ -361,6 +378,8 @@ function eventSummary(event, profile = null) {
     takeProfit: fingerprinted.takeProfit ?? null,
     time: fingerprinted.time ?? null,
     trigger: fingerprinted.trigger ?? null,
+    triggerEligibleFrom: eligibility.triggerEligibleFrom,
+    triggerEligibleFromIso: eligibility.triggerEligibleFromIso,
     type: fingerprinted.type ?? "",
   };
 }
@@ -1267,7 +1286,21 @@ export function createSztabRunner({
         ? eventSummary(strategyResult.latestEvent, profile)
         : null;
       const rawLatestEntryEvent = eventSummary(strategyResult.latestEntryEvent, profile);
-      const latestSetupEvent = eventSummary(strategyResult.latestSetupEvent, profile);
+      const rawLatestSetupEvent = eventSummary(strategyResult.latestSetupEvent, profile);
+      const latestSetupActionability = rawLatestSetupEvent
+        ? isSetupActionable(rawLatestSetupEvent, interval, Date.now())
+        : null;
+      const formingSetupCandidate = rawLatestSetupEvent && latestSetupActionability && !latestSetupActionability.actionable
+        ? {
+            ...rawLatestSetupEvent,
+            actionable: false,
+            reason: latestSetupActionability.reason,
+            triggerEligibleFrom: latestSetupActionability.triggerEligibleFrom,
+            triggerEligibleFromIso: latestSetupActionability.triggerEligibleFromIso,
+            waitingForBenchmarkClose: true,
+          }
+        : null;
+      const latestSetupEvent = formingSetupCandidate ? null : rawLatestSetupEvent;
       const latestEntryFingerprint = rawLatestEntryEvent?.setupFingerprint ?? "";
       const latestSetupFingerprint = latestSetupEvent?.setupFingerprint ?? "";
       const staleEntryIgnoredReason = rawLatestEntryEvent && latestSetupEvent && latestEntryFingerprint && latestSetupFingerprint && latestEntryFingerprint !== latestSetupFingerprint
@@ -1286,6 +1319,7 @@ export function createSztabRunner({
           pending: null,
           runtime: {
             ...(current.runtime ?? {}),
+            formingSetupCandidate,
             lastBlockedReason: blockedReason,
             lastDecision: "Fresh signal blocked by global execution lock.",
             lastDecisionReason: "global_execution_block",
@@ -1320,6 +1354,8 @@ export function createSztabRunner({
           latestEntryEvent,
           latestEntryFingerprint,
           latestSetupEvent,
+          formingSetupCandidate,
+          latestSetupEventActionable: Boolean(latestSetupEvent),
           latestSetupFingerprint,
           profileConnected: publicProfile?.status === "connected",
           staleEntryIgnoredReason: staleEntryIgnoredReason || lastSignalStaleReason,
@@ -1370,6 +1406,7 @@ export function createSztabRunner({
         pending: pendingTriggerOrder,
         runtime: {
           ...(current.runtime ?? {}),
+          formingSetupCandidate: updatedProfile.live?.formingSetupCandidate ?? formingSetupCandidate,
           lastBlockedReason: "",
           lastDecision: pendingTriggerOrder
             ? triggerOrderDecisionText(pendingTriggerOrder)
@@ -1396,10 +1433,13 @@ export function createSztabRunner({
       } else {
         clearTriggerWatcher(interval);
       }
+      const waitingForBenchmarkClose = Boolean(updatedProfile.live?.formingSetupCandidate ?? formingSetupCandidate);
       const lastDecisionReason = lastSignal
         ? "fresh_executable_entry_signal"
         : pendingTriggerOrder
           ? `trigger_order_${triggerOrderState}`
+        : waitingForBenchmarkClose
+          ? "waiting_for_benchmark_candle_close"
         : latestEntryEvent
           ? "latest_entry_signal_is_historical_or_stale"
           : "no_entry_signal";
@@ -1430,6 +1470,8 @@ export function createSztabRunner({
           ? triggerOrderDecisionText(pendingTriggerOrder)
           : lastSignal
             ? `Latest ${lastSignal.direction} signal ${lastSignal.setupId}`
+            : waitingForBenchmarkClose
+              ? "Strategia widzi kandydat setupu, ale benchmark candle nie jest jeszcze zamknięta."
             : "No fresh entry signal on latest closed candle.",
         lastDecisionReason,
         lastError: "",
@@ -1444,6 +1486,9 @@ export function createSztabRunner({
         lastOrderAttempt,
         lastSignal,
         lastSyncAt: nowIso(),
+        formingSetupCandidate: updatedProfile.live?.formingSetupCandidate ?? formingSetupCandidate,
+        latestSetupEvent,
+        latestSetupEventActionable: Boolean(latestSetupEvent),
         nextRecoveryAt: null,
         pendingTriggerOrder,
         runnerDegraded: false,
@@ -1472,7 +1517,6 @@ export function createSztabRunner({
         activeSetupFingerprintShort: triggerSummary.activeSetupFingerprintShort,
         latestEntryEvent,
         latestEntryFingerprint,
-        latestSetupEvent,
         latestSetupFingerprint,
         pendingOrderAgeSeconds: triggerSummary.pendingOrderAgeSeconds,
         platformMarketEntrySent: triggerSummary.marketOrderSent,
@@ -1690,9 +1734,8 @@ export function createSztabRunner({
     const isShort = direction.includes("SHORT") || direction === "SELL";
     const touched = isShort ? tickPrice <= triggerPrice : tickPrice >= triggerPrice;
     if (!touched) return { ignoredPreEligibility: false, touched: false };
-    const triggerEligibleFromMs = timeValueMs(pending.triggerEligibleFrom ?? pending.triggerEligibleFromIso ?? pending.setupCandleCloseTime);
-    const tickTimeMs = timeValueMs(time);
-    if (triggerEligibleFromMs !== null && tickTimeMs !== null && tickTimeMs < triggerEligibleFromMs) {
+    const actionability = isSetupActionable(pending, interval, time ?? Date.now());
+    if (!actionability.actionable) {
       return { ignoredPreEligibility: true, touched: false };
     }
     return { ignoredPreEligibility: false, touched: true };
