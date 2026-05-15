@@ -5600,6 +5600,9 @@ function SztabIntervalPanel({
   const cleanupFailureClassification = runtime.cleanupFailureClassification ?? "";
   const marginDiagnostics = triggerMarginDiagnostics(runtime);
   const marginWarnings = marginDiagnostics.warnings ?? [];
+  const currentSetupOrderJournal = runtime.currentSetupOrderJournal ?? [];
+  const historicalSetupOrderJournal = runtime.historicalSetupOrderJournal ?? (runtime.setupOrderJournal ?? []).filter((item) => item.historical);
+  const currentDecisionTimeline = runtime.currentDecisionTimeline ?? [];
   const detectedTakeProfitOrders = [
     ...orders.filter(takeProfitOrderLike),
     ...positions
@@ -5873,11 +5876,44 @@ function SztabIntervalPanel({
           <Metric label="Calculated qty" value={fmt(runtime.pendingTriggerOrder?.quantity, 3)} />
           <Metric label="Decision reason" value={runtime.lastDecisionReason || runtime.lastDecision || "--"} />
           <Metric label="Blocked reason" value={runtime.lastBlockedReason || "--"} />
+          <Metric label="Runner started" value={compactDateText(runtime.currentRunnerStartedAt ?? runtime.startedAt)} />
+          <Metric label="Current setup FP" value={runtime.currentSetupFingerprintShort || runtime.currentSetupFingerprint || "--"} />
+          <Metric label="Current order ids" value={(runtime.currentLifecycleOrderIds ?? []).join(", ") || "--"} />
+          <Metric label="Stale historical rows" value={runtime.staleHistoricalOrderCount ?? 0} />
           <Metric label="Interval blocker" value={intervalBlockers.map((blocker) => blocker.type ?? blocker.source).join(", ") || "--"} />
           <Metric label="Last exchange response" value={runtime.lastExchangeResponse ? compactDateText(runtime.lastExchangeResponse.time) : "--"} />
         </div>
         <details className="hubert-advanced" open>
-          <summary>Setup / order journal</summary>
+          <summary>Current decision timeline</summary>
+          <div className="hubert-lab__table">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Event</th>
+                  <th>Setup</th>
+                  <th>FP</th>
+                  <th>Text</th>
+                </tr>
+              </thead>
+              <tbody>
+                {currentDecisionTimeline.length ? currentDecisionTimeline.slice(-20).reverse().map((item, index) => (
+                  <tr key={`${item.time ?? index}-${item.event ?? index}`}>
+                    <td>{compactDateText(item.time)}</td>
+                    <td>{item.event ?? "--"}</td>
+                    <td>{item.setupId ?? "--"}</td>
+                    <td>{item.setupFingerprint ? String(item.setupFingerprint).replace(/^sf_/, "").slice(0, 8).toUpperCase() : "--"}</td>
+                    <td>{item.text ?? item.reason ?? "--"}</td>
+                  </tr>
+                )) : (
+                  <tr><td colSpan="5">Current runner has not written a decision timeline yet.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </details>
+        <details className="hubert-advanced" open>
+          <summary>Current setup / order lifecycle</summary>
           <div className="hubert-lab__table">
             <table>
               <thead>
@@ -5894,7 +5930,7 @@ function SztabIntervalPanel({
                 </tr>
               </thead>
               <tbody>
-                {(runtime.setupOrderJournal ?? []).length ? (runtime.setupOrderJournal ?? []).slice(-20).reverse().map((item, index) => (
+                {currentSetupOrderJournal.length ? currentSetupOrderJournal.slice(-20).reverse().map((item, index) => (
                   <tr key={`${item.timestamp ?? index}-${item.orderId ?? item.setupId ?? index}`}>
                     <td>{compactDateText(item.timestamp)}</td>
                     <td>{item.setupId ?? "--"}</td>
@@ -5907,7 +5943,40 @@ function SztabIntervalPanel({
                     <td>{item.reason ?? item.failureClassification ?? item.event ?? "--"}</td>
                   </tr>
                 )) : (
-                  <tr><td colSpan="9">No setup/order journal entries yet.</td></tr>
+                  <tr><td colSpan="9">No current setup/order lifecycle entries. Check decision timeline for why no entry was opened.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </details>
+        <details className="hubert-advanced">
+          <summary>Historical setup / order journal ({runtime.staleHistoricalOrderCount ?? historicalSetupOrderJournal.length})</summary>
+          <div className="hubert-lab__table">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Setup</th>
+                  <th>FP</th>
+                  <th>Side</th>
+                  <th>Trigger</th>
+                  <th>Status</th>
+                  <th>Stale reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {historicalSetupOrderJournal.length ? historicalSetupOrderJournal.slice(-20).reverse().map((item, index) => (
+                  <tr key={`historical-${item.timestamp ?? index}-${item.orderId ?? item.setupId ?? index}`}>
+                    <td>{compactDateText(item.timestamp)}</td>
+                    <td>{item.setupId ?? "--"}</td>
+                    <td>{item.setupFingerprintShort ?? (item.setupFingerprint ? String(item.setupFingerprint).replace(/^sf_/, "").slice(0, 8).toUpperCase() : "--")}</td>
+                    <td>{item.side ?? "--"}</td>
+                    <td>{fmt(item.triggerPrice)}</td>
+                    <td>{item.status ?? item.event ?? "--"}</td>
+                    <td>{item.staleHistoricalReason ?? "historical"}</td>
+                  </tr>
+                )) : (
+                  <tr><td colSpan="7">No stale historical order rows.</td></tr>
                 )}
               </tbody>
             </table>

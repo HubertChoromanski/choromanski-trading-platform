@@ -87,6 +87,223 @@ function timeValueMs(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function orderIdCandidates(value = {}) {
+  return [
+    value?.orderId,
+    value?.clientOrderId,
+    value?.data?.orderId,
+    value?.data?.clientOrderId,
+    value?.raw?.orderId,
+    value?.raw?.clientOrderId,
+  ]
+    .filter((item) => item !== null && item !== undefined && item !== "")
+    .map((item) => String(item));
+}
+
+function lifecycleOrderIds(pending = {}) {
+  return [...new Set([
+    ...orderIdCandidates(pending),
+    ...orderIdCandidates(pending?.exchangeResponse),
+    ...orderIdCandidates(pending?.marketOrder),
+    ...orderIdCandidates(pending?.stopOrder),
+    ...orderIdCandidates(pending?.takeProfitOrder),
+  ])];
+}
+
+function journalItemTimeMs(item = {}) {
+  return timeValueMs(item.timestamp ?? item.time ?? item.createdAt ?? item.updatedAt);
+}
+
+function setupFingerprintFromRuntime(runtime = {}, pending = null) {
+  return pending?.setupFingerprint ??
+    runtime.activeSetupFingerprint ??
+    runtime.latestSetupFingerprint ??
+    runtime.latestSetupEvent?.setupFingerprint ??
+    runtime.setupFingerprint ??
+    "";
+}
+
+function setupFingerprintShort(value = "") {
+  return value ? String(value).replace(/^sf_/u, "").slice(0, 8).toUpperCase() : "";
+}
+
+function currentJournalPredicate({ currentOrderIds = [], currentRunnerStartedAt = null, currentSetupFingerprint = "", item = {} } = {}) {
+  const itemFingerprint = item.setupFingerprint ?? "";
+  if (currentSetupFingerprint && itemFingerprint && itemFingerprint !== currentSetupFingerprint) return false;
+  const startedMs = timeValueMs(currentRunnerStartedAt);
+  const itemMs = journalItemTimeMs(item);
+  if (startedMs !== null && itemMs !== null && itemMs < startedMs) return false;
+  if (currentSetupFingerprint && itemFingerprint === currentSetupFingerprint) return true;
+  if (item.orderId && currentOrderIds.includes(String(item.orderId))) return true;
+  return !currentSetupFingerprint && startedMs !== null && itemMs !== null && itemMs >= startedMs;
+}
+
+function splitSetupOrderJournal({ journal = [], pending = null, runtime = {} } = {}) {
+  const currentRunnerStartedAt = runtime.currentRunnerStartedAt ?? runtime.startedAt ?? null;
+  const currentSetupFingerprint = setupFingerprintFromRuntime(runtime, pending);
+  const currentLifecycleOrderIds = lifecycleOrderIds(pending);
+  const currentSetupOrderJournal = [];
+  const historicalSetupOrderJournal = [];
+  for (const item of Array.isArray(journal) ? journal : []) {
+    const current = currentJournalPredicate({
+      currentOrderIds: currentLifecycleOrderIds,
+      currentRunnerStartedAt,
+      currentSetupFingerprint,
+      item,
+    });
+    const decorated = {
+      ...item,
+      historical: !current,
+      staleHistoricalReason: current
+        ? ""
+        : item.setupFingerprint && currentSetupFingerprint && item.setupFingerprint !== currentSetupFingerprint
+          ? "different_setup_fingerprint"
+          : currentRunnerStartedAt && journalItemTimeMs(item) !== null && timeValueMs(currentRunnerStartedAt) !== null && journalItemTimeMs(item) < timeValueMs(currentRunnerStartedAt)
+            ? "older_than_current_runner_start"
+            : "not_current_lifecycle",
+    };
+    if (current) currentSetupOrderJournal.push(decorated);
+    else historicalSetupOrderJournal.push(decorated);
+  }
+  return {
+    currentLifecycleOrderIds,
+    currentRunnerStartedAt,
+    currentSetupFingerprint,
+    currentSetupFingerprintShort: setupFingerprintShort(currentSetupFingerprint),
+    currentSetupOrderJournal: currentSetupOrderJournal.slice(-50),
+    historicalSetupOrderJournal: historicalSetupOrderJournal.slice(-100),
+    staleHistoricalOrderCount: historicalSetupOrderJournal.length,
+  };
+}
+
+function currentDecisionTimeline({ latestSetupEvent = null, pending = null, runtime = {} } = {}) {
+  const timeline = [];
+  const runnerStartedAt = runtime.currentRunnerStartedAt ?? runtime.startedAt ?? null;
+  if (runnerStartedAt) {
+    timeline.push({
+      event: "runner_started",
+      text: "Runner wystartował dla tego interwału.",
+      time: runnerStartedAt,
+    });
+  }
+  if (latestSetupEvent) {
+    timeline.push({
+      direction: latestSetupEvent.direction ?? null,
+      event: "setup_detected",
+      setupFingerprint: latestSetupEvent.setupFingerprint ?? "",
+      setupId: latestSetupEvent.setupId ?? "",
+      text: `Strategia wykryła setup ${latestSetupEvent.direction ?? ""}${latestSetupEvent.setupId ? ` ${latestSetupEvent.setupId}` : ""}.`,
+      time: latestSetupEvent.time ?? null,
+    });
+  }
+  if (pending) {
+    timeline.push({
+      direction: pending.direction ?? pending.positionSide ?? null,
+      event: "setup_armed",
+      setupFingerprint: pending.setupFingerprint ?? "",
+      setupId: pending.setupId ?? "",
+      text: "Aktualny setup jest uzbrojony w runtime Sztabu.",
+      time: pending.armedAt ?? pending.updatedAt ?? null,
+      triggerPrice: pending.triggerPrice ?? null,
+    });
+    if (pending.triggerEligibleFromIso ?? pending.triggerEligibleFrom) {
+      timeline.push({
+        event: "trigger_waiting",
+        setupFingerprint: pending.setupFingerprint ?? "",
+        text: "Bot czeka na eligible trigger po zamknięciu świecy setupu.",
+        time: pending.triggerEligibleFromIso ?? pending.triggerEligibleFrom,
+        triggerPrice: pending.triggerPrice ?? null,
+      });
+    }
+    if (pending.triggerCrossed) {
+      timeline.push({
+        event: "trigger_crossed",
+        setupFingerprint: pending.setupFingerprint ?? "",
+        text: "Trigger został przebity według bieżącego runtime.",
+        time: pending.triggerCrossedAt ?? pending.updatedAt ?? null,
+        triggerPrice: pending.triggerPrice ?? null,
+      });
+    } else if (String(pending.status ?? "").toLowerCase() === "platform_armed") {
+      timeline.push({
+        event: "trigger_not_crossed",
+        setupFingerprint: pending.setupFingerprint ?? "",
+        text: "Trigger nie został jeszcze przebity w aktualnym cyklu.",
+        time: pending.lastStatusCheckAt ?? pending.updatedAt ?? null,
+        triggerPrice: pending.triggerPrice ?? null,
+      });
+    }
+    if (pending.marketOrderSent) {
+      timeline.push({
+        event: "market_order_sent",
+        orderId: pending.orderId ?? null,
+        setupFingerprint: pending.setupFingerprint ?? "",
+        text: "MARKET został wysłany do BingX.",
+        time: pending.marketSentAt ?? pending.updatedAt ?? null,
+      });
+    }
+    if (["filled_protected", "filled_sl_failed"].includes(String(pending.status ?? "").toLowerCase())) {
+      timeline.push({
+        event: "position_confirmed",
+        orderId: pending.orderId ?? null,
+        setupFingerprint: pending.setupFingerprint ?? "",
+        text: pending.status === "filled_protected"
+          ? "Pozycja została potwierdzona, a SL wysłany."
+          : "Pozycja została potwierdzona, ale SL wymaga kontroli.",
+        time: pending.fillDetectedAt ?? pending.updatedAt ?? null,
+      });
+    }
+    if (["setup_invalidated_before_platform_trigger", "invalidated_before_fill"].includes(String(pending.status ?? "").toLowerCase())) {
+      timeline.push({
+        event: "setup_invalidated",
+        setupFingerprint: pending.setupFingerprint ?? "",
+        text: "Setup został anulowany przed wykonaniem triggera.",
+        time: pending.updatedAt ?? null,
+      });
+    }
+  }
+  if (!pending && !latestSetupEvent && ["running", "degraded", "recovering"].includes(String(runtime.status ?? "").toLowerCase())) {
+    timeline.push({
+      event: "waiting_for_setup",
+      text: "Runner działa i czeka na nowy setup strategii.",
+      time: runtime.lastTickAt ?? runtime.heartbeatAt ?? null,
+    });
+  }
+  if (runtime.lastDecisionReason || runtime.lastDecision || runtime.lastBlockedReason) {
+    timeline.push({
+      event: runtime.lastBlockedReason ? "blocker" : "decision",
+      reason: runtime.lastDecisionReason ?? "",
+      text: runtime.lastBlockedReason || runtime.lastDecision || runtime.lastDecisionReason,
+      time: runtime.lastTickAt ?? runtime.heartbeatAt ?? null,
+    });
+  }
+  return timeline
+    .filter((item) => item.text)
+    .sort((left, right) => (timeValueMs(right.time) ?? 0) - (timeValueMs(left.time) ?? 0))
+    .slice(0, 20);
+}
+
+export function deriveCurrentRuntimeContext({ latestSetupEvent = null, pending = null, runtime = {} } = {}) {
+  const split = splitSetupOrderJournal({
+    journal: runtime.setupOrderJournal ?? [],
+    pending,
+    runtime: {
+      ...runtime,
+      latestSetupEvent,
+    },
+  });
+  return {
+    ...split,
+    currentDecisionTimeline: currentDecisionTimeline({
+      latestSetupEvent,
+      pending,
+      runtime: {
+        ...runtime,
+        currentRunnerStartedAt: split.currentRunnerStartedAt,
+      },
+    }),
+  };
+}
+
 function compactSymbol(symbol) {
   return String(symbol ?? "").replace("-", "").toUpperCase();
 }
@@ -384,6 +601,14 @@ function defaultIntervalConfig(interval) {
       scenarioTerminalReason: "",
       slPlacementStatus: "",
       setupOrderJournal: [],
+      currentDecisionTimeline: [],
+      currentLifecycleOrderIds: [],
+      currentRunnerStartedAt: null,
+      currentSetupFingerprint: "",
+      currentSetupFingerprintShort: "",
+      currentSetupOrderJournal: [],
+      historicalSetupOrderJournal: [],
+      staleHistoricalOrderCount: 0,
       setupFingerprint: "",
       setupFingerprintShort: "",
       supersededBySetupId: null,
@@ -1056,8 +1281,19 @@ export function createSztabRunner({
 
       if (lastSignal && executionDiagnostics.globalBlockers.length > 0) {
         const blockedReason = executionDiagnostics.globalBlockers.map((blocker) => blocker.reason).join("; ");
+        const currentRuntimeContext = deriveCurrentRuntimeContext({
+          latestSetupEvent,
+          pending: null,
+          runtime: {
+            ...(current.runtime ?? {}),
+            lastBlockedReason: blockedReason,
+            lastDecision: "Fresh signal blocked by global execution lock.",
+            lastDecisionReason: "global_execution_block",
+          },
+        });
         await persistRuntime(interval, {
           ...executionDiagnostics,
+          ...currentRuntimeContext,
           candlesLoaded: strategyResult.rawCandles.length,
           candlesRequested,
           closedCandlesUsed: strategyResult.sourceCandles.length,
@@ -1129,6 +1365,27 @@ export function createSztabRunner({
       const pendingTriggerOrder = updatedProfile.live?.pendingTriggerOrder ?? null;
       const triggerOrderState = pendingTriggerOrder?.status ?? "none";
       const triggerSummary = triggerRuntimeSummary(pendingTriggerOrder, updatedProfile.live);
+      const currentRuntimeContext = deriveCurrentRuntimeContext({
+        latestSetupEvent,
+        pending: pendingTriggerOrder,
+        runtime: {
+          ...(current.runtime ?? {}),
+          lastBlockedReason: "",
+          lastDecision: pendingTriggerOrder
+            ? triggerOrderDecisionText(pendingTriggerOrder)
+            : lastSignal
+              ? `Latest ${lastSignal.direction} signal ${lastSignal.setupId}`
+              : "No fresh entry signal on latest closed candle.",
+          lastDecisionReason: lastSignal
+            ? "fresh_executable_entry_signal"
+            : pendingTriggerOrder
+              ? `trigger_order_${triggerOrderState}`
+              : latestEntryEvent
+                ? "latest_entry_signal_is_historical_or_stale"
+                : "no_entry_signal",
+          setupOrderJournal: triggerSummary.setupOrderJournal,
+        },
+      });
       const orderFingerprintMatchesLatestSetup = Boolean(
         pendingTriggerOrder?.setupFingerprint &&
         latestSetupEvent?.setupFingerprint &&
@@ -1149,6 +1406,7 @@ export function createSztabRunner({
       await persistRuntime(interval, {
         ...executionDiagnostics,
         ...priceFeedRuntime(updatedProfile.symbol ?? current.symbol, pendingTriggerOrder?.priceSource ?? "binance_futures"),
+        ...currentRuntimeContext,
         autoRecoveryStatus: current.runtime?.runnerDegraded ? "recovered" : current.runtime?.autoRecoveryStatus ?? "",
         candlesLoaded: strategyResult.rawCandles.length,
         candlesRequested,
@@ -1520,8 +1778,19 @@ export function createSztabRunner({
     const nextPending = updatedProfile.live?.pendingTriggerOrder ?? null;
     const lastOrderAttempt = updatedProfile.live?.orderLog?.at?.(-1) ?? null;
     const triggerSummary = triggerRuntimeSummary(nextPending, updatedProfile.live);
+    const currentRuntimeContext = deriveCurrentRuntimeContext({
+      latestSetupEvent: current.runtime?.latestSetupEvent ?? null,
+      pending: nextPending,
+      runtime: {
+        ...(current.runtime ?? {}),
+        lastDecision: triggerOrderDecisionText(nextPending),
+        lastDecisionReason: `trigger_order_${nextPending?.status ?? "none"}`,
+        setupOrderJournal: triggerSummary.setupOrderJournal,
+      },
+    });
     await persistRuntime(interval, {
       ...priceFeedRuntime(updatedProfile.symbol ?? current.symbol, nextPending?.priceSource ?? "binance_futures"),
+      ...currentRuntimeContext,
       heartbeatAt: nowIso(),
       lastDecision: triggerOrderDecisionText(nextPending),
       lastDecisionReason: `trigger_order_${nextPending?.status ?? "none"}`,
@@ -1738,16 +2007,29 @@ export function createSztabRunner({
     if (!gate.ok) return gate;
 
     clearTimer(interval);
+    const startedAt = nowIso();
     await persistRuntime(interval, {
       ...clearTransientBlockers(),
       autoRecoveryStatus: "",
+      currentDecisionTimeline: [{
+        event: "runner_started",
+        text: "Runner wystartował dla tego interwału.",
+        time: startedAt,
+      }],
+      currentLifecycleOrderIds: [],
+      currentRunnerStartedAt: startedAt,
+      currentSetupFingerprint: "",
+      currentSetupFingerprintShort: "",
+      currentSetupOrderJournal: [],
       error: "",
+      historicalSetupOrderJournal: [],
       intervalBlockers: [],
       lastDecision: "Starting Sztab interval runner.",
       lastDecisionReason: "starting",
       nextRecoveryAt: null,
       runnerDegraded: false,
-      startedAt: nowIso(),
+      staleHistoricalOrderCount: 0,
+      startedAt,
       status: "running",
       stoppedAt: null,
     });

@@ -807,7 +807,11 @@ function classifyMarkerReality({ activeAnalysisSession, markerSource, selectedHi
 }
 
 function timelineFromRuntime(runtime = {}) {
-  const journal = (runtime.setupOrderJournal ?? []).slice(-8).map((item) => ({
+  const decisions = (runtime.currentDecisionTimeline ?? []).slice(-10).map((item) => ({
+    time: item.time,
+    text: item.text || readableDecisionText(item),
+  }));
+  const journal = (runtime.currentSetupOrderJournal ?? []).slice(-8).map((item) => ({
     time: item.timestamp,
     text: readableJournalText(item),
   }));
@@ -821,7 +825,8 @@ function timelineFromRuntime(runtime = {}) {
         text: `Strategia zobaczyła setup ${polishSide(runtime.latestSetupEvent.direction)} (${runtime.latestSetupEvent.setupId ?? "bez id"}${runtime.latestSetupEvent.setupFingerprintShort ? ` · ${runtime.latestSetupEvent.setupFingerprintShort}` : ""}).`,
       }]
     : [];
-  return [...setup, ...journal, ...lifecycle]
+  const source = decisions.length ? [...decisions, ...journal] : [...setup, ...journal, ...lifecycle];
+  return source
     .filter((item) => item.text)
     .sort((left, right) => {
       const leftTime = typeof left.time === "number" ? left.time * 1000 : new Date(left.time ?? 0).getTime();
@@ -829,6 +834,37 @@ function timelineFromRuntime(runtime = {}) {
       return rightTime - leftTime;
     })
     .slice(0, 7);
+}
+
+function readableDecisionText(item = {}) {
+  switch (item.event) {
+    case "runner_started":
+      return "Runner wystartował dla tego interwału.";
+    case "waiting_for_setup":
+      return "Runner działa i czeka na nowy setup strategii.";
+    case "setup_detected":
+      return `Strategia wykryła setup ${polishSide(item.direction)}${item.setupId ? ` ${compactId(item.setupId)}` : ""}.`;
+    case "setup_armed":
+      return `Setup jest uzbrojony${Number.isFinite(Number(item.triggerPrice)) ? ` przy ${formatChartPrice(item.triggerPrice)}` : ""}.`;
+    case "trigger_waiting":
+      return `Bot czeka na eligible trigger${Number.isFinite(Number(item.triggerPrice)) ? ` ${formatChartPrice(item.triggerPrice)}` : ""}.`;
+    case "trigger_not_crossed":
+      return "Trigger nie został przebity w aktualnym runtime.";
+    case "trigger_crossed":
+      return "Trigger został przebity według aktualnego runtime.";
+    case "market_order_sent":
+      return "MARKET został wysłany do BingX.";
+    case "position_confirmed":
+      return "Pozycja została potwierdzona przez świeży sync.";
+    case "setup_invalidated":
+      return "Setup został anulowany przed wykonaniem triggera.";
+    case "blocker":
+      return `Bloker: ${polishReason(item.reason ?? item.text ?? "unknown")}`;
+    case "decision":
+      return item.text || polishReason(item.reason ?? "runtime decision");
+    default:
+      return item.text || polishStatus(item.event ?? "runtime");
+  }
 }
 
 function readableJournalText(item = {}) {
@@ -959,6 +995,11 @@ function runtimeDiagnostics(runtime = {}) {
     ["Backend updatedAt", runtime.backendUpdatedAt ? `${formatChartTime(runtime.backendUpdatedAt)} (${ageText(runtime.backendUpdatedAt)})` : "--"],
     ["runningIntervals", runtime.runningIntervalsText ?? "--"],
     ["Stale detection", runtime.staleDetection ?? "--"],
+    ["Runner started", runtime.currentRunnerStartedAt ? `${formatChartTime(runtime.currentRunnerStartedAt)} (${ageText(runtime.currentRunnerStartedAt)})` : runtime.startedAt ? `${formatChartTime(runtime.startedAt)} (${ageText(runtime.startedAt)})` : "--"],
+    ["Current setup FP", runtime.currentSetupFingerprintShort || runtime.currentSetupFingerprint || runtime.activeSetupFingerprintShort || runtime.latestSetupFingerprint || "--"],
+    ["Current order ids", (runtime.currentLifecycleOrderIds ?? []).length ? runtime.currentLifecycleOrderIds.join(", ") : "--"],
+    ["Historical stale rows", runtime.staleHistoricalOrderCount ?? 0],
+    ["Decision reason", runtime.lastDecisionReason || "--"],
     ["Heartbeat", runtime.heartbeatAt ? `${formatChartTime(runtime.heartbeatAt)} (${ageText(runtime.heartbeatAt)})` : runtime.heartbeatAgeSeconds !== null && runtime.heartbeatAgeSeconds !== undefined ? `${runtime.heartbeatAgeSeconds}s temu` : "--"],
     ["Fetch error", runtime.frontendStatusFetchError || "--"],
   ];
