@@ -116,7 +116,7 @@ function createStore() {
 
 const store = createStore();
 
-function createPriceService({ price = 101, source = "binance_futures" } = {}) {
+function createPriceService({ mode = "websocket", price = 101, recentTicks = null, source = "binance_futures" } = {}) {
   const calls = [];
   return {
     calls,
@@ -125,15 +125,25 @@ function createPriceService({ price = 101, source = "binance_futures" } = {}) {
       return {
         ageMs: 0,
         degraded: false,
-        mode: "rest",
+        fallbackActive: mode !== "websocket",
+        lastWebsocketTickAt: mode === "websocket" ? new Date().toISOString() : null,
+        mode,
         price,
         raw: { price },
+        recentHigh: Array.isArray(recentTicks) && recentTicks.length
+          ? Math.max(...recentTicks.map((tick) => tick.price))
+          : null,
+        recentLow: Array.isArray(recentTicks) && recentTicks.length
+          ? Math.min(...recentTicks.map((tick) => tick.price))
+          : null,
+        recentTicks: Array.isArray(recentTicks) ? recentTicks : [],
         rateLimitCount: 0,
         source,
         stale: false,
         status: "ok",
         time: new Date().toISOString(),
-        websocketStatus: "unconfigured",
+        websocketAgeMs: mode === "websocket" ? 0 : null,
+        websocketStatus: mode === "websocket" ? "connected" : "unconfigured",
       };
     },
   };
@@ -199,7 +209,10 @@ function createBingxClient({ initialPositions = [] } = {}) {
 async function assertArmedSetupBinanceCrossSendsMarket() {
   process.env.SZTAB_EXECUTION_MODE = "platform_market_trigger";
   const client = createBingxClient();
-  const priceService = createPriceService({ price: 100.01 });
+  const priceService = createPriceService({
+    price: 99.98,
+    recentTicks: [{ price: 100.01, time: new Date(Date.now() + 1000).toISOString() }],
+  });
   const armed = await processLiveProfileExecution({
     bingxClient: client,
     logger: async () => {},
@@ -219,9 +232,20 @@ async function assertArmedSetupBinanceCrossSendsMarket() {
     store,
     strategyResult: strategyResult(),
   });
-  assert(executed.live.pendingTriggerOrder?.status === "filled_protected", "Binance trigger cross did not execute market entry.");
+  assert(
+    executed.live.pendingTriggerOrder?.status === "filled_protected",
+    `Binance websocket wick touch did not execute market entry: ${JSON.stringify(executed.live.pendingTriggerOrder?.platformTriggerDiagnostics ?? executed.live.pendingTriggerOrder)}`,
+  );
   assert(client.calls.some((call) => call.type === "placeMarketOrder" && call.side === "BUY"), "LONG market order was not sent.");
   assert(priceService.calls.every((source) => source === "binance_futures"), `Unexpected strategic price source: ${priceService.calls.join(",")}`);
+  assert(
+    executed.live.pendingTriggerOrder?.platformTriggerDiagnostics?.priceFeed?.mode === "websocket",
+    "Wick trigger test did not use websocket price feed mode.",
+  );
+  assert(
+    executed.live.pendingTriggerOrder?.platformTriggerDiagnostics?.recentTickTriggerTouched === true,
+    "Wick touch was not detected from recent websocket ticks.",
+  );
 }
 
 async function assertStrategyEntryDoesNotRequireLivePriceCross() {

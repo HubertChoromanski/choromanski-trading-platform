@@ -13,6 +13,7 @@
     "test:ai-intent": "node scripts/ai-intent-regression.mjs",
     "test:sztab-cancel-cleanup": "node scripts/sztab-cancel-cleanup-regression.mjs",
     "test:sztab-live-parity": "node scripts/sztab-live-parity-regression.mjs",
+    "test:sztab-price-websocket": "node scripts/sztab-price-service-websocket-regression.mjs",
     "stop:prod": "pm2 stop choromanski-trading-backend"
   },
   "dependencies": {

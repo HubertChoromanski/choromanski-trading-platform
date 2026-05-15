@@ -671,12 +671,16 @@ export function createSztabRunner({
     return {
       priceFeedAgeMs: snapshot?.ageMs ?? null,
       priceFeedBackoffUntil: snapshot?.backoffUntil ?? null,
+      priceFeedFallbackActive: Boolean(snapshot?.fallbackActive),
       priceFeedLastError: snapshot?.lastError ?? null,
+      priceFeedLastWebsocketTickAt: snapshot?.lastWebsocketTickAt ?? null,
       priceFeedMode: snapshot?.mode ?? "rest",
       priceFeedRateLimitCount: snapshot?.rateLimitCount ?? 0,
       priceFeedRequestCount: snapshot?.requestCount ?? 0,
       priceFeedSource: snapshot?.source ?? source,
       priceFeedStatus: snapshot?.status ?? "unknown",
+      priceFeedWebsocketAgeMs: snapshot?.websocketAgeMs ?? null,
+      priceFeedWebsocketError: snapshot?.websocketError ?? "",
       priceFeedWebsocketStatus: snapshot?.websocketStatus ?? "unknown",
     };
   }
@@ -1294,9 +1298,13 @@ export function createSztabRunner({
         ? secondsSinceIso(pending.acceptedAt ?? pending.updatedAt ?? pending.createdAt)
         : null,
       priceFeedAgeMs: pending?.platformTriggerDiagnostics?.priceFeed?.ageMs ?? null,
+      priceFeedFallbackActive: Boolean(pending?.platformTriggerDiagnostics?.priceFeed?.fallbackActive),
+      priceFeedLastWebsocketTickAt: pending?.platformTriggerDiagnostics?.priceFeed?.lastWebsocketTickAt ?? null,
       priceFeedMode: pending?.platformTriggerDiagnostics?.priceFeed?.mode ?? null,
       priceFeedRateLimitCount: pending?.platformTriggerDiagnostics?.priceFeed?.rateLimitCount ?? null,
       priceFeedStatus: pending?.platformTriggerDiagnostics?.priceFeed?.status ?? null,
+      priceFeedWebsocketAgeMs: pending?.platformTriggerDiagnostics?.priceFeed?.websocketAgeMs ?? null,
+      priceFeedWebsocketError: pending?.platformTriggerDiagnostics?.priceFeed?.websocketError ?? "",
       priceFeedWebsocketStatus: pending?.platformTriggerDiagnostics?.priceFeed?.websocketStatus ?? null,
       platformTriggerCrossed: Boolean(pending?.triggerCrossed),
       platformTriggerCrossedAt: pending?.triggerCrossedAt ?? null,
@@ -1349,6 +1357,15 @@ export function createSztabRunner({
       return `Trigger order terminal: ${pending.terminalReason ?? pending.failureClassification ?? status}.`;
     }
     return "Pending trigger order is still waiting for fill.";
+  }
+
+  function pendingTriggerTouchedByTick(pending = {}, price) {
+    const triggerPrice = Number(pending.triggerPrice ?? pending.entryEvent?.trigger);
+    const tickPrice = Number(price);
+    if (!Number.isFinite(triggerPrice) || !Number.isFinite(tickPrice)) return false;
+    const direction = String(pending.direction ?? pending.positionSide ?? pending.side ?? "").toUpperCase();
+    const isShort = direction.includes("SHORT") || direction === "SELL";
+    return isShort ? tickPrice <= triggerPrice : tickPrice >= triggerPrice;
   }
 
   function clearTriggerWatcher(interval) {
@@ -1509,6 +1526,29 @@ export function createSztabRunner({
     }
 
     return updatedProfile;
+    });
+  }
+
+  if (typeof priceService?.onPriceTick === "function") {
+    priceService.onPriceTick((tick) => {
+      if (tick?.source !== "binance_futures") return;
+      const config = normalizeConfig(store.getSztabConfig());
+      for (const interval of SZTAB_INTERVALS) {
+        const current = config.intervals[interval];
+        const existingProfile = liveProfiles.get(interval);
+        const pending = existingProfile?.live?.pendingTriggerOrder ?? current?.runtime?.pendingTriggerOrder ?? null;
+        if (!current || !isRunningStatus(current.runtime?.status) || !isActivePendingTrigger(pending)) continue;
+        if (normalizeSymbol(current.symbol) !== normalizeSymbol(tick.symbol)) continue;
+        if (!pendingTriggerTouchedByTick(pending, tick.price)) continue;
+        pollPendingTrigger(interval).catch((error) => {
+          appendLog("Sztab websocket trigger wake failed", {
+            error: error instanceof Error ? error.message : String(error),
+            interval,
+            price: tick.price,
+            symbol: tick.symbol,
+          }).catch(() => {});
+        });
+      }
     });
   }
 

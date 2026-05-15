@@ -482,6 +482,7 @@ export async function processLiveProfileExecution({
       side,
       updatedProfile,
     });
+    warmStrategyPriceFeed({ bingxClient, priceService, symbol: armedProfile.symbol });
     if (activeSetupEvent.strategyEventTrigger === true) {
       return processPlatformMarketTrigger({
         bingxClient,
@@ -927,6 +928,15 @@ function sztabPriceSource() {
 function sztabStrategyPriceSource() {
   // Strategic trigger truth must stay on the Binance Futures side; BingX is only the execution venue.
   return "binance_futures";
+}
+
+function warmStrategyPriceFeed({ bingxClient, priceService = null, symbol }) {
+  if (typeof priceService?.getPrice !== "function") return;
+  priceService.getPrice({
+    client: bingxClient,
+    source: sztabStrategyPriceSource(),
+    symbol,
+  }).catch(() => {});
 }
 
 function maxTriggerSlippagePct() {
@@ -1428,10 +1438,17 @@ async function getPlatformTriggerPrice({ bingxClient, priceService = null, sourc
       price: numericValue(sample.price),
       raw: sample.raw,
       rateLimitCount: sample.rateLimitCount ?? 0,
+      recentHigh: sample.recentHigh ?? null,
+      recentLow: sample.recentLow ?? null,
+      recentTicks: Array.isArray(sample.recentTicks) ? sample.recentTicks : [],
       source: sample.source ?? source,
       stale: Boolean(sample.stale),
       status: sample.status ?? "ok",
       time: sample.time ?? new Date().toISOString(),
+      fallbackActive: Boolean(sample.fallbackActive),
+      lastWebsocketTickAt: sample.lastWebsocketTickAt ?? null,
+      websocketAgeMs: sample.websocketAgeMs ?? null,
+      websocketError: sample.websocketError ?? "",
       websocketStatus: sample.websocketStatus ?? "unknown",
     };
   }
@@ -1486,6 +1503,16 @@ function triggerTouchedByPrice(pending = {}, price) {
   return pendingDirection(pending) === "LONG"
     ? marketPrice >= triggerPrice
     : marketPrice <= triggerPrice;
+}
+
+function triggerTouchedByRecentTicks(pending = {}, ticks = []) {
+  if (!Array.isArray(ticks) || ticks.length === 0) return false;
+  const armedAtMs = Date.parse(pending.armedAt ?? pending.updatedAt ?? 0);
+  return ticks.some((tick) => {
+    const tickTime = Date.parse(tick?.time ?? 0);
+    if (Number.isFinite(armedAtMs) && Number.isFinite(tickTime) && tickTime < armedAtMs) return false;
+    return triggerTouchedByPrice(pending, tick?.price);
+  });
 }
 
 function triggerSlippagePct(pending = {}, price) {
@@ -2378,17 +2405,22 @@ async function processPlatformMarketTrigger({
   const priceFeed = {
     ageMs: sample.ageMs ?? null,
     degraded: Boolean(sample.degraded),
+    fallbackActive: Boolean(sample.fallbackActive),
     lastError: sample.lastError ?? null,
+    lastWebsocketTickAt: sample.lastWebsocketTickAt ?? null,
     mode: sample.mode ?? "rest",
     rateLimitCount: sample.rateLimitCount ?? 0,
     stale: Boolean(sample.stale),
     status: sample.status ?? (sample.degraded ? "degraded" : "ok"),
+    websocketAgeMs: sample.websocketAgeMs ?? null,
+    websocketError: sample.websocketError ?? "",
     websocketStatus: sample.websocketStatus ?? "unknown",
   };
   const maxStaleMs = Number(process.env.SZTAB_PRICE_MAX_STALE_MS || 3_000);
   const diagnosticInvalidationTouched = invalidationTouchedByPrice(pending, markPrice);
   const touchedInvalidation = false;
-  const touchedTrigger = strategyEventTrigger || triggerTouchedByPrice(pending, markPrice);
+  const recentTickTriggerTouched = triggerTouchedByRecentTicks(pending, sample.recentTicks);
+  const touchedTrigger = strategyEventTrigger || triggerTouchedByPrice(pending, markPrice) || recentTickTriggerTouched;
   const slippagePct = triggerSlippagePct(pending, markPrice);
   const maxSlippagePct = Number(pending.maxSlippagePct ?? maxTriggerSlippagePct());
   const baseDiagnostics = {
@@ -2397,6 +2429,8 @@ async function processPlatformMarketTrigger({
     markPrice,
     maxSlippagePct,
     priceRaw: sample.raw,
+    recentHigh: sample.recentHigh ?? null,
+    recentLow: sample.recentLow ?? null,
     priceFeed,
     priceSource: sample.source,
     priceTime: sample.time,
@@ -2405,6 +2439,7 @@ async function processPlatformMarketTrigger({
     strategyEventTrigger,
     triggerTruthSource: strategyEventTrigger ? "strategy_event_closed_candle" : "binance_futures_live_price",
     diagnosticInvalidationTouched,
+    recentTickTriggerTouched,
     touchedInvalidation,
     touchedTrigger,
     triggerPrice: pendingTriggerPrice(pending),
