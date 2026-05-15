@@ -327,26 +327,27 @@ export async function processLiveProfileExecution({
   });
 
   const balancePayload = await bingxClient.getPerpetualFuturesBalance();
-  const availableBalance = getAvailableBalance(balancePayload);
+  const accountBalanceUsed = getAvailableBalance(balancePayload);
+  const availableMargin = availableMarginForExecution(balancePayload, accountBalanceUsed);
   const startingBalance = Number(updatedProfile.risk?.startingBalance);
   updatedProfile.risk = {
     ...(updatedProfile.risk ?? {}),
     startingBalance: Number.isFinite(startingBalance) && startingBalance > 0
       ? startingBalance
-      : availableBalance,
+      : accountBalanceUsed,
   };
   const sizing = calculatePaperPositionSize({
     entryPrice: activeSetupEvent.trigger,
-    equity: availableBalance,
+    equity: accountBalanceUsed,
     risk: updatedProfile.risk,
     stopLoss: activeSetupEvent.stopLoss,
   });
   const marginSafety = applyLiveMarginSafetyBuffer({
-    availableMargin: balanceSnapshot(balancePayload).availableMargin ?? availableBalance,
+    availableMargin,
     entryPrice: activeSetupEvent.trigger,
     minNotional: Number(process.env.SZTAB_MIN_ORDER_NOTIONAL_USDT || 5),
     minQuantity: Number(process.env.SZTAB_MIN_ORDER_QTY || 0.001),
-    riskBasis: availableBalance,
+    riskBasis: accountBalanceUsed,
     riskPercent: updatedProfile.risk.riskPerTradePercent,
     sizing,
   });
@@ -432,7 +433,7 @@ export async function processLiveProfileExecution({
   }
   const risk = validateOrder({
     apiConfigured: bingxClient.auth.configured,
-    availableBalance,
+    availableBalance: availableMargin,
     liveModeEnabled: profile.liveModeEnabled === true || store.getState().botStatus === "LIVE_RUNNING",
     openPosition: isReversalSetup ? null : updatedProfile.live?.openPosition,
     order,
@@ -936,8 +937,8 @@ async function placeLiveTakeProfitIfEnabled({
 }
 
 function sztabExecutionMode() {
-  const value = String(process.env.SZTAB_EXECUTION_MODE ?? "exchange_trigger").toLowerCase();
-  return value === "platform_market_trigger" ? "platform_market_trigger" : "exchange_trigger";
+  const value = String(process.env.SZTAB_EXECUTION_MODE ?? "platform_market_trigger").toLowerCase();
+  return value === "exchange_trigger" ? "exchange_trigger" : "platform_market_trigger";
 }
 
 function sztabPriceSource() {
@@ -995,6 +996,7 @@ function applyLiveMarginSafetyBuffer({
   const marginUsageCap = normalizedMarginUsageCap();
   const feeBufferMultiplier = marginFeeBufferMultiplier();
   const available = numericValue(availableMargin);
+  const entry = numericValue(entryPrice);
   const leverage = Math.max(1, Number(sizing.leverage ?? 1));
   const desiredQuantity = floorQuantity(sizing.quantity);
   const desiredNotional = Number.isFinite(Number(sizing.notionalSize))
@@ -1012,6 +1014,7 @@ function applyLiveMarginSafetyBuffer({
   const finalMarginRequired = finalNotional / leverage;
   const finalEstimatedRequiredMargin = finalMarginRequired * feeBufferMultiplier;
   const slDistancePercent = Number(sizing.slDistancePercent ?? 0);
+  const slDistance = entry !== null ? entry * slDistancePercent : null;
   const finalRiskAmount = finalNotional * slDistancePercent;
   const requestedRiskAmount = numericValue(sizing.riskAmount);
   const riskBasisValue = numericValue(riskBasis);
@@ -1029,9 +1032,16 @@ function applyLiveMarginSafetyBuffer({
 
   return {
     allowed,
+    accountBalanceUsed: riskBasisValue,
+    accountRiskAmount: requestedRiskAmount,
     availableMargin: available,
     capApplied,
     capHeadroomAfterCap: numericValue(capHeadroomAfterCap),
+    cappedQtyReason: capApplied
+      ? "margin_safety_cap_applied"
+      : allowed
+        ? "account_risk_quantity_allowed"
+        : "margin_safety_cap_below_min_order_size",
     desiredEstimatedRequiredMargin: numericValue(desiredEstimatedRequiredMargin),
     desiredMarginRequired: numericValue(desiredMarginRequired),
     desiredNotional: numericValue(desiredNotional),
@@ -1041,6 +1051,9 @@ function applyLiveMarginSafetyBuffer({
     finalMarginRequired: numericValue(finalMarginRequired),
     finalNotional: numericValue(finalNotional),
     finalQuantity: cappedQuantity,
+    finalQty: cappedQuantity,
+    finalRiskAtSL: numericValue(finalRiskAmount),
+    finalRiskAtSLPercentOfAccount: numericValue(actualRiskPercentAfterCap),
     marginHeadroomAfterCap: numericValue(marginHeadroomAfterCap),
     marginUsageCap,
     maxAllowedRequiredMargin: numericValue(maxAllowedRequiredMargin),
@@ -1054,6 +1067,7 @@ function applyLiveMarginSafetyBuffer({
     riskAmountAfterCap: numericValue(finalRiskAmount),
     riskBasis: riskBasisValue,
     riskPercentAfterCap: numericValue(actualRiskPercentAfterCap),
+    rawQtyFromAccountRisk: desiredQuantity,
     sizing: {
       ...sizing,
       marginRequired: finalMarginRequired,
@@ -1061,6 +1075,7 @@ function applyLiveMarginSafetyBuffer({
       quantity: cappedQuantity,
       riskAmount: finalRiskAmount,
     },
+    slDistance: numericValue(slDistance),
   };
 }
 
@@ -1090,10 +1105,13 @@ function buildLiveSetupEvent(setupEvent, profile) {
 function getAvailableBalance(payload) {
   const balance = Array.isArray(payload) ? payload[0] : payload?.balance ?? payload;
   return Number(
-    balance?.availableMargin ??
+    balance?.equity ??
+      balance?.totalEquity ??
+      balance?.totalMarginBalance ??
+      balance?.balance ??
       balance?.availableBalance ??
       balance?.available ??
-      balance?.balance ??
+      balance?.availableMargin ??
       0,
   );
 }
@@ -1109,6 +1127,11 @@ function balanceSnapshot(payload) {
     raw: balance,
     usedMargin: numericValue(balance?.usedMargin ?? balance?.used ?? balance?.lockedMargin ?? balance?.freezedMargin),
   };
+}
+
+function availableMarginForExecution(payload, fallback = null) {
+  const snapshot = balanceSnapshot(payload);
+  return snapshot.availableMargin ?? snapshot.availableBalance ?? fallback ?? snapshot.equity ?? snapshot.balance ?? 0;
 }
 
 function triggerDistance({ direction, markPrice, triggerPrice }) {
@@ -2717,19 +2740,20 @@ async function processPlatformMarketTrigger({
   }
 
   const balancePayload = await bingxClient.getPerpetualFuturesBalance();
-  const availableBalance = getAvailableBalance(balancePayload);
+  const accountBalanceUsed = getAvailableBalance(balancePayload);
+  const availableMargin = availableMarginForExecution(balancePayload, accountBalanceUsed);
   const sizing = calculatePaperPositionSize({
     entryPrice: pending.triggerPrice,
-    equity: availableBalance,
+    equity: accountBalanceUsed,
     risk: updatedProfile.risk,
     stopLoss: pending.stopLoss,
   });
   const marginSafety = applyLiveMarginSafetyBuffer({
-    availableMargin: balanceSnapshot(balancePayload).availableMargin ?? availableBalance,
+    availableMargin,
     entryPrice: markPrice ?? pending.triggerPrice,
     minNotional: Number(process.env.SZTAB_MIN_ORDER_NOTIONAL_USDT || 5),
     minQuantity: Number(process.env.SZTAB_MIN_ORDER_QTY || 0.001),
-    riskBasis: availableBalance,
+    riskBasis: accountBalanceUsed,
     riskPercent: updatedProfile.risk?.riskPerTradePercent,
     sizing,
   });
@@ -2785,7 +2809,7 @@ async function processPlatformMarketTrigger({
 
   const risk = validateOrder({
     apiConfigured: bingxClient.auth.configured,
-    availableBalance,
+    availableBalance: availableMargin,
     liveModeEnabled: profile.liveModeEnabled === true || store.getState().botStatus === "LIVE_RUNNING",
     openPosition: reversalContext ? null : updatedProfile.live?.openPosition,
     order,

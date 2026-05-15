@@ -13,9 +13,9 @@ const DEFAULT_SZTAB_CANDLE_LIMITS = {
 };
 
 function sztabExecutionMode() {
-  return String(process.env.SZTAB_EXECUTION_MODE ?? "exchange_trigger").toLowerCase() === "platform_market_trigger"
-    ? "platform_market_trigger"
-    : "exchange_trigger";
+  return String(process.env.SZTAB_EXECUTION_MODE ?? "platform_market_trigger").toLowerCase() === "exchange_trigger"
+    ? "exchange_trigger"
+    : "platform_market_trigger";
 }
 
 function triggerWatchMs() {

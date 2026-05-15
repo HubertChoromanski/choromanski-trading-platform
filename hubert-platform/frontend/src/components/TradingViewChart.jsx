@@ -995,6 +995,7 @@ function runtimeDiagnostics(runtime = {}) {
     ["Backend updatedAt", runtime.backendUpdatedAt ? `${formatChartTime(runtime.backendUpdatedAt)} (${ageText(runtime.backendUpdatedAt)})` : "--"],
     ["runningIntervals", runtime.runningIntervalsText ?? "--"],
     ["Stale detection", runtime.staleDetection ?? "--"],
+    ["Execution mode", runtime.executionMode || runtime.pendingTriggerOrder?.executionMode || "--"],
     ["Runner started", runtime.currentRunnerStartedAt ? `${formatChartTime(runtime.currentRunnerStartedAt)} (${ageText(runtime.currentRunnerStartedAt)})` : runtime.startedAt ? `${formatChartTime(runtime.startedAt)} (${ageText(runtime.startedAt)})` : "--"],
     ["Current setup FP", runtime.currentSetupFingerprintShort || runtime.currentSetupFingerprint || runtime.activeSetupFingerprintShort || runtime.latestSetupFingerprint || "--"],
     ["Current order ids", (runtime.currentLifecycleOrderIds ?? []).length ? runtime.currentLifecycleOrderIds.join(", ") : "--"],

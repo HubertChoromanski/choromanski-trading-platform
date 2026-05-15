@@ -578,6 +578,8 @@ function triggerMarginDiagnostics(runtime = {}) {
       ? (actualRiskUsdt / riskBasis) * 100
       : null;
   return {
+    accountBalanceUsed: Number(marginSafety.accountBalanceUsed ?? marginSafety.riskBasis ?? available.equity ?? available.balance),
+    accountRiskAmount: Number(marginSafety.accountRiskAmount ?? marginSafety.requestedRiskAmount),
     actualRiskPercent,
     actualRiskUsdt,
     availableMargin,
@@ -589,6 +591,8 @@ function triggerMarginDiagnostics(runtime = {}) {
     equity: Number(available.equity),
     estimatedRequiredMarginWithBuffer: Number(marginSafety.estimatedRequiredMarginAfterCap ?? diagnostics.estimatedRequiredMarginWithBuffer),
     finalQuantity: Number(marginSafety.finalQuantity ?? diagnostics.quantity),
+    finalRiskAtSL: Number(marginSafety.finalRiskAtSL ?? marginSafety.riskAmountAfterCap),
+    finalRiskAtSLPercentOfAccount: Number(marginSafety.finalRiskAtSLPercentOfAccount ?? marginSafety.riskPercentAfterCap),
     leverage: diagnostics.leverage,
     marginHeadroom: Number.isFinite(Number(marginSafety.marginHeadroomAfterCap)) ? Number(marginSafety.marginHeadroomAfterCap) : marginHeadroom,
     marginHeadroomPct: Number.isFinite(Number(marginSafety.marginHeadroomAfterCap)) && Number.isFinite(availableMargin) && availableMargin > 0
@@ -603,6 +607,9 @@ function triggerMarginDiagnostics(runtime = {}) {
     requestedRiskPercent,
     requestedRiskUsdt,
     riskBasis,
+    rawQtyFromAccountRisk: Number(marginSafety.rawQtyFromAccountRisk ?? marginSafety.desiredQuantity),
+    slDistance: Number(marginSafety.slDistance),
+    cappedQtyReason: marginSafety.cappedQtyReason ?? marginSafety.reason ?? "",
     usedMargin: Number(available.usedMargin ?? available.raw?.usedMargin ?? available.raw?.used ?? available.raw?.freezedMargin),
     warnings: [...warnings],
   };
@@ -5846,11 +5853,20 @@ function SztabIntervalPanel({
           <Metric label="Futures balance" value={fmt(marginDiagnostics.balance)} />
           <Metric label="Available margin" value={fmt(marginDiagnostics.availableMargin)} />
           <Metric label="Used margin" value={fmt(marginDiagnostics.usedMargin)} />
+          <Metric label="Account balance used" value={fmt(marginDiagnostics.accountBalanceUsed)} />
+          <Metric label="Risk per SL %" value={Number.isFinite(marginDiagnostics.requestedRiskPercent) ? `${fmt(marginDiagnostics.requestedRiskPercent)}%` : "--"} />
+          <Metric label="Account risk amount" value={fmt(marginDiagnostics.accountRiskAmount)} />
+          <Metric label="Entry price" value={fmt(runtime.pendingTriggerOrder?.triggerPrice)} />
+          <Metric label="SL price" value={fmt(runtime.pendingTriggerOrder?.stopLoss ?? runtime.pendingTriggerOrder?.invalidationPrice)} />
+          <Metric label="SL distance" value={fmt(marginDiagnostics.slDistance)} />
+          <Metric label="Raw qty from account risk" value={fmt(marginDiagnostics.rawQtyFromAccountRisk, 3)} />
           <Metric label="Risk basis used" value={fmt(marginDiagnostics.riskBasis)} />
           <Metric label="Requested SL risk" value={Number.isFinite(marginDiagnostics.requestedRiskPercent) ? `${fmt(marginDiagnostics.requestedRiskUsdt)} (${fmt(marginDiagnostics.requestedRiskPercent)}%)` : "--"} />
           <Metric label="Actual SL risk" value={Number.isFinite(marginDiagnostics.actualRiskPercent) ? `${fmt(marginDiagnostics.actualRiskUsdt)} (${fmt(marginDiagnostics.actualRiskPercent)}%)` : "--"} />
           <Metric label="Desired qty" value={fmt(marginDiagnostics.desiredQuantity, 3)} />
           <Metric label="Final qty" value={fmt(marginDiagnostics.finalQuantity, 3)} />
+          <Metric label="Final risk at SL" value={Number.isFinite(marginDiagnostics.finalRiskAtSLPercentOfAccount) ? `${fmt(marginDiagnostics.finalRiskAtSL)} (${fmt(marginDiagnostics.finalRiskAtSLPercentOfAccount)}%)` : "--"} />
+          <Metric label="Capped qty reason" value={marginDiagnostics.cappedQtyReason || "--"} />
           <Metric label="Margin cap applied" value={marginDiagnostics.capApplied ? "yes" : "no"} />
           <Metric label="Margin usage cap" value={Number.isFinite(marginDiagnostics.marginUsageCap) ? `${fmt(marginDiagnostics.marginUsageCap * 100, 0)}%` : "--"} />
           <Metric label="Max allowed margin" value={fmt(marginDiagnostics.maxAllowedRequiredMargin)} />
