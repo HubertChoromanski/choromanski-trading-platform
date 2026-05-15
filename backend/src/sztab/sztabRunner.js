@@ -680,9 +680,30 @@ export function createSztabRunner({
       priceFeedSource: snapshot?.source ?? source,
       priceFeedStatus: snapshot?.status ?? "unknown",
       priceFeedWebsocketAgeMs: snapshot?.websocketAgeMs ?? null,
+      priceFeedWebsocketConfigReason: snapshot?.websocketConfigReason ?? "",
+      priceFeedWebsocketDisabledReason: snapshot?.websocketDisabledReason ?? "",
       priceFeedWebsocketError: snapshot?.websocketError ?? "",
       priceFeedWebsocketStatus: snapshot?.websocketStatus ?? "unknown",
     };
+  }
+
+  function statusFromConfigWithFreshPriceFeed(config) {
+    const intervals = statusFromConfig(config);
+    for (const interval of SZTAB_INTERVALS) {
+      const current = config.intervals[interval];
+      const pendingSource = current.runtime?.pendingTriggerOrder?.priceSource;
+      const source = String(process.env.SZTAB_PRICE_SOURCE ?? "").toLowerCase() === "binance_futures"
+        ? "binance_futures"
+        : pendingSource || current.runtime?.lastPriceSource || "binance_futures";
+      intervals[interval] = {
+        ...intervals[interval],
+        runtime: {
+          ...intervals[interval].runtime,
+          ...priceFeedRuntime(current.symbol, source),
+        },
+      };
+    }
+    return intervals;
   }
 
   function globalExecutionDiagnostics() {
@@ -1304,6 +1325,8 @@ export function createSztabRunner({
       priceFeedRateLimitCount: pending?.platformTriggerDiagnostics?.priceFeed?.rateLimitCount ?? null,
       priceFeedStatus: pending?.platformTriggerDiagnostics?.priceFeed?.status ?? null,
       priceFeedWebsocketAgeMs: pending?.platformTriggerDiagnostics?.priceFeed?.websocketAgeMs ?? null,
+      priceFeedWebsocketConfigReason: pending?.platformTriggerDiagnostics?.priceFeed?.websocketConfigReason ?? "",
+      priceFeedWebsocketDisabledReason: pending?.platformTriggerDiagnostics?.priceFeed?.websocketDisabledReason ?? "",
       priceFeedWebsocketError: pending?.platformTriggerDiagnostics?.priceFeed?.websocketError ?? "",
       priceFeedWebsocketStatus: pending?.platformTriggerDiagnostics?.priceFeed?.websocketStatus ?? null,
       platformTriggerCrossed: Boolean(pending?.triggerCrossed),
@@ -1766,7 +1789,7 @@ export function createSztabRunner({
     const config = normalizeConfig(store.getSztabConfig());
     return {
       config,
-      intervals: statusFromConfig(config),
+      intervals: statusFromConfigWithFreshPriceFeed(config),
       runner: {
         loopMs: DEFAULT_LOOP_MS,
         runningIntervals: [...timers.keys()],

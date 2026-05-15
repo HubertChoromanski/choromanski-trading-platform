@@ -118,9 +118,22 @@ export function createPriceService({
   const baseBackoffMs = Number(process.env.SZTAB_PRICE_REST_BACKOFF_MS || DEFAULT_REST_BACKOFF_MS);
   const maxBackoffMs = Number(process.env.SZTAB_PRICE_REST_BACKOFF_MAX_MS || DEFAULT_REST_BACKOFF_MAX_MS);
   const freshMs = Number(process.env.SZTAB_PRICE_FRESH_MS || DEFAULT_FRESH_MS);
+  const selectedPriceSource = normalizeSource(process.env.SZTAB_PRICE_SOURCE || "binance_futures");
   const binanceWebsocketEnabled = String(process.env.BINANCE_FUTURES_PRICE_WEBSOCKET_ENABLED ?? "true").toLowerCase() !== "false";
   const binanceWebsocketBaseUrl = process.env.BINANCE_FUTURES_PRICE_WS_URL || "wss://fstream.binance.com/ws";
   const binanceReconnectMs = Number(process.env.BINANCE_FUTURES_PRICE_WS_RECONNECT_MS || 2_000);
+
+  function binanceWebsocketConfigReason() {
+    if (!binanceWebsocketEnabled) return "disabled_by_env_BINANCE_FUTURES_PRICE_WEBSOCKET_ENABLED";
+    if (typeof WebSocketImpl !== "function") return "websocket_runtime_unavailable_rest_fallback_active";
+    return "configured_by_SZTAB_PRICE_SOURCE";
+  }
+
+  logger.info?.("[price-service] startup", {
+    binanceFuturesWebsocketEnabled: binanceWebsocketEnabled,
+    selectedSztabPriceSource: selectedPriceSource,
+    websocketConfigReason: binanceWebsocketConfigReason(),
+  });
 
   function entryFor(symbol, source) {
     const key = cacheKey(symbol, source);
@@ -144,6 +157,8 @@ export function createPriceService({
         symbol: compactSymbol(symbol),
         updatedAt: null,
         websocketError: "",
+        websocketConfigReason: source === "binance_futures" ? binanceWebsocketConfigReason() : "",
+        websocketDisabledReason: "",
         websocketStatus: "not_started",
         websocketUpdatedAt: null,
       });
@@ -237,6 +252,8 @@ export function createPriceService({
       websocketAgeMs: entry.source === "binance_futures" && entry.websocketUpdatedAt
         ? Date.now() - Date.parse(entry.websocketUpdatedAt)
         : null,
+      websocketConfigReason: entry.websocketConfigReason ?? "",
+      websocketDisabledReason: entry.websocketDisabledReason ?? "",
       websocketError,
       websocketStatus,
     };
@@ -338,6 +355,7 @@ export function createPriceService({
 
   function updateBinanceWebsocketEntry(symbol, patch = {}) {
     return updateEntry(symbol, "binance_futures", {
+      websocketConfigReason: binanceWebsocketConfigReason(),
       websocketUpdatedAt: patch.websocketUpdatedAt ?? nowIso(),
       ...patch,
     });
@@ -394,6 +412,7 @@ export function createPriceService({
     if (!binanceWebsocketEnabled) {
       state.status = "disabled";
       updateBinanceWebsocketEntry(normalizedSymbol, {
+        websocketDisabledReason: "disabled_by_env_BINANCE_FUTURES_PRICE_WEBSOCKET_ENABLED",
         websocketError: "",
         websocketStatus: state.status,
       });
@@ -404,6 +423,7 @@ export function createPriceService({
       state.status = "unavailable";
       state.error = "Runtime WebSocket API is unavailable; REST fallback is active.";
       updateBinanceWebsocketEntry(normalizedSymbol, {
+        websocketDisabledReason: "websocket_runtime_unavailable_rest_fallback_active",
         websocketError: state.error,
         websocketStatus: state.status,
       });
@@ -416,6 +436,7 @@ export function createPriceService({
       state.status = "connecting";
       updateBinanceWebsocketEntry(normalizedSymbol, {
         websocketError: "",
+        websocketDisabledReason: "",
         websocketStatus: state.status,
       });
       socket.addEventListener("open", () => {
@@ -424,6 +445,7 @@ export function createPriceService({
         state.status = "connected";
         updateBinanceWebsocketEntry(normalizedSymbol, {
           websocketError: "",
+          websocketDisabledReason: "",
           websocketStatus: state.status,
         });
       });
@@ -446,6 +468,8 @@ export function createPriceService({
             status: "ok",
             updatedAt,
             websocketError: "",
+            websocketConfigReason: binanceWebsocketConfigReason(),
+            websocketDisabledReason: "",
             websocketStatus: state.status,
             websocketUpdatedAt: updatedAt,
           });
@@ -462,6 +486,7 @@ export function createPriceService({
           state.error = error instanceof Error ? error.message : String(error);
           updateBinanceWebsocketEntry(normalizedSymbol, {
             websocketError: state.error,
+            websocketDisabledReason: "",
             websocketStatus: state.status,
           });
         }
@@ -471,6 +496,7 @@ export function createPriceService({
         state.status = "disconnected";
         updateBinanceWebsocketEntry(normalizedSymbol, {
           websocketError: state.error,
+          websocketDisabledReason: "",
           websocketStatus: state.status,
         });
         scheduleBinanceReconnect(normalizedSymbol, state);
@@ -481,6 +507,7 @@ export function createPriceService({
         state.status = "error";
         updateBinanceWebsocketEntry(normalizedSymbol, {
           websocketError: state.error,
+          websocketDisabledReason: "",
           websocketStatus: state.status,
         });
         scheduleBinanceReconnect(normalizedSymbol, state);
@@ -491,6 +518,7 @@ export function createPriceService({
       state.status = "error";
       updateBinanceWebsocketEntry(normalizedSymbol, {
         websocketError: state.error,
+        websocketDisabledReason: "",
         websocketStatus: state.status,
       });
       logger.warn?.(`[price-service] Binance Futures websocket disabled: ${state.error}`);
@@ -618,6 +646,9 @@ export function createPriceService({
   }
 
   function snapshot({ source = "bingx_mark", symbol } = {}) {
+    if (normalizeSource(source) === "binance_futures" && symbol) {
+      ensureBinanceFuturesWebsocket(symbol);
+    }
     const entry = entryFor(symbol, source);
     return {
       ...buildSample(entry, { stale: entry.updatedAt ? Date.now() - Date.parse(entry.updatedAt) > freshMs : false }),
@@ -629,6 +660,11 @@ export function createPriceService({
 
   function status() {
     return {
+      config: {
+        binanceFuturesWebsocketEnabled: binanceWebsocketEnabled,
+        selectedSztabPriceSource: selectedPriceSource,
+        websocketConfigReason: binanceWebsocketConfigReason(),
+      },
       entries: Array.from(entries.values()).map((entry) => snapshot({ source: entry.source, symbol: entry.symbol })),
       binanceFuturesWebsockets: Array.from(binanceWebsockets.values()).map((state) => ({
         connected: state.connected,

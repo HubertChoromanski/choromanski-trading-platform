@@ -99,6 +99,34 @@ async function assertRestFallbackWhenWebsocketUnavailable() {
   }
 }
 
+async function assertSztabPriceSourceConfiguresBinanceWebsocket() {
+  MockWebSocket.instances = [];
+  const oldSource = process.env.SZTAB_PRICE_SOURCE;
+  process.env.SZTAB_PRICE_SOURCE = "binance_futures";
+  try {
+    const service = createPriceService({
+      WebSocketImpl: MockWebSocket,
+      fetchImpl: async () => ({
+        ok: true,
+        json: async () => ({ price: "99.00", symbol: "SOLUSDT" }),
+      }),
+      logger: { info: () => {}, warn: () => {} },
+    });
+    const snapshot = service.snapshot({ source: "binance_futures", symbol: "SOLUSDT" });
+    assert(MockWebSocket.instances.length === 1, "SZTAB_PRICE_SOURCE=binance_futures did not configure/start Binance websocket from snapshot.");
+    assert(snapshot.websocketStatus !== "unconfigured", `Binance websocket should not report unconfigured, got ${snapshot.websocketStatus}`);
+    assert(snapshot.websocketConfigReason === "configured_by_SZTAB_PRICE_SOURCE", `Unexpected config reason: ${snapshot.websocketConfigReason}`);
+    assert(service.status().config.selectedSztabPriceSource === "binance_futures", "Service status did not expose selected SZTAB_PRICE_SOURCE.");
+  } finally {
+    if (oldSource === undefined) {
+      delete process.env.SZTAB_PRICE_SOURCE;
+    } else {
+      process.env.SZTAB_PRICE_SOURCE = oldSource;
+    }
+  }
+}
+
 await assertBinanceWebsocketTickWinsOverRest();
 await assertRestFallbackWhenWebsocketUnavailable();
+await assertSztabPriceSourceConfiguresBinanceWebsocket();
 console.log("Sztab price websocket regression passed");

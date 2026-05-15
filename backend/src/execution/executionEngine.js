@@ -1448,6 +1448,8 @@ async function getPlatformTriggerPrice({ bingxClient, priceService = null, sourc
       fallbackActive: Boolean(sample.fallbackActive),
       lastWebsocketTickAt: sample.lastWebsocketTickAt ?? null,
       websocketAgeMs: sample.websocketAgeMs ?? null,
+      websocketConfigReason: sample.websocketConfigReason ?? "",
+      websocketDisabledReason: sample.websocketDisabledReason ?? "",
       websocketError: sample.websocketError ?? "",
       websocketStatus: sample.websocketStatus ?? "unknown",
     };
@@ -2413,6 +2415,8 @@ async function processPlatformMarketTrigger({
     stale: Boolean(sample.stale),
     status: sample.status ?? (sample.degraded ? "degraded" : "ok"),
     websocketAgeMs: sample.websocketAgeMs ?? null,
+    websocketConfigReason: sample.websocketConfigReason ?? "",
+    websocketDisabledReason: sample.websocketDisabledReason ?? "",
     websocketError: sample.websocketError ?? "",
     websocketStatus: sample.websocketStatus ?? "unknown",
   };
