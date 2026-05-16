@@ -2,6 +2,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { runBacktest } from "../backtest/backtestEngine";
 import { BACKEND_URL, backendApiUrl, dashboardAuthHeaders } from "../api/backend";
 import { fetchHistoricalCandles } from "../api/binance";
+import {
+  isRecord,
+  safeObjectRows,
+  safeOrderId,
+  safeStringRows,
+  setupFingerprintShort,
+} from "../utils/sztabRuntimeGuards";
 
 const PANEL_GROUPS = [
   {
@@ -521,7 +528,7 @@ function ageText(time) {
 }
 
 function eventText(event) {
-  if (!event) return "--";
+  if (!isRecord(event)) return "--";
   const side = event.direction ? `${event.direction} ` : "";
   const type = event.type ?? "event";
   const id = event.setupId ? ` ${event.setupId}` : "";
@@ -531,16 +538,18 @@ function eventText(event) {
 }
 
 function triggerFailureCandidateText(runtime = {}) {
-  const pending = runtime.pendingTriggerOrder ?? {};
-  const diagnostics = runtime.lastTriggerFailureDiagnostics ?? pending.failureDiagnostics ?? {};
+  const safeRuntime = isRecord(runtime) ? runtime : {};
+  const pending = isRecord(safeRuntime.pendingTriggerOrder) ? safeRuntime.pendingTriggerOrder : {};
+  const diagnostics = safeRuntime.lastTriggerFailureDiagnostics ?? pending.failureDiagnostics ?? {};
   if (diagnostics.triggerAlreadyCrossed) return "trigger_price_invalid_or_crossed";
-  return runtime.lastTriggerFailureCandidate || pending.failureCandidate || "--";
+  return safeRuntime.lastTriggerFailureCandidate || pending.failureCandidate || "--";
 }
 
 function triggerMarginDiagnostics(runtime = {}) {
-  const pending = runtime.pendingTriggerOrder ?? {};
-  const diagnostics = runtime.triggerMarginDiagnostics ??
-    runtime.lastTriggerFailureDiagnostics ??
+  const safeRuntime = isRecord(runtime) ? runtime : {};
+  const pending = isRecord(safeRuntime.pendingTriggerOrder) ? safeRuntime.pendingTriggerOrder : {};
+  const diagnostics = safeRuntime.triggerMarginDiagnostics ??
+    safeRuntime.lastTriggerFailureDiagnostics ??
     pending.failureDiagnostics ??
     pending.placementDiagnostics ??
     {};
@@ -665,7 +674,7 @@ function manualActionLabel(action) {
 }
 
 function protectionOrder(position, kind) {
-  const orders = position?.attachedOrders ?? [];
+  const orders = safeObjectRows(position?.attachedOrders);
   const wantsTp = kind === "TP";
 
   return orders.find((order) => {
@@ -680,6 +689,7 @@ function protectionOrder(position, kind) {
 }
 
 function takeProfitOrderLike(order = {}) {
+  if (!isRecord(order)) return false;
   const type = String(order.type ?? order.orderType ?? order.origType ?? order.planType ?? "").toUpperCase();
   const purpose = String(order.protectionType ?? order.protectionKind ?? order.tpslType ?? "").toUpperCase();
   return type.includes("TAKE") || purpose.includes("TAKE") || purpose.includes("TP");
@@ -691,7 +701,7 @@ function protectionSourceText(position, kind) {
     ? position?.takeProfitSource
     : position?.stopLossSource;
   const price = kind === "TP" ? position?.takeProfit : position?.stopLoss;
-  const orderId = order?.orderId ?? order?.orderID ?? order?.id;
+  const orderId = safeOrderId(order);
   const orderPrice = order?.stopPrice ?? order?.price ?? order?.triggerPrice;
 
   if (source || order) {
@@ -5584,14 +5594,14 @@ function SztabIntervalPanel({
   summary = {},
   system,
 }) {
-  const runtime = config.runtime ?? {};
+  const runtime = isRecord(config.runtime) ? config.runtime : {};
   const isRunning = ["running", "degraded", "recovering"].includes(String(runtime.status ?? "").toLowerCase());
   const locked = isRunning || config.locked || (config.strategyLocked && config.mmLocked);
   const profile = accountProfiles.find((item) => item.id === config.apiProfile);
   const positions = positionsForInterval(livestream?.positions ?? [], config, interval);
   const orders = ordersForInterval(livestream?.openOrders ?? [], config);
-  const globalBlockers = runtime.globalBlockers ?? [];
-  const intervalBlockers = runtime.intervalBlockers ?? [];
+  const globalBlockers = safeObjectRows(runtime.globalBlockers);
+  const intervalBlockers = safeObjectRows(runtime.intervalBlockers);
   const latestCandle = selectedInterval === interval ? rawCandles.at(-1) : null;
   const logs = (system?.logs ?? []).filter((log) => {
     const haystack = JSON.stringify(log).toLowerCase();
@@ -5607,16 +5617,18 @@ function SztabIntervalPanel({
   const cleanupFailureClassification = runtime.cleanupFailureClassification ?? "";
   const marginDiagnostics = triggerMarginDiagnostics(runtime);
   const marginWarnings = marginDiagnostics.warnings ?? [];
-  const currentSetupOrderJournal = runtime.currentSetupOrderJournal ?? [];
-  const historicalSetupOrderJournal = runtime.historicalSetupOrderJournal ?? (runtime.setupOrderJournal ?? []).filter((item) => item.historical);
-  const currentDecisionTimeline = runtime.currentDecisionTimeline ?? [];
+  const currentSetupOrderJournal = safeObjectRows(runtime.currentSetupOrderJournal);
+  const historicalSetupOrderJournal = safeObjectRows(runtime.historicalSetupOrderJournal).length
+    ? safeObjectRows(runtime.historicalSetupOrderJournal)
+    : safeObjectRows(runtime.setupOrderJournal).filter((item) => item.historical);
+  const currentDecisionTimeline = safeObjectRows(runtime.currentDecisionTimeline);
   const detectedTakeProfitOrders = [
     ...orders.filter(takeProfitOrderLike),
     ...positions
       .map((position) => protectionOrder(position, "TP"))
       .filter(Boolean),
-    runtime.pendingTriggerOrder?.takeProfitOrder,
-  ].filter(Boolean);
+    isRecord(runtime.pendingTriggerOrder) ? runtime.pendingTriggerOrder.takeProfitOrder : null,
+  ].filter(isRecord);
   const detectedLegacyTakeProfitState = detectedTakeProfitOrders.length > 0 ||
     positions.some((position) => Number(position.takeProfit) > 0) ||
     Boolean(runtime.pendingTriggerOrder?.takeProfitOrder);
@@ -5894,7 +5906,7 @@ function SztabIntervalPanel({
           <Metric label="Blocked reason" value={runtime.lastBlockedReason || "--"} />
           <Metric label="Runner started" value={compactDateText(runtime.currentRunnerStartedAt ?? runtime.startedAt)} />
           <Metric label="Current setup FP" value={runtime.currentSetupFingerprintShort || runtime.currentSetupFingerprint || "--"} />
-          <Metric label="Current order ids" value={(runtime.currentLifecycleOrderIds ?? []).join(", ") || "--"} />
+          <Metric label="Current order ids" value={safeStringRows(runtime.currentLifecycleOrderIds).join(", ") || "--"} />
           <Metric label="Stale historical rows" value={runtime.staleHistoricalOrderCount ?? 0} />
           <Metric label="Interval blocker" value={intervalBlockers.map((blocker) => blocker.type ?? blocker.source).join(", ") || "--"} />
           <Metric label="Last exchange response" value={runtime.lastExchangeResponse ? compactDateText(runtime.lastExchangeResponse.time) : "--"} />
@@ -5918,7 +5930,7 @@ function SztabIntervalPanel({
                     <td>{compactDateText(item.time)}</td>
                     <td>{item.event ?? "--"}</td>
                     <td>{item.setupId ?? "--"}</td>
-                    <td>{item.setupFingerprint ? String(item.setupFingerprint).replace(/^sf_/, "").slice(0, 8).toUpperCase() : "--"}</td>
+                    <td>{setupFingerprintShort(item.setupFingerprint) || "--"}</td>
                     <td>{item.text ?? item.reason ?? "--"}</td>
                   </tr>
                 )) : (
@@ -5947,14 +5959,14 @@ function SztabIntervalPanel({
               </thead>
               <tbody>
                 {currentSetupOrderJournal.length ? currentSetupOrderJournal.slice(-20).reverse().map((item, index) => (
-                  <tr key={`${item.timestamp ?? index}-${item.orderId ?? item.setupId ?? index}`}>
+                  <tr key={`${item.timestamp ?? index}-${safeOrderId(item) ?? item.setupId ?? index}`}>
                     <td>{compactDateText(item.timestamp)}</td>
                     <td>{item.setupId ?? "--"}</td>
-                    <td>{item.setupFingerprintShort ?? (item.setupFingerprint ? String(item.setupFingerprint).replace(/^sf_/, "").slice(0, 8).toUpperCase() : "--")}</td>
+                    <td>{item.setupFingerprintShort || setupFingerprintShort(item.setupFingerprint) || "--"}</td>
                     <td>{item.side ?? "--"}</td>
                     <td>{fmt(item.triggerPrice)}</td>
                     <td>{fmt(item.quantity, 3)}</td>
-                    <td>{item.orderId ?? "--"}</td>
+                    <td>{safeOrderId(item) ?? "--"}</td>
                     <td>{item.status ?? item.event ?? "--"}</td>
                     <td>{item.reason ?? item.failureClassification ?? item.event ?? "--"}</td>
                   </tr>
@@ -5982,10 +5994,10 @@ function SztabIntervalPanel({
               </thead>
               <tbody>
                 {historicalSetupOrderJournal.length ? historicalSetupOrderJournal.slice(-20).reverse().map((item, index) => (
-                  <tr key={`historical-${item.timestamp ?? index}-${item.orderId ?? item.setupId ?? index}`}>
+                  <tr key={`historical-${item.timestamp ?? index}-${safeOrderId(item) ?? item.setupId ?? index}`}>
                     <td>{compactDateText(item.timestamp)}</td>
                     <td>{item.setupId ?? "--"}</td>
-                    <td>{item.setupFingerprintShort ?? (item.setupFingerprint ? String(item.setupFingerprint).replace(/^sf_/, "").slice(0, 8).toUpperCase() : "--")}</td>
+                    <td>{item.setupFingerprintShort || setupFingerprintShort(item.setupFingerprint) || "--"}</td>
                     <td>{item.side ?? "--"}</td>
                     <td>{fmt(item.triggerPrice)}</td>
                     <td>{item.status ?? item.event ?? "--"}</td>
@@ -6320,7 +6332,7 @@ function validationText(validation = {}) {
 }
 
 function positionsForInterval(positions = [], config = {}, interval) {
-  return positions.filter((position) => {
+  return safeObjectRows(positions).filter((position) => {
     const profileMatch = config.apiProfile ? position.apiProfile === config.apiProfile || position.sourceProfileId === config.apiProfile : true;
     const timeframeMatch = position.timeframe ? position.timeframe === interval : true;
     return profileMatch && timeframeMatch;
@@ -6328,7 +6340,7 @@ function positionsForInterval(positions = [], config = {}, interval) {
 }
 
 function ordersForInterval(orders = [], config = {}) {
-  return orders.filter((order) => {
+  return safeObjectRows(orders).filter((order) => {
     if (!config.apiProfile) return true;
     return order.apiProfile === config.apiProfile || order.__apiProfileId === config.apiProfile || order.sourceProfileId === config.apiProfile;
   });
@@ -8514,7 +8526,8 @@ function TradeTable({ onViewTrade, trades }) {
 }
 
 function OrderTable({ orders }) {
-  if (!orders?.length) {
+  const visibleOrders = safeObjectRows(orders);
+  if (!visibleOrders.length) {
     return <MiniStatus>No open exchange orders reported.</MiniStatus>;
   }
 
@@ -8525,8 +8538,8 @@ function OrderTable({ orders }) {
           <tr><th>Symbol</th><th>Type</th><th>Side</th><th>Price</th><th>Status</th></tr>
         </thead>
         <tbody>
-          {orders.slice(-20).map((order, index) => (
-            <tr key={`${order.orderId ?? order.id ?? "order"}-${order.type ?? order.orderType ?? "type"}-${order.stopPrice ?? order.price ?? index}-${index}`}>
+          {visibleOrders.slice(-20).map((order, index) => (
+            <tr key={`${safeOrderId(order) ?? "order"}-${order.type ?? order.orderType ?? "type"}-${order.stopPrice ?? order.price ?? index}-${index}`}>
               <td>{order.symbol ?? "--"}</td>
               <td>{order.type ?? order.orderType ?? "--"}</td>
               <td>{order.side ?? order.positionSide ?? "--"}</td>

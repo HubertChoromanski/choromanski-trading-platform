@@ -21,6 +21,12 @@ import {
   readPlatformState,
   writeStoredJson,
 } from "../utils/persistence";
+import {
+  isRecord,
+  safeObjectRows,
+  safeOrderId,
+  safeStringRows,
+} from "../utils/sztabRuntimeGuards";
 import "../styles/chart.css";
 
 const DISPLAY_TIME_ZONE = import.meta.env.VITE_DISPLAY_TIME_ZONE || "Europe/Warsaw";
@@ -281,6 +287,7 @@ function resolvedTriggerFailureCandidate(runtime = {}, pending = {}) {
 }
 
 function polishLifecycleText(item = {}) {
+  if (!isRecord(item)) return "Brak aktywnego zlecenia.";
   const message = String(item.message ?? item.status ?? "");
   const normalized = message.toLowerCase();
   if (!message) return "Aktualizacja zlecenia trigger.";
@@ -368,6 +375,7 @@ function displayInterval(value = "") {
 }
 
 function positionSide(position = {}) {
+  if (!isRecord(position)) return "";
   const raw = String(position.positionSide ?? position.side ?? position.direction ?? "").toUpperCase();
   if (raw.includes("LONG")) return "LONG";
   if (raw.includes("SHORT")) return "SHORT";
@@ -380,34 +388,38 @@ function positionSide(position = {}) {
 }
 
 function positionAmount(position = {}) {
+  if (!isRecord(position)) return 0;
   return Math.abs(Number(position.positionAmt ?? position.positionAmount ?? position.quantity ?? position.availableAmt ?? 0));
 }
 
 function positionEntry(position = {}) {
+  if (!isRecord(position)) return 0;
   return Number(position.entryPrice ?? position.avgPrice ?? position.averagePrice ?? position.positionAvgPrice ?? 0);
 }
 
 function positionPnl(position = {}) {
+  if (!isRecord(position)) return 0;
   return Number(position.unrealizedPnl ?? position.unrealizedProfit ?? position.pnl ?? 0);
 }
 
 function orderIdentifier(order = {}) {
-  return order.orderId ?? order.orderID ?? order.id ?? order.clientOrderId ?? order.clientOrderID ?? null;
+  return safeOrderId(order);
 }
 
 function orderType(order = {}) {
+  if (!isRecord(order)) return "";
   return String(order.type ?? order.orderType ?? order.origType ?? order.planType ?? order.stopOrderType ?? "").toUpperCase();
 }
 
 function stopProtectionOrder(position = {}) {
-  return (position.attachedOrders ?? []).find((order) => {
+  return safeObjectRows(position?.attachedOrders).find((order) => {
     const type = orderType(order);
     return type.includes("STOP") && !type.includes("TAKE");
   }) ?? null;
 }
 
 function takeProfitProtectionOrder(position = {}) {
-  return (position.attachedOrders ?? []).find((order) => {
+  return safeObjectRows(position?.attachedOrders).find((order) => {
     const type = orderType(order);
     return type.includes("TAKE") || type.includes("PROFIT");
   }) ?? null;
@@ -495,7 +507,7 @@ function liveProtectionState({ livePosition = null, pending = null, runtime = {}
 }
 
 function positionsForOperationalState(livestream, config = {}) {
-  const positions = livestream?.positions ?? [];
+  const positions = safeObjectRows(livestream?.positions);
   return positions.filter((position) => {
     const profile = normalizeProfileId(position.apiProfile ?? position.__apiProfileId ?? position.sourceProfileId ?? "");
     const configured = normalizeProfileId(config.apiProfile ?? "");
@@ -809,15 +821,15 @@ function classifyMarkerReality({ activeAnalysisSession, markerSource, selectedHi
 }
 
 function timelineFromRuntime(runtime = {}) {
-  const decisions = (runtime.currentDecisionTimeline ?? []).slice(-10).map((item) => ({
+  const decisions = safeObjectRows(runtime.currentDecisionTimeline).slice(-10).map((item) => ({
     time: item.time,
     text: item.text || readableDecisionText(item),
   }));
-  const journal = (runtime.currentSetupOrderJournal ?? []).slice(-8).map((item) => ({
+  const journal = safeObjectRows(runtime.currentSetupOrderJournal).slice(-8).map((item) => ({
     time: item.timestamp,
     text: readableJournalText(item),
   }));
-  const lifecycle = (runtime.pendingTriggerOrder?.orderLifecycle ?? []).slice(-5).map((item) => ({
+  const lifecycle = safeObjectRows(runtime.pendingTriggerOrder?.orderLifecycle).slice(-5).map((item) => ({
     time: item.time,
     text: polishLifecycleText(item),
   }));
@@ -829,7 +841,7 @@ function timelineFromRuntime(runtime = {}) {
     : [];
   const source = decisions.length ? [...decisions, ...journal] : [...setup, ...journal, ...lifecycle];
   return source
-    .filter((item) => item.text)
+    .filter((item) => isRecord(item) && item.text)
     .sort((left, right) => {
       const leftTime = typeof left.time === "number" ? left.time * 1000 : new Date(left.time ?? 0).getTime();
       const rightTime = typeof right.time === "number" ? right.time * 1000 : new Date(right.time ?? 0).getTime();
@@ -872,6 +884,7 @@ function readableDecisionText(item = {}) {
 }
 
 function readableJournalText(item = {}) {
+  if (!isRecord(item)) return "";
   const setup = item.setupId ? ` ${compactId(item.setupId)}` : "";
   const trigger = Number.isFinite(Number(item.triggerPrice)) ? ` @ ${formatChartPrice(item.triggerPrice)}` : "";
   const side = item.side ? ` ${polishSide(item.side)}` : "";
@@ -932,19 +945,46 @@ function normalizeSztabRuntimeForPanel(status = {}, interval) {
     ...(statusInterval.runtime ?? {}),
   };
   runtime.setupOrderJournal =
-    statusInterval.runtime?.setupOrderJournal ??
-    statusInterval.setupOrderJournal ??
-    configInterval.runtime?.setupOrderJournal ??
-    configInterval.setupOrderJournal ??
-    runtime.setupOrderJournal ??
-    [];
+    safeObjectRows(
+      statusInterval.runtime?.setupOrderJournal ??
+        statusInterval.setupOrderJournal ??
+        configInterval.runtime?.setupOrderJournal ??
+        configInterval.setupOrderJournal ??
+        runtime.setupOrderJournal,
+    );
+  runtime.currentSetupOrderJournal = safeObjectRows(
+    statusInterval.runtime?.currentSetupOrderJournal ??
+      configInterval.runtime?.currentSetupOrderJournal ??
+      runtime.currentSetupOrderJournal,
+  );
+  runtime.historicalSetupOrderJournal = safeObjectRows(
+    statusInterval.runtime?.historicalSetupOrderJournal ??
+      configInterval.runtime?.historicalSetupOrderJournal ??
+      runtime.historicalSetupOrderJournal,
+  );
+  runtime.currentDecisionTimeline = safeObjectRows(
+    statusInterval.runtime?.currentDecisionTimeline ??
+      configInterval.runtime?.currentDecisionTimeline ??
+      runtime.currentDecisionTimeline,
+  );
   runtime.pendingTriggerOrder =
-    statusInterval.runtime?.pendingTriggerOrder ??
-    statusInterval.pendingTriggerOrder ??
-    configInterval.runtime?.pendingTriggerOrder ??
-    configInterval.pendingTriggerOrder ??
-    runtime.pendingTriggerOrder ??
-    null;
+    isRecord(statusInterval.runtime?.pendingTriggerOrder)
+      ? statusInterval.runtime.pendingTriggerOrder
+      : isRecord(statusInterval.pendingTriggerOrder)
+        ? statusInterval.pendingTriggerOrder
+        : isRecord(configInterval.runtime?.pendingTriggerOrder)
+          ? configInterval.runtime.pendingTriggerOrder
+          : isRecord(configInterval.pendingTriggerOrder)
+            ? configInterval.pendingTriggerOrder
+            : isRecord(runtime.pendingTriggerOrder)
+              ? runtime.pendingTriggerOrder
+              : null;
+  if (runtime.pendingTriggerOrder) {
+    runtime.pendingTriggerOrder = {
+      ...runtime.pendingTriggerOrder,
+      orderLifecycle: safeObjectRows(runtime.pendingTriggerOrder.orderLifecycle),
+    };
+  }
   const runningFromRunner = runningIntervalSet(status).has(key);
   const rawStatus = String(runtime.status ?? "").toLowerCase();
   const operationalStatus = runningFromRunner && !["running", "degraded", "recovering", "error", "interrupted"].includes(rawStatus)
@@ -1002,7 +1042,7 @@ function runtimeDiagnostics(runtime = {}) {
     ["Execution mode", runtime.executionMode || runtime.pendingTriggerOrder?.executionMode || "--"],
     ["Runner started", runtime.currentRunnerStartedAt ? `${formatChartTime(runtime.currentRunnerStartedAt)} (${ageText(runtime.currentRunnerStartedAt)})` : runtime.startedAt ? `${formatChartTime(runtime.startedAt)} (${ageText(runtime.startedAt)})` : "--"],
     ["Current setup FP", runtime.currentSetupFingerprintShort || runtime.currentSetupFingerprint || runtime.activeSetupFingerprintShort || runtime.latestSetupFingerprint || "--"],
-    ["Current order ids", (runtime.currentLifecycleOrderIds ?? []).length ? runtime.currentLifecycleOrderIds.join(", ") : "--"],
+    ["Current order ids", safeStringRows(runtime.currentLifecycleOrderIds).length ? safeStringRows(runtime.currentLifecycleOrderIds).join(", ") : "--"],
     ["Historical stale rows", runtime.staleHistoricalOrderCount ?? 0],
     ["Decision reason", runtime.lastDecisionReason || "--"],
     ["Heartbeat", runtime.heartbeatAt ? `${formatChartTime(runtime.heartbeatAt)} (${ageText(runtime.heartbeatAt)})` : runtime.heartbeatAgeSeconds !== null && runtime.heartbeatAgeSeconds !== undefined ? `${runtime.heartbeatAgeSeconds}s temu` : "--"],
@@ -1022,12 +1062,12 @@ function deriveOperationalState({
 }) {
   const positions = positionsForOperationalState(livestream, config);
   const livePosition = positions[0] ?? null;
-  const pending = runtime.pendingTriggerOrder ?? null;
+  const pending = isRecord(runtime.pendingTriggerOrder) ? runtime.pendingTriggerOrder : null;
   const status = String(runtime.status ?? "stopped").toLowerCase();
   const pendingStatus = String(pending?.status ?? runtime.triggerOrderState ?? "").toLowerCase();
   const markerReality = classifyMarkerReality({ activeAnalysisSession, markerSource, selectedHistoricalWindow });
-  const setup = runtime.latestSetupEvent ?? null;
-  const formingCandidate = runtime.formingSetupCandidate ?? null;
+  const setup = isRecord(runtime.latestSetupEvent) ? runtime.latestSetupEvent : null;
+  const formingCandidate = isRecord(runtime.formingSetupCandidate) ? runtime.formingSetupCandidate : null;
   const setupIsActive = setup?.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE || String(setup?.status ?? "").toUpperCase() === "PENDING";
   const intervalName = displayInterval(interval);
   const triggerPrice = Number(pending?.triggerPrice ?? setup?.trigger ?? formingCandidate?.trigger);

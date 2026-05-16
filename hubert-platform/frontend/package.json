@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:sztab-runtime-guards": "node scripts/sztab-runtime-guards-regression.mjs"
   },
   "dependencies": {
     "lightweight-charts": "^5.2.0",
