@@ -1,4 +1,8 @@
-import { cancelLivePendingTriggerOrder, processLiveProfileExecution } from "../execution/executionEngine.js";
+import {
+  cancelLivePendingTriggerOrder,
+  ensureLiveExchangePositionProtectedOrClosed,
+  processLiveProfileExecution,
+} from "../execution/executionEngine.js";
 import { withSetupFingerprint } from "../execution/setupFingerprint.js";
 import { isSetupActionable, triggerEligibilityForSetup } from "../execution/setupActionability.js";
 import { runStrategyForProfile, runStrategyOnCandles } from "../strategy/strategyRunner.js";
@@ -255,14 +259,24 @@ function currentDecisionTimeline({ latestSetupEvent = null, pending = null, runt
         time: pending.marketSentAt ?? pending.updatedAt ?? null,
       });
     }
-    if (["filled_protected", "filled_sl_failed"].includes(String(pending.status ?? "").toLowerCase())) {
+    if ([
+      "filled_protected",
+      "filled_sl_failed",
+      "sl_protection_failed_emergency_closed",
+      "sl_protection_failed_emergency_close_failed",
+    ].includes(String(pending.status ?? "").toLowerCase())) {
+      const pendingStatus = String(pending.status ?? "").toLowerCase();
       timeline.push({
         event: "position_confirmed",
         orderId: pending.orderId ?? null,
         setupFingerprint: pending.setupFingerprint ?? "",
-        text: pending.status === "filled_protected"
-          ? "Pozycja została potwierdzona, a SL wysłany."
-          : "Pozycja została potwierdzona, ale SL wymaga kontroli.",
+        text: pendingStatus === "filled_protected"
+          ? "Pozycja została potwierdzona, a SL jest potwierdzony na BingX."
+          : pendingStatus === "sl_protection_failed_emergency_closed"
+            ? "Pozycja została potwierdzona, ale SL nie; backend zamknął ją awaryjnie MARKET."
+            : pendingStatus === "sl_protection_failed_emergency_close_failed"
+              ? "Pozycja została potwierdzona bez SL i awaryjne zamknięcie nie zostało potwierdzone."
+              : "Pozycja została potwierdzona, ale SL wymaga kontroli.",
         time: pending.fillDetectedAt ?? pending.updatedAt ?? null,
       });
     }
@@ -457,6 +471,8 @@ function terminalPendingStatus(status) {
     "reversal_close_succeeded_entry_failed",
     "setup_invalidated_before_platform_trigger",
     "simulated_only",
+    "sl_protection_failed_emergency_closed",
+    "sl_protection_failed_emergency_close_failed",
     "terminal_failed",
     "trigger_crossed_but_price_too_far",
     "trigger_order_rejected",
@@ -942,6 +958,94 @@ export function createSztabRunner({
     };
   }
 
+  async function reconcileStartupUnprotectedPositions(config) {
+    for (const interval of SZTAB_INTERVALS) {
+      const current = config.intervals[interval];
+      if (!current?.apiProfile) continue;
+
+      try {
+        const client = getApiProfileClient(current.apiProfile);
+        const existingProfile = liveProfiles.get(interval) ?? {};
+        const profile = configToProfile({
+          ...current,
+          apiProfileLabel: current.apiProfile,
+        }, existingProfile);
+        const positions = normalizeExchangeList(await client.getOpenPositions(profile.symbol))
+          .filter((position) => compactSymbol(position.symbol) === compactSymbol(profile.symbol) && positionAmount(position) > 0);
+
+        for (const position of positions) {
+          const pending = profile.live?.pendingTriggerOrder ?? current.runtime?.pendingTriggerOrder ?? null;
+          const setupContext = {
+            invalidationPrice: pending?.invalidationPrice ?? null,
+            setupFingerprint: pending?.setupFingerprint ?? null,
+            setupFingerprintShort: pending?.setupFingerprintShort ?? null,
+            setupId: pending?.setupId ?? null,
+            stopLoss: pending?.stopLoss ?? profile.live?.openPosition?.stopLoss ?? current.runtime?.latestSetupEvent?.stopLoss ?? null,
+            triggerPrice: pending?.triggerPrice ?? profile.live?.openPosition?.entryPrice ?? null,
+          };
+          const result = await ensureLiveExchangePositionProtectedOrClosed({
+            bingxClient: client,
+            logger: (message, context) => appendLog(message, { interval, profileId: profile.id, startupReconciliation: true, ...context }),
+            position,
+            profile,
+            setupContext,
+            store,
+          });
+
+          if (result.action === "already_protected") {
+            await persistRuntime(interval, {
+              livePositionConfirmed: true,
+              liveProtectionConfirmed: true,
+              lastDecision: "Backend startup found an existing BingX position with confirmed SL protection.",
+              lastDecisionReason: "startup_position_already_protected",
+              protectionOrderId: result.protectionOrderId ?? null,
+              protectionSource: result.protectionSource ?? "bingx_order",
+            });
+          } else if (result.action === "sl_placed") {
+            await persistRuntime(interval, {
+              livePositionConfirmed: true,
+              liveProtectionConfirmed: true,
+              lastDecision: "Backend startup found an unprotected BingX position and placed SL protection.",
+              lastDecisionReason: "startup_sl_protection_placed",
+              protectionOrderId: result.protectionOrderId ?? null,
+              protectionSource: result.protectionSource ?? "bingx_order",
+              setupOrderJournal: result.profile?.live?.setupOrderJournal ?? profile.live?.setupOrderJournal ?? [],
+            });
+          } else if (result.action === "emergency_closed") {
+            await persistRuntime(interval, {
+              livePositionConfirmed: false,
+              liveProtectionConfirmed: false,
+              lastDecision: "Backend startup found an unprotected BingX position and emergency-closed it MARKET.",
+              lastDecisionReason: "startup_unprotected_position_emergency_closed",
+              protectionSource: "emergency_closed",
+              setupOrderJournal: result.profile?.live?.setupOrderJournal ?? profile.live?.setupOrderJournal ?? [],
+            });
+          } else if (result.action === "emergency_close_failed") {
+            await persistRuntime(interval, {
+              error: "Startup reconciliation found an unprotected BingX position and emergency close was not confirmed.",
+              intervalBlockers: [{
+                reason: "Unprotected exchange position still exists after startup emergency close attempt",
+                source: "startup_protection_reconcile",
+                type: "unprotected_position_close_failed",
+              }],
+              livePositionConfirmed: true,
+              liveProtectionConfirmed: false,
+              lastDecision: "Backend startup found an unprotected BingX position, but emergency close was not confirmed.",
+              lastDecisionReason: "startup_unprotected_position_emergency_close_failed",
+              protectionSource: "unprotected_close_failed",
+              setupOrderJournal: result.profile?.live?.setupOrderJournal ?? profile.live?.setupOrderJournal ?? [],
+            });
+          }
+        }
+      } catch (error) {
+        await appendLog("Sztab startup protection reconciliation failed", {
+          error: error instanceof Error ? error.message : String(error),
+          interval,
+        });
+      }
+    }
+  }
+
   function statusFromConfigWithFreshPriceFeed(config) {
     const intervals = statusFromConfig(config);
     for (const interval of SZTAB_INTERVALS) {
@@ -1075,6 +1179,8 @@ export function createSztabRunner({
     if (changed) {
       await store.setSztabConfig(config);
     }
+
+    await reconcileStartupUnprotectedPositions(config);
 
     if (intervalsToResume.length) {
       for (const interval of intervalsToResume) {
@@ -1536,12 +1642,14 @@ export function createSztabRunner({
         setupFingerprint: latestSetupFingerprint || triggerSummary.setupFingerprint || "",
         setupFingerprintShort: latestSetupEvent?.setupFingerprintShort || triggerSummary.setupFingerprintShort || "",
         slPlacementStatus: pendingTriggerOrder?.status === "filled_protected"
-          ? "placed"
-          : pendingTriggerOrder?.status === "filled_sl_failed"
-            ? "failed"
-            : pendingTriggerOrder?.stopOrder
-              ? "placed"
-              : "not_placed",
+          ? "confirmed"
+          : pendingTriggerOrder?.status === "sl_protection_failed_emergency_closed"
+            ? "emergency_closed"
+            : ["filled_sl_failed", "sl_protection_failed_emergency_close_failed"].includes(String(pendingTriggerOrder?.status ?? ""))
+              ? "failed"
+              : pendingTriggerOrder?.stopOrder
+                ? "unconfirmed"
+                : "not_placed",
         setupOrderJournal: triggerSummary.setupOrderJournal,
         staleEntryIgnoredReason: staleEntryIgnoredReason || lastSignalStaleReason,
         supersededBySetupFingerprint: triggerSummary.supersededBySetupFingerprint,
@@ -1672,7 +1780,7 @@ export function createSztabRunner({
       platformTriggerDiagnostics: pending?.platformTriggerDiagnostics ?? null,
       platformTriggerSkippedReason: pending?.skippedReason ?? "",
       platformTriggerSlippagePct: pending?.triggerSlippagePct ?? null,
-      protectionOrderId: live?.protectionOrderId ?? pending?.stopOrder?.orderId ?? pending?.stopOrder?.data?.orderId ?? null,
+      protectionOrderId: live?.protectionOrderId ?? pending?.protectionOrderId ?? pending?.stopOrder?.orderId ?? pending?.stopOrder?.data?.orderId ?? null,
       protectionSource: live?.protectionSource ?? pending?.protectionSource ?? (pending ? "local_planned" : "none"),
       reversalFromDirection: pending?.reversalFromDirection ?? "",
       reversalReason: pending?.reversalReason ?? "",
@@ -1693,7 +1801,13 @@ export function createSztabRunner({
       triggerMarginDiagnostics: pending?.failureDiagnostics ?? pending?.placementDiagnostics ?? null,
       triggerFailureClassification: pending?.failureClassification ?? "",
       triggerOrderExecutedQty: pending?.executedQty ?? null,
-      triggerOrderFillDetected: ["filled_protected", "filled_sl_failed", "filled_but_position_missing"].includes(status.toLowerCase()),
+      triggerOrderFillDetected: [
+        "filled_protected",
+        "filled_sl_failed",
+        "filled_but_position_missing",
+        "sl_protection_failed_emergency_closed",
+        "sl_protection_failed_emergency_close_failed",
+      ].includes(status.toLowerCase()),
       triggerOrderState: status,
     };
   }
@@ -1711,9 +1825,11 @@ export function createSztabRunner({
     if (status === "market_sent_position_missing") return "Platform MARKET was sent, but no matching live position was found after sync.";
     if (status === "platform_blocked_existing_position") return "Platform trigger crossed, but a matching live position already exists.";
     if (status === "filled_protected" && pending.isReversal) return "Reversal wykonany.";
-    if (status === "filled_protected") return "Trigger order fill detected; SL protection placement requested.";
+    if (status === "filled_protected") return "Trigger order fill detected; SL protection confirmed on BingX.";
     if (status === "filled_sl_failed" && pending.isReversal) return "Reversal wykonał wejście, ale SL nie został potwierdzony. Wymagana kontrola ręczna.";
     if (status === "filled_sl_failed") return "Trigger order filled but SL placement failed. Manual crisis management required.";
+    if (status === "sl_protection_failed_emergency_closed") return "Po wejściu SL nie został potwierdzony, więc backend awaryjnie zamknął pozycję MARKET.";
+    if (status === "sl_protection_failed_emergency_close_failed") return "Po wejściu SL nie został potwierdzony i awaryjne zamknięcie nie zostało potwierdzone. Wymagana pilna kontrola.";
     if (status === "filled_but_position_missing") return "Trigger order reports fill, but no matching position was found after sync.";
     if (status === "invalidated_before_fill") return "Setup invalidated before trigger fill; pending trigger order was cancelled.";
     if (status === "reversal_close_failed") return "Przeciwny trigger przebity, ale nie udało się zamknąć starej pozycji. Nowa pozycja nie została otwarta.";
@@ -1894,10 +2010,12 @@ export function createSztabRunner({
       staleEntryIgnoredReason: triggerSummary.staleEntryIgnoredReason,
       staleLatestEntryFingerprint: triggerSummary.staleLatestEntryFingerprint,
       slPlacementStatus: nextPending?.status === "filled_protected"
-        ? "placed"
-        : nextPending?.status === "filled_sl_failed"
-          ? "failed"
-          : "not_placed",
+        ? "confirmed"
+        : nextPending?.status === "sl_protection_failed_emergency_closed"
+          ? "emergency_closed"
+          : ["filled_sl_failed", "sl_protection_failed_emergency_close_failed"].includes(String(nextPending?.status ?? ""))
+            ? "failed"
+            : "not_placed",
       status: "running",
       supersededBySetupId: triggerSummary.supersededBySetupId,
       supersededBySetupFingerprint: triggerSummary.supersededBySetupFingerprint,

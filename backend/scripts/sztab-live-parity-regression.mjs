@@ -1,4 +1,7 @@
-import { processLiveProfileExecution } from "../src/execution/executionEngine.js";
+import {
+  ensureLiveExchangePositionProtectedOrClosed,
+  processLiveProfileExecution,
+} from "../src/execution/executionEngine.js";
 import { STRATEGY_EVENT_TYPES } from "../../hubert-platform/frontend/src/engine/strategyEngine.js";
 
 function assert(condition, message) {
@@ -150,9 +153,10 @@ function createPriceService({ mode = "websocket", price = 101, recentTicks = nul
   };
 }
 
-function createBingxClient({ initialPositions = [] } = {}) {
+function createBingxClient({ confirmStopOrders = true, initialPositions = [], slFails = false } = {}) {
   const calls = [];
   let positions = [...initialPositions];
+  const openOrders = [];
   return {
     auth: { configured: true },
     calls,
@@ -171,6 +175,7 @@ function createBingxClient({ initialPositions = [] } = {}) {
       return { data: { orderId: "close-1", status: "FILLED" } };
     },
     getOpenPositions: async () => positions,
+    getOpenOrders: async () => openOrders,
     getPerpetualFuturesBalance: async () => ({
       balance: {
         availableBalance: 10_000,
@@ -194,7 +199,19 @@ function createBingxClient({ initialPositions = [] } = {}) {
     },
     placePositionStopLoss: async (symbol, side, stopLoss, options = {}) => {
       calls.push({ options, side, stopLoss, symbol, type: "placePositionStopLoss" });
-      return { data: { orderId: "sl-1", status: "NEW" } };
+      if (slFails) {
+        throw new Error("mock SL placement failed");
+      }
+      const order = {
+        orderId: `sl-${openOrders.length + 1}`,
+        positionSide: options.positionSide ?? (side === "BUY" ? "LONG" : "SHORT"),
+        status: "NEW",
+        stopPrice: stopLoss,
+        symbol,
+        type: "STOP_MARKET",
+      };
+      if (confirmStopOrders) openOrders.push(order);
+      return { data: order };
     },
     setLeverage: async (symbol, leverage, side) => {
       calls.push({ leverage, side, symbol, type: "setLeverage" });
@@ -473,6 +490,108 @@ async function assertPostEligibilityWebsocketTickExecutes() {
   assert(client.calls.some((call) => call.type === "placeMarketOrder" && call.side === "BUY"), "Post-eligibility trigger did not send MARKET.");
 }
 
+async function assertPlatformModeIgnoresLegacyMarkInvalidation() {
+  process.env.SZTAB_EXECUTION_MODE = "platform_market_trigger";
+  const client = createBingxClient();
+  const priceService = createPriceService({ price: 94 });
+  const armed = await processLiveProfileExecution({
+    bingxClient: client,
+    logger: async () => {},
+    priceService,
+    profile: {
+      ...baseProfile(),
+      live: {
+        openPosition: null,
+        orderLog: [],
+        pendingTriggerOrder: {
+          direction: "LONG",
+          executionMode: "platform_market_trigger",
+          invalidationPrice: 95,
+          invalidationSource: "mark_price",
+          positionSide: "LONG",
+          quantity: 1,
+          setupFingerprint: "sf-legacy-mark",
+          setupId: "legacy-mark",
+          side: "BUY",
+          status: "platform_armed",
+          stopLoss: 95,
+          triggerPrice: 100,
+        },
+        setupOrderJournal: [],
+      },
+    },
+    store,
+    strategyResult: strategyResult(),
+  });
+  assert(armed.live.pendingTriggerOrder?.status === "platform_armed", "Platform mode invalidated setup from mark_price.");
+  assert(armed.live.pendingTriggerOrder?.invalidationSource === "ignored_legacy_mark_price", "Legacy mark_price invalidation was not explicitly ignored.");
+  assert(!client.calls.some((call) => call.type === "placeMarketOrder"), "Legacy mark_price invalidation path sent an order.");
+}
+
+async function assertSlFailureEmergencyClosesPosition() {
+  process.env.SZTAB_EXECUTION_MODE = "platform_market_trigger";
+  const client = createBingxClient({ slFails: true });
+  const event = entryEvent({ direction: "LONG", setupId: "sl-fails", stopLoss: 95, trigger: 100 });
+  const result = await processLiveProfileExecution({
+    bingxClient: client,
+    logger: async () => {},
+    priceService: createPriceService({ price: 100 }),
+    profile: baseProfile(),
+    store,
+    strategyResult: strategyResult({ events: [event], latestEvent: event }),
+  });
+  assert(result.live.pendingTriggerOrder?.status === "sl_protection_failed_emergency_closed", "SL failure did not emergency-close the position.");
+  assert(client.calls.some((call) => call.type === "closePosition"), "Emergency close was not called after SL failure.");
+  assert(!result.live.openPosition, "Local live position remained open after confirmed emergency close.");
+}
+
+async function assertFilledProtectedRequiresConfirmedStopOrder() {
+  process.env.SZTAB_EXECUTION_MODE = "platform_market_trigger";
+  const client = createBingxClient({ confirmStopOrders: false });
+  const event = entryEvent({ direction: "LONG", setupId: "sl-unconfirmed", stopLoss: 95, trigger: 100 });
+  const result = await processLiveProfileExecution({
+    bingxClient: client,
+    logger: async () => {},
+    priceService: createPriceService({ price: 100 }),
+    profile: baseProfile(),
+    store,
+    strategyResult: strategyResult({ events: [event], latestEvent: event }),
+  });
+  assert(result.live.pendingTriggerOrder?.status !== "filled_protected", "Unconfirmed SL was incorrectly marked filled_protected.");
+  assert(result.live.pendingTriggerOrder?.status === "sl_protection_failed_emergency_closed", "Unconfirmed SL did not trigger emergency close.");
+}
+
+async function assertStartupUnprotectedPositionIsEmergencyClosed() {
+  const client = createBingxClient({
+    initialPositions: [{
+      avgPrice: 100,
+      positionAmt: 1,
+      positionId: "startup-long",
+      positionSide: "LONG",
+      quantity: 1,
+      symbol: "SOLUSDT",
+    }],
+    slFails: true,
+  });
+  const result = await ensureLiveExchangePositionProtectedOrClosed({
+    bingxClient: client,
+    logger: async () => {},
+    position: {
+      avgPrice: 100,
+      positionAmt: 1,
+      positionId: "startup-long",
+      positionSide: "LONG",
+      quantity: 1,
+      symbol: "SOLUSDT",
+    },
+    profile: baseProfile(),
+    setupContext: { setupId: "startup", stopLoss: 95, triggerPrice: 100 },
+    store,
+  });
+  assert(result.action === "emergency_closed", `Startup unprotected position was not emergency-closed: ${result.action}`);
+  assert(client.calls.some((call) => call.type === "closePosition"), "Startup reconciliation did not call emergency close.");
+}
+
 await assertArmedSetupBinanceCrossSendsMarket();
 await assertStrategyEntryDoesNotRequireLivePriceCross();
 await assertReversalClosesThenOpensOpposite();
@@ -480,4 +599,8 @@ await assertStrategyInvalidationCancelsSetup();
 await assertStaleEntryDifferentFingerprintDoesNotExecuteCurrentSetup();
 await assertPreEligibilityWebsocketTickDoesNotExecute();
 await assertPostEligibilityWebsocketTickExecutes();
+await assertPlatformModeIgnoresLegacyMarkInvalidation();
+await assertSlFailureEmergencyClosesPosition();
+await assertFilledProtectedRequiresConfirmedStopOrder();
+await assertStartupUnprotectedPositionIsEmergencyClosed();
 console.log("Sztab live parity regression passed");

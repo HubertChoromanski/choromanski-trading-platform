@@ -96,10 +96,12 @@ const store = createStore();
 function createBingxClient() {
   const calls = [];
   let positions = [];
+  const openOrders = [];
   return {
     auth: { configured: true },
     calls,
     getOpenPositions: async () => positions,
+    getOpenOrders: async () => openOrders,
     getPerpetualFuturesBalance: async () => ({
       balance: {
         availableBalance: 100,
@@ -122,7 +124,16 @@ function createBingxClient() {
     },
     placePositionStopLoss: async (symbol, side, stopLoss, options = {}) => {
       calls.push({ options, side, stopLoss, symbol, type: "placePositionStopLoss" });
-      return { data: { orderId: "sl-risk-test", status: "NEW" } };
+      const order = {
+        orderId: "sl-risk-test",
+        positionSide: options.positionSide ?? (side === "BUY" ? "LONG" : "SHORT"),
+        status: "NEW",
+        stopPrice: stopLoss,
+        symbol,
+        type: "STOP_MARKET",
+      };
+      openOrders.push(order);
+      return { data: order };
     },
     setLeverage: async (symbol, leverage, side) => {
       calls.push({ leverage, side, symbol, type: "setLeverage" });

@@ -81,10 +81,12 @@ function createStore() {
 function createBingxClient() {
   const calls = [];
   let positions = [];
+  const openOrders = [];
   return {
     auth: { configured: true },
     calls,
     getOpenPositions: async () => positions,
+    getOpenOrders: async () => openOrders,
     getPerpetualFuturesBalance: async () => ({
       balance: {
         availableBalance: 10_000,
@@ -107,7 +109,16 @@ function createBingxClient() {
     },
     placePositionStopLoss: async (symbol, side, stopLoss, options = {}) => {
       calls.push({ options, side, stopLoss, symbol, type: "placePositionStopLoss" });
-      return { data: { orderId: "sl-gate-test", status: "NEW" } };
+      const order = {
+        orderId: "sl-gate-test",
+        positionSide: options.positionSide ?? (side === "BUY" ? "LONG" : "SHORT"),
+        status: "NEW",
+        stopPrice: stopLoss,
+        symbol,
+        type: "STOP_MARKET",
+      };
+      openOrders.push(order);
+      return { data: order };
     },
     placeTriggerMarketOrder: async () => {
       calls.push({ type: "placeTriggerMarketOrder" });

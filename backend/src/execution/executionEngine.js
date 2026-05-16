@@ -1069,6 +1069,463 @@ async function placeLiveTakeProfitIfEnabled({
   }
 }
 
+function slProtectionRetryCount() {
+  const configured = Number(process.env.SZTAB_SL_PROTECTION_RETRIES ?? 1);
+  return Number.isFinite(configured) && configured >= 0 ? Math.floor(configured) : 1;
+}
+
+function slProtectionRetryDelayMs() {
+  const configured = Number(process.env.SZTAB_SL_PROTECTION_RETRY_MS ?? 250);
+  return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 250;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function orderIdentifier(order = {}) {
+  const normalized = resultOrder(order);
+  return normalized?.orderId ?? normalized?.orderID ?? normalized?.id ?? order?.orderId ?? order?.orderID ?? order?.id ?? null;
+}
+
+function orderSymbol(order = {}) {
+  const normalized = resultOrder(order);
+  return compactSymbol(normalized?.symbol ?? order?.symbol ?? "");
+}
+
+function orderPositionSide(order = {}) {
+  const normalized = resultOrder(order);
+  return positionSideFromPosition(normalized?.positionSide ?? order?.positionSide ?? order);
+}
+
+function isActiveExchangeOrder(order = {}) {
+  const status = String(resultOrder(order)?.status ?? order?.status ?? "").toUpperCase();
+  return !["CANCELED", "CANCELLED", "EXPIRED", "FAILED", "FILLED", "REJECTED"].includes(status);
+}
+
+function isStopProtectionOrder(order = {}, { positionSide = "", stopOrder = null, symbol = "" } = {}) {
+  const normalized = resultOrder(order);
+  const type = String(normalized?.type ?? order?.type ?? "").toUpperCase();
+  if (!type.includes("STOP") || type.includes("TAKE")) return false;
+  if (!isActiveExchangeOrder(order)) return false;
+
+  const expectedSymbol = compactSymbol(symbol);
+  if (expectedSymbol && orderSymbol(order) && orderSymbol(order) !== expectedSymbol) return false;
+
+  const expectedSide = positionSide ? String(positionSide).toUpperCase() : "";
+  if (expectedSide && orderPositionSide(order) !== expectedSide) return false;
+
+  const placedOrderId = orderIdentifier(stopOrder);
+  if (!placedOrderId) return true;
+  return orderIdentifier(order) === placedOrderId || !orderIdentifier(order);
+}
+
+async function confirmStopProtection({
+  bingxClient,
+  position = null,
+  positionSide = "",
+  stopOrder = null,
+  symbol,
+}) {
+  if (typeof bingxClient?.getOpenOrders !== "function") {
+    return {
+      confirmed: false,
+      openOrders: [],
+      protectionOrder: null,
+      protectionOrderId: null,
+      protectionSource: "open_orders_unavailable",
+      reason: "open_orders_endpoint_unavailable",
+    };
+  }
+
+  try {
+    const openOrders = normalizeExchangeList(await bingxClient.getOpenOrders(symbol));
+    const side = positionSide || positionSideFromPosition(position);
+    const protectionOrder = openOrders.find((order) =>
+      isStopProtectionOrder(order, { positionSide: side, stopOrder, symbol }));
+    return {
+      confirmed: Boolean(protectionOrder),
+      openOrders,
+      protectionOrder,
+      protectionOrderId: orderIdentifier(protectionOrder),
+      protectionSource: protectionOrder ? "bingx_order" : "missing",
+      reason: protectionOrder ? "stop_order_found_after_fresh_sync" : "stop_order_missing_after_fresh_sync",
+    };
+  } catch (error) {
+    return {
+      confirmed: false,
+      error: error?.bingx ?? { message: error instanceof Error ? error.message : String(error) },
+      openOrders: [],
+      protectionOrder: null,
+      protectionOrderId: null,
+      protectionSource: "sync_error",
+      reason: "open_orders_sync_failed",
+    };
+  }
+}
+
+async function placeStopLossOnce({
+  bingxClient,
+  pending = {},
+  position = null,
+  profile,
+  protectiveQuantity,
+  side,
+}) {
+  try {
+    return await bingxClient.placePositionStopLoss(profile.symbol, side, pending.stopLoss, {
+      position,
+      positionId: positionIdentifier(position),
+      positionSide: pending.positionSide,
+      quantity: protectiveQuantity,
+    });
+  } catch (error) {
+    if (typeof bingxClient?.placeStopLoss !== "function") throw error;
+    return bingxClient.placeStopLoss(profile.symbol, side, pending.stopLoss, protectiveQuantity, {
+      position,
+      positionId: positionIdentifier(position),
+      positionSide: pending.positionSide,
+    });
+  }
+}
+
+async function emergencyClosePosition({
+  bingxClient,
+  position = null,
+  positionSide = "",
+  profile,
+}) {
+  let closeResponse = null;
+  try {
+    closeResponse = await bingxClient.closePosition(profile.symbol, {
+      position,
+      positionSide: positionSide || positionSideFromPosition(position),
+    });
+  } catch (error) {
+    return {
+      closeError: error?.bingx ?? { message: error instanceof Error ? error.message : String(error) },
+      closeResponse: error?.bingx ?? null,
+      emergencyClosed: false,
+      positionsAfterClose: [],
+      positionStillOpen: true,
+    };
+  }
+
+  let positionsAfterClose = [];
+  let positionStillOpen = false;
+  try {
+    positionsAfterClose = normalizeExchangeList(await bingxClient.getOpenPositions(profile.symbol));
+    positionStillOpen = Boolean(matchingExchangePosition(positionsAfterClose, {
+      positionSide: positionSide || positionSideFromPosition(position),
+      symbol: profile.symbol,
+    }));
+  } catch (error) {
+    return {
+      closeError: error?.bingx ?? { message: error instanceof Error ? error.message : String(error) },
+      closeResponse,
+      emergencyClosed: false,
+      positionsAfterClose,
+      positionStillOpen: true,
+    };
+  }
+
+  return {
+    closeError: null,
+    closeResponse,
+    emergencyClosed: !positionStillOpen,
+    positionsAfterClose,
+    positionStillOpen,
+  };
+}
+
+async function protectLivePositionOrEmergencyClose({
+  bingxClient,
+  logger = async () => {},
+  pending = {},
+  position = null,
+  profile,
+  protectiveQuantity,
+  side,
+}) {
+  const protectionAttempts = [];
+  const totalAttempts = Math.max(1, 1 + slProtectionRetryCount());
+  const stopLoss = numericValue(pending.stopLoss);
+  const positionSide = pending.positionSide || positionSideFromPosition(position);
+
+  if (stopLoss !== null && stopLoss > 0) {
+    let lastPlacedStopOrder = null;
+    for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
+      let stopOrder = lastPlacedStopOrder;
+      let placementError = null;
+      if (!stopOrder) {
+        try {
+          stopOrder = await placeStopLossOnce({
+            bingxClient,
+            pending,
+            position,
+            profile,
+            protectiveQuantity,
+            side,
+          });
+          lastPlacedStopOrder = stopOrder;
+        } catch (error) {
+          placementError = error?.bingx ?? { message: error instanceof Error ? error.message : String(error) };
+        }
+      }
+
+      const confirmation = placementError
+        ? { confirmed: false, reason: "sl_place_failed", error: placementError }
+        : await confirmStopProtection({
+          bingxClient,
+          position,
+          positionSide,
+          stopOrder,
+          symbol: profile.symbol,
+        });
+
+      protectionAttempts.push({
+        attempt,
+        confirmation,
+        placedOrderId: resultOrderId(stopOrder),
+        placementError,
+        stopOrder,
+        time: new Date().toISOString(),
+      });
+
+      if (confirmation.confirmed) {
+        let takeProfitOrder = null;
+        try {
+          takeProfitOrder = await placeLiveTakeProfitIfEnabled({
+            bingxClient,
+            logger,
+            pending,
+            position,
+            profile,
+            protectiveQuantity,
+            side,
+          });
+        } catch (error) {
+          appendSetupOrderJournal(profile, {
+            event: "take_profit_failed_after_sl_confirmed",
+            exchangeResponseSummary: summarizeExchangeResponse(error?.bingx ?? null),
+            failureClassification: "take_profit_failed_after_sl_confirmed",
+            interval: profile.timeframe,
+            quantity: protectiveQuantity,
+            reason: error instanceof Error ? error.message : String(error),
+            setupFingerprint: pending.setupFingerprint,
+            setupFingerprintShort: pending.setupFingerprintShort,
+            setupId: pending.setupId,
+            side,
+            status: "tp_failed_after_sl_confirmed",
+            triggerPrice: pending.triggerPrice,
+          });
+          await logger("take profit placement failed after SL confirmation", {
+            error: error instanceof Error ? error.message : String(error),
+            mode: "live",
+            profileId: profile.id,
+            setupFingerprint: pending.setupFingerprint,
+            setupId: pending.setupId,
+          });
+        }
+        appendSetupOrderJournal(profile, {
+          event: "sl_protection_confirmed",
+          interval: profile.timeframe,
+          orderId: resultOrderId(stopOrder),
+          protectionOrderId: confirmation.protectionOrderId,
+          protectionSource: confirmation.protectionSource,
+          quantity: protectiveQuantity,
+          setupFingerprint: pending.setupFingerprint,
+          setupFingerprintShort: pending.setupFingerprintShort,
+          setupId: pending.setupId,
+          side,
+          slPlaced: true,
+          status: "sl_confirmed",
+          stopLoss,
+          triggerPrice: pending.triggerPrice,
+        });
+        return {
+          critical: "",
+          emergencyClose: null,
+          emergencyClosed: false,
+          protectionAttempts,
+          protectionConfirmed: true,
+          protectionOrderId: confirmation.protectionOrderId,
+          protectionSource: confirmation.protectionSource,
+          stopOrder,
+          stopOrderVerification: confirmation,
+          takeProfitOrder,
+        };
+      }
+
+      await logger("SL protection attempt not confirmed", {
+        attempt,
+        mode: "live",
+        profileId: profile.id,
+        reason: confirmation.reason,
+        setupFingerprint: pending.setupFingerprint,
+        setupId: pending.setupId,
+      });
+
+      if (attempt < totalAttempts && slProtectionRetryDelayMs() > 0) {
+        await sleep(slProtectionRetryDelayMs());
+      }
+    }
+  } else {
+    protectionAttempts.push({
+      attempt: 0,
+      confirmation: { confirmed: false, reason: "missing_stop_loss" },
+      placementError: "missing_stop_loss",
+      stopOrder: null,
+      time: new Date().toISOString(),
+    });
+  }
+
+  const emergencyClose = await emergencyClosePosition({
+    bingxClient,
+    position,
+    positionSide,
+    profile,
+  });
+  const status = emergencyClose.emergencyClosed
+    ? "sl_protection_failed_emergency_closed"
+    : "sl_protection_failed_emergency_close_failed";
+  appendSetupOrderJournal(profile, {
+    emergencyCloseResponse: summarizeExchangeResponse(emergencyClose.closeResponse),
+    event: status,
+    failureClassification: status,
+    interval: profile.timeframe,
+    positionStillOpen: emergencyClose.positionStillOpen,
+    protectionAttempts: protectionAttempts.map((attempt) => ({
+      attempt: attempt.attempt,
+      confirmed: Boolean(attempt.confirmation?.confirmed),
+      placedOrderId: attempt.placedOrderId ?? null,
+      reason: attempt.confirmation?.reason ?? attempt.placementError?.message ?? attempt.placementError ?? "",
+    })),
+    quantity: protectiveQuantity,
+    reason: status,
+    setupFingerprint: pending.setupFingerprint,
+    setupFingerprintShort: pending.setupFingerprintShort,
+    setupId: pending.setupId,
+    side,
+    slPlaced: false,
+    status,
+    stopLoss,
+    triggerPrice: pending.triggerPrice,
+  });
+  await logger("SL protection failed; emergency close attempted", {
+    emergencyClosed: emergencyClose.emergencyClosed,
+    mode: "live",
+    positionStillOpen: emergencyClose.positionStillOpen,
+    profileId: profile.id,
+    setupFingerprint: pending.setupFingerprint,
+    setupId: pending.setupId,
+  });
+
+  return {
+    critical: status,
+    emergencyClose,
+    emergencyClosed: emergencyClose.emergencyClosed,
+    protectionAttempts,
+    protectionConfirmed: false,
+    protectionOrderId: null,
+    protectionSource: emergencyClose.emergencyClosed ? "emergency_closed" : "unprotected_close_failed",
+    stopOrder: null,
+    stopOrderVerification: protectionAttempts.at(-1)?.confirmation ?? null,
+    takeProfitOrder: null,
+  };
+}
+
+export async function ensureLiveExchangePositionProtectedOrClosed({
+  bingxClient,
+  logger = async () => {},
+  position = null,
+  profile,
+  setupContext = {},
+  store = null,
+}) {
+  if (!position || !profile) {
+    return { action: "none", profile, reason: "position_or_profile_missing" };
+  }
+
+  const positionSide = positionSideFromPosition(position);
+  const side = sideForDirection(positionSide);
+  const stopLoss = numericValue(
+    setupContext.stopLoss ??
+      setupContext.invalidationPrice ??
+      profile.live?.pendingTriggerOrder?.stopLoss ??
+      profile.live?.openPosition?.stopLoss,
+  );
+  const existingProtection = await confirmStopProtection({
+    bingxClient,
+    position,
+    positionSide,
+    stopOrder: null,
+    symbol: profile.symbol,
+  });
+
+  if (existingProtection.confirmed) {
+    return {
+      action: "already_protected",
+      profile,
+      protectionConfirmed: true,
+      protectionOrderId: existingProtection.protectionOrderId,
+      protectionSource: existingProtection.protectionSource,
+    };
+  }
+
+  const pseudoPending = {
+    direction: positionSide,
+    entryEvent: setupContext.entryEvent ?? null,
+    positionSide,
+    setupFingerprint: setupContext.setupFingerprint ?? profile.live?.pendingTriggerOrder?.setupFingerprint ?? null,
+    setupFingerprintShort: setupContext.setupFingerprintShort ?? profile.live?.pendingTriggerOrder?.setupFingerprintShort ?? null,
+    setupId: setupContext.setupId ?? profile.live?.pendingTriggerOrder?.setupId ?? "startup-reconcile",
+    side,
+    status: "startup_protection_reconcile",
+    stopLoss,
+    triggerPrice: setupContext.triggerPrice ?? positionEntryPrice(position) ?? null,
+  };
+  const protectiveQuantity = positionAmount(position);
+
+  const result = await protectLivePositionOrEmergencyClose({
+    bingxClient,
+    logger,
+    pending: pseudoPending,
+    position,
+    profile,
+    protectiveQuantity,
+    side,
+  });
+
+  if (result.protectionConfirmed && store && result.stopOrder) {
+    await store.upsertOrder({
+      id: String(result.protectionOrderId ?? resultOrderId(result.stopOrder) ?? `${pseudoPending.setupId}-startup-sl`),
+      mode: "live",
+      profileId: profile.id,
+      raw: result.stopOrder,
+      setupFingerprint: pseudoPending.setupFingerprint,
+      setupFingerprintShort: pseudoPending.setupFingerprintShort,
+      setupId: pseudoPending.setupId,
+      side: closeSideForPositionSide(positionSide),
+      status: "SENT",
+      symbol: profile.symbol,
+      type: "STOP_MARKET",
+    });
+  }
+
+  return {
+    action: result.protectionConfirmed
+      ? "sl_placed"
+      : result.emergencyClosed
+        ? "emergency_closed"
+        : "emergency_close_failed",
+    ...result,
+    profile,
+  };
+}
+
 function sztabExecutionMode() {
   const value = String(process.env.SZTAB_EXECUTION_MODE ?? "platform_market_trigger").toLowerCase();
   return value === "exchange_trigger" ? "exchange_trigger" : "platform_market_trigger";
@@ -1507,6 +1964,8 @@ function nonRetryPendingStatuses() {
     "reversal_close_succeeded_entry_failed",
     "risk_blocked",
     "setup_invalidated_before_platform_trigger",
+    "sl_protection_failed_emergency_closed",
+    "sl_protection_failed_emergency_close_failed",
     "terminal_canceled",
     "terminal_cancelled",
     "terminal_expired",
@@ -1770,7 +2229,24 @@ async function cancelPendingTriggerIfInvalidated({
   let pending = activePendingTriggerOrder(updatedProfile.live?.pendingTriggerOrder);
   if (!pending) return updatedProfile;
 
+  const platformMode = String(pending.executionMode ?? "").toLowerCase() === "platform_market_trigger";
   const strategyInvalidation = pendingInvalidationEvent(strategyResult, pending);
+  if (platformMode && !strategyInvalidation && String(pending.invalidationSource ?? "").toLowerCase() === "mark_price") {
+    updatedProfile.live.pendingTriggerOrder = {
+      ...pending,
+      invalidationSource: "ignored_legacy_mark_price",
+      legacyMarkPriceInvalidationIgnoredAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await logger("ignored legacy mark_price invalidation in platform_market_trigger mode", {
+      fingerprint: pending.setupFingerprint,
+      mode: "live",
+      profileId: updatedProfile.id,
+      setupId: pending.setupId,
+    });
+    return updatedProfile;
+  }
+
   const invalidation = strategyInvalidation
     ? {
         event: strategyInvalidation,
@@ -1796,7 +2272,6 @@ async function cancelPendingTriggerIfInvalidated({
     setupId: pending.setupId,
   });
 
-  const platformMode = String(pending.executionMode ?? "").toLowerCase() === "platform_market_trigger";
   const terminalStatus = platformMode ? "setup_invalidated_before_platform_trigger" : "invalidated_before_fill";
   const terminalReason = platformMode ? "setup_invalidated_before_platform_trigger" : "setup_invalidated_before_fill";
 
@@ -1819,7 +2294,7 @@ async function cancelPendingTriggerIfInvalidated({
       markPriceAtInvalidation: invalidation.markPrice,
     },
     failureClassification: terminalReason,
-    journalEvent: "setup_invalidated_before_fill",
+    journalEvent: platformMode ? "setup_invalidated_by_strategy" : "setup_invalidated_before_fill",
     logger,
     profile: updatedProfile,
     reason: terminalReason,
@@ -1847,6 +2322,8 @@ function normalizeExchangeList(value) {
   if (Array.isArray(value?.positions)) return value.positions;
   if (Array.isArray(value?.orders)) return value.orders;
   if (Array.isArray(value?.data)) return value.data;
+  if (Array.isArray(value?.data?.positions)) return value.data.positions;
+  if (Array.isArray(value?.data?.orders)) return value.data.orders;
   return value ? [value] : [];
 }
 
@@ -3078,44 +3555,20 @@ async function processPlatformMarketTrigger({
   }
 
   const protectiveQuantity = positionAmount(position) || quantity;
-  let stopOrder = null;
-  let takeProfitOrder = null;
-  let critical = "";
-
-  try {
-    try {
-      stopOrder = await bingxClient.placePositionStopLoss(updatedProfile.symbol, pending.side, pending.stopLoss, {
-        position,
-        positionId: positionIdentifier(position),
-        positionSide: pending.positionSide,
-        quantity: protectiveQuantity,
-      });
-    } catch {
-      stopOrder = await bingxClient.placeStopLoss(updatedProfile.symbol, pending.side, pending.stopLoss, protectiveQuantity, {
-        position,
-        positionId: positionIdentifier(position),
-        positionSide: pending.positionSide,
-      });
-    }
-
-    takeProfitOrder = await placeLiveTakeProfitIfEnabled({
-      bingxClient,
-      logger,
-      pending,
-      position,
-      profile: updatedProfile,
-      protectiveQuantity,
-      side: pending.side,
-    });
-  } catch (error) {
-    critical = error instanceof Error ? error.message : String(error);
-    await logger("SL placement after platform market entry failed", {
-      error: critical,
-      mode: "live",
-      profileId: updatedProfile.id,
-      setupId: pending.setupId,
-    });
-  }
+  const protection = await protectLivePositionOrEmergencyClose({
+    bingxClient,
+    logger,
+    pending,
+    position,
+    profile: updatedProfile,
+    protectiveQuantity,
+    side: pending.side,
+  });
+  const stopOrder = protection.stopOrder;
+  const takeProfitOrder = protection.takeProfitOrder;
+  const critical = protection.critical;
+  const protectionConfirmed = protection.protectionConfirmed === true;
+  const terminalUnprotectedStatus = critical || "sl_protection_failed_emergency_close_failed";
 
   const executionPrice = positionEntryPrice(position) ?? markPrice ?? pending.triggerPrice;
   const fillTime = Math.floor(Date.now() / 1000);
@@ -3128,9 +3581,9 @@ async function processPlatformMarketTrigger({
     trigger: executionPrice,
   };
 
-  if (stopOrder) {
+  if (protectionConfirmed && stopOrder) {
     await store.upsertOrder({
-      id: String(resultOrderId(stopOrder) ?? `${pending.setupId}-sl`),
+      id: String(protection.protectionOrderId ?? resultOrderId(stopOrder) ?? `${pending.setupId}-sl`),
       mode: "live",
       profileId: updatedProfile.id,
       raw: stopOrder,
@@ -3143,7 +3596,7 @@ async function processPlatformMarketTrigger({
       type: "STOP_MARKET",
     });
   }
-  if (takeProfitOrder) {
+  if (protectionConfirmed && takeProfitOrder) {
     await store.upsertOrder({
       id: String(resultOrderId(takeProfitOrder) ?? `${pending.setupId}-tp`),
       mode: "live",
@@ -3159,24 +3612,32 @@ async function processPlatformMarketTrigger({
     });
   }
 
-  updatedProfile.live.openPosition = createPaperPosition({
-    entryEvent,
-    order: {
-      ...order,
-      direction: pending.direction,
-      entryPrice: executionPrice,
-      quantity: protectiveQuantity,
-      stopLoss: pending.stopLoss,
-      takeProfit: liveTakeProfitEnabled(updatedProfile, pending) ? pending.takeProfit ?? null : null,
-    },
-  });
+  updatedProfile.live.openPosition = protectionConfirmed || !protection.emergencyClosed
+    ? createPaperPosition({
+        entryEvent,
+        order: {
+          ...order,
+          direction: pending.direction,
+          entryPrice: executionPrice,
+          protectionMissing: !protectionConfirmed,
+          quantity: protectiveQuantity,
+          stopLoss: pending.stopLoss,
+          takeProfit: liveTakeProfitEnabled(updatedProfile, pending) ? pending.takeProfit ?? null : null,
+        },
+      })
+    : null;
+  updatedProfile.live.liveProtectionConfirmed = protectionConfirmed;
+  updatedProfile.live.protectionOrderId = protection.protectionOrderId;
+  updatedProfile.live.protectionSource = protection.protectionSource;
   updatedProfile.live.lastProcessedSetupId = pending.setupId;
   updatedProfile.live.lastProcessedSetupFingerprint = pending.setupFingerprint ?? null;
   updatedProfile.live.lastProcessedStrategyEventFingerprint = pending.strategyEventFingerprint ?? null;
   updatedProfile.live.pendingTriggerOrder = {
     ...pending,
-    canArmNextSetup: false,
+    canArmNextSetup: protection.emergencyClosed === true,
     critical,
+    emergencyClose: protection.emergencyClose,
+    emergencyClosed: protection.emergencyClosed,
     executionPrice,
     fillDetectedAt: new Date().toISOString(),
     filledPosition: {
@@ -3203,25 +3664,39 @@ async function processPlatformMarketTrigger({
           position,
           stopOrder,
           takeProfitOrder,
+          protection,
         },
         message: reversalContext
-          ? critical
-            ? `Przeciwny trigger przebity — zamknięto starą pozycję i otwarto nową, ale SL nie został potwierdzony: ${critical}`
-            : "Reversal wykonany. Stara pozycja zamknięta, nowa pozycja otwarta i SL wysłany."
-          : critical
-            ? `Platform trigger crossed; MARKET sent, but SL placement failed: ${critical}`
-            : "Platform trigger crossed; MARKET sent and SL protection placement requested.",
-        status: critical ? "filled_sl_failed" : "filled_protected",
+          ? protectionConfirmed
+            ? "Reversal wykonany. Stara pozycja zamknięta, nowa pozycja otwarta i SL potwierdzony na BingX."
+            : protection.emergencyClosed
+              ? "Reversal otworzył nową pozycję, ale SL nie został potwierdzony; backend zamknął pozycję awaryjnie MARKET."
+              : "Reversal otworzył nową pozycję, SL nie został potwierdzony i awaryjne zamknięcie nie zostało potwierdzone."
+          : protectionConfirmed
+            ? "Platform trigger crossed; MARKET sent and SL protection confirmed on BingX."
+            : protection.emergencyClosed
+              ? "Platform trigger crossed; MARKET sent, SL was not confirmed, so backend emergency-closed the position."
+              : "Platform trigger crossed; MARKET sent, SL was not confirmed and emergency close was not confirmed.",
+        status: protectionConfirmed ? "filled_protected" : terminalUnprotectedStatus,
         time: new Date().toISOString(),
       },
     ].slice(-20),
     platformTriggerDiagnostics: { ...baseDiagnostics, executionPrice, slippagePct },
     position,
+    protectionAttempts: protection.protectionAttempts,
+    protectionConfirmed,
+    protectionOrderId: protection.protectionOrderId,
+    protectionSource: protection.protectionSource,
+    stopOrderVerification: protection.stopOrderVerification,
     reversalClose,
     reversalReason: reversalContext ? "live_reversal_trigger_crossed" : "",
-    reversalStatus: reversalContext ? "completed" : "",
-    status: critical ? "filled_sl_failed" : "filled_protected",
+    reversalStatus: reversalContext
+      ? protectionConfirmed ? "completed" : protection.emergencyClosed ? "entry_emergency_closed_after_sl_failure" : "entry_unprotected_close_failed"
+      : "",
+    status: protectionConfirmed ? "filled_protected" : terminalUnprotectedStatus,
     stopOrder,
+    terminal: !protectionConfirmed,
+    terminalReason: protectionConfirmed ? "" : terminalUnprotectedStatus,
     takeProfit: liveTakeProfitEnabled(updatedProfile, pending) ? pending.takeProfit ?? null : null,
     takeProfitOrder,
     triggerCrossed: true,
@@ -3231,8 +3706,8 @@ async function processPlatformMarketTrigger({
   };
   appendSetupOrderJournal(updatedProfile, {
     event: reversalContext
-      ? critical ? "live_reversal_sl_failed" : "live_reversal_completed"
-      : critical ? "platform_market_entry_sl_failed" : "platform_market_entry_sl_placed",
+      ? protectionConfirmed ? "live_reversal_completed" : terminalUnprotectedStatus
+      : protectionConfirmed ? "platform_market_entry_sl_confirmed" : terminalUnprotectedStatus,
     exchangeResponseSummary: summarizeExchangeResponse(marketOrder),
     executionPrice,
     interval: updatedProfile.timeframe,
@@ -3246,9 +3721,12 @@ async function processPlatformMarketTrigger({
     setupFingerprintShort: pending.setupFingerprintShort,
     setupId: pending.setupId,
     side: pending.side,
-    slPlaced: !critical,
+    slPlaced: protectionConfirmed,
+    emergencyClosed: protection.emergencyClosed,
+    protectionOrderId: protection.protectionOrderId,
+    protectionSource: protection.protectionSource,
     slippagePct,
-    status: critical ? "filled_sl_failed" : "filled_protected",
+    status: protectionConfirmed ? "filled_protected" : terminalUnprotectedStatus,
     triggerPrice: pending.triggerPrice,
   });
   updatedProfile.live.orderLog = [
@@ -3472,45 +3950,20 @@ async function syncPendingTriggerFill({
 
   const protectiveQuantity = positionAmount(position) || pending.quantity;
   const side = pending.side;
-  let stopOrder = null;
-  let takeProfitOrder = null;
-  let critical = "";
-
-  try {
-    try {
-      stopOrder = await bingxClient.placePositionStopLoss(updatedProfile.symbol, side, pending.stopLoss, {
-        position,
-        positionId: positionIdentifier(position),
-        positionSide: pending.positionSide,
-        quantity: protectiveQuantity,
-      });
-    } catch {
-      stopOrder = await bingxClient.placeStopLoss(updatedProfile.symbol, side, pending.stopLoss, protectiveQuantity, {
-        position,
-        positionId: positionIdentifier(position),
-        positionSide: pending.positionSide,
-      });
-    }
-
-    takeProfitOrder = await placeLiveTakeProfitIfEnabled({
-      bingxClient,
-      logger,
-      pending,
-      position,
-      profile: updatedProfile,
-      protectiveQuantity,
-      side,
-    });
-  } catch (error) {
-    critical = error instanceof Error ? error.message : String(error);
-    await logger("SL placement after trigger fill failed", {
-      error: critical,
-      mode: "live",
-      orderId: pending.orderId,
-      profileId: updatedProfile.id,
-      setupId: pending.setupId,
-    });
-  }
+  const protection = await protectLivePositionOrEmergencyClose({
+    bingxClient,
+    logger,
+    pending,
+    position,
+    profile: updatedProfile,
+    protectiveQuantity,
+    side,
+  });
+  const stopOrder = protection.stopOrder;
+  const takeProfitOrder = protection.takeProfitOrder;
+  const critical = protection.critical;
+  const protectionConfirmed = protection.protectionConfirmed === true;
+  const terminalUnprotectedStatus = critical || "sl_protection_failed_emergency_close_failed";
 
   const fillTime = Math.floor(Date.now() / 1000);
   const entryEvent = {
@@ -3522,7 +3975,7 @@ async function syncPendingTriggerFill({
     trigger: pending.triggerPrice,
   };
 
-  if (!critical) {
+  if (protectionConfirmed) {
     await logger("trigger order fill detected and SL attached", {
       mode: "live",
       orderId: pending.orderId,
@@ -3532,7 +3985,7 @@ async function syncPendingTriggerFill({
     });
     if (stopOrder) {
       await store.upsertOrder({
-        id: String(resultOrderId(stopOrder) ?? `${pending.setupId}-sl`),
+        id: String(protection.protectionOrderId ?? resultOrderId(stopOrder) ?? `${pending.setupId}-sl`),
         mode: "live",
         profileId: updatedProfile.id,
         raw: stopOrder,
@@ -3562,25 +4015,33 @@ async function syncPendingTriggerFill({
     }
   }
 
-  updatedProfile.live.openPosition = createPaperPosition({
-    entryEvent,
-    order: {
-      ...(pending.order ?? {}),
-      direction: pending.direction,
-      entryPrice: pending.triggerPrice,
-      quantity: protectiveQuantity,
-      stopLoss: pending.stopLoss,
-      takeProfit: liveTakeProfitEnabled(updatedProfile, pending) ? pending.takeProfit ?? null : null,
-    },
-  });
+  updatedProfile.live.openPosition = protectionConfirmed || !protection.emergencyClosed
+    ? createPaperPosition({
+        entryEvent,
+        order: {
+          ...(pending.order ?? {}),
+          direction: pending.direction,
+          entryPrice: pending.triggerPrice,
+          protectionMissing: !protectionConfirmed,
+          quantity: protectiveQuantity,
+          stopLoss: pending.stopLoss,
+          takeProfit: liveTakeProfitEnabled(updatedProfile, pending) ? pending.takeProfit ?? null : null,
+        },
+      })
+    : null;
+  updatedProfile.live.liveProtectionConfirmed = protectionConfirmed;
+  updatedProfile.live.protectionOrderId = protection.protectionOrderId;
+  updatedProfile.live.protectionSource = protection.protectionSource;
   updatedProfile.live.lastProcessedSetupId = pending.setupId;
   updatedProfile.live.lastProcessedSetupFingerprint = pending.setupFingerprint ?? null;
   updatedProfile.live.pendingTriggerOrder = {
     ...pending,
-    canArmNextSetup: false,
+    canArmNextSetup: protection.emergencyClosed === true,
     executedQty: classification.executedQty,
     exchangeTerminalStatus: classification.statusText,
     critical,
+    emergencyClose: protection.emergencyClose,
+    emergencyClosed: protection.emergencyClosed,
     fillDetectedAt: new Date().toISOString(),
     filledPosition: {
       positionId: positionIdentifier(position),
@@ -3598,23 +4059,33 @@ async function syncPendingTriggerFill({
           position,
           stopOrder,
           takeProfitOrder,
+          protection,
         },
-        message: critical
-          ? `Trigger filled, but SL placement failed: ${critical}`
-          : "Trigger filled; SL protection placement requested.",
-        status: critical ? "filled_sl_failed" : "filled_protected",
+        message: protectionConfirmed
+          ? "Trigger filled; SL protection confirmed on BingX."
+          : protection.emergencyClosed
+            ? "Trigger filled, SL was not confirmed, so backend emergency-closed the position."
+            : "Trigger filled, SL was not confirmed and emergency close was not confirmed.",
+        status: protectionConfirmed ? "filled_protected" : terminalUnprotectedStatus,
         time: new Date().toISOString(),
       },
     ].slice(-20),
     position,
-    status: critical ? "filled_sl_failed" : "filled_protected",
+    protectionAttempts: protection.protectionAttempts,
+    protectionConfirmed,
+    protectionOrderId: protection.protectionOrderId,
+    protectionSource: protection.protectionSource,
+    status: protectionConfirmed ? "filled_protected" : terminalUnprotectedStatus,
     stopOrder,
+    stopOrderVerification: protection.stopOrderVerification,
+    terminal: !protectionConfirmed,
+    terminalReason: protectionConfirmed ? "" : terminalUnprotectedStatus,
     takeProfit: liveTakeProfitEnabled(updatedProfile, pending) ? pending.takeProfit ?? null : null,
     takeProfitOrder,
     updatedAt: new Date().toISOString(),
   };
   appendSetupOrderJournal(updatedProfile, {
-    event: critical ? "fill_detected_sl_failed" : "fill_detected_sl_placed",
+    event: protectionConfirmed ? "fill_detected_sl_confirmed" : terminalUnprotectedStatus,
     exchangeResponseSummary: summarizeExchangeResponse(placedOrderStatus),
     executedQty: classification.executedQty,
     interval: updatedProfile.timeframe,
@@ -3624,8 +4095,11 @@ async function syncPendingTriggerFill({
     setupFingerprintShort: pending.setupFingerprintShort,
     setupId: pending.setupId,
     side: pending.side,
-    slPlaced: !critical,
-    status: critical ? "filled_sl_failed" : "filled_protected",
+    slPlaced: protectionConfirmed,
+    emergencyClosed: protection.emergencyClosed,
+    protectionOrderId: protection.protectionOrderId,
+    protectionSource: protection.protectionSource,
+    status: protectionConfirmed ? "filled_protected" : terminalUnprotectedStatus,
     triggerPrice: pending.triggerPrice,
   });
   updatedProfile.live.orderLog = [
