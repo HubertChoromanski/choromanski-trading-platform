@@ -1,4 +1,5 @@
 import { evaluateChoromanskiStrategy, STRATEGY_EVENT_TYPES } from "../../../hubert-platform/frontend/src/engine/strategyEngine.js";
+import { canonicalEventsFromStrategyEvents, CANONICAL_EVENT_SOURCES } from "../../../hubert-platform/frontend/src/events/canonicalEventStream.js";
 import { toHeikenAshi } from "../../../hubert-platform/frontend/src/indicators/heikenAshi.js";
 import { calculateNadarayaEnvelope } from "../../../hubert-platform/frontend/src/indicators/nadaraya.js";
 
@@ -214,9 +215,17 @@ export function runStrategyOnCandles({ rawCandles = [], strategyParameters = {} 
     STRATEGY_EVENT_TYPES.SETUP_INVALIDATED,
   ]);
   const validNweBandCount = envelope.reduce((count, band) => count + (isFiniteBand(band) ? 1 : 0), 0);
+  const canonicalEvents = canonicalEventsFromStrategyEvents(strategy.events, {
+    interval: strategyParameters.timeframe ?? strategyParameters.interval ?? "15m",
+    source: strategyParameters.canonicalSource ?? CANONICAL_EVENT_SOURCES.CHART_SIMULATION,
+    strategyParameters,
+    symbol: strategyParameters.symbol ?? "SOLUSDT",
+  });
 
   return {
+    canonicalEvents,
     diagnostics: {
+      canonicalEventCount: canonicalEvents.length,
       closedCandlesUsed: sourceCandles.length,
       lastClosedCandleTime: sourceCandles.at(-1)?.time ?? null,
       latestEntryEvent,
@@ -245,7 +254,13 @@ export async function runStrategyForProfile(profile, options = {}) {
   });
   const result = runStrategyOnCandles({
     rawCandles,
-    strategyParameters: profile.strategyParameters,
+    strategyParameters: {
+      ...(profile.strategyParameters ?? {}),
+      canonicalSource: CANONICAL_EVENT_SOURCES.LIVE_SZTAB,
+      interval: profile.timeframe,
+      symbol: profile.symbol,
+      timeframe: profile.timeframe,
+    },
   });
 
   return {

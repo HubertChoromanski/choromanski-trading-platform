@@ -3,6 +3,12 @@ import {
   ensureLiveExchangePositionProtectedOrClosed,
   processLiveProfileExecution,
 } from "../execution/executionEngine.js";
+import {
+  canonicalEventsFromRuntime,
+  CANONICAL_EVENT_SOURCES,
+  CANONICAL_EVENT_TYPES,
+  mergeCanonicalEventStreams,
+} from "../../../hubert-platform/frontend/src/events/canonicalEventStream.js";
 import { withSetupFingerprint } from "../execution/setupFingerprint.js";
 import { isSetupActionable, triggerEligibilityForSetup } from "../execution/setupActionability.js";
 import { runStrategyForProfile, runStrategyOnCandles } from "../strategy/strategyRunner.js";
@@ -311,6 +317,8 @@ function currentDecisionTimeline({ latestSetupEvent = null, pending = null, runt
 }
 
 export function deriveCurrentRuntimeContext({ latestSetupEvent = null, pending = null, runtime = {} } = {}) {
+  const interval = runtime.interval ?? runtime.timeframe ?? pending?.interval ?? latestSetupEvent?.interval ?? "15m";
+  const symbol = runtime.symbol ?? pending?.symbol ?? latestSetupEvent?.symbol ?? "SOLUSDT";
   const split = splitSetupOrderJournal({
     journal: runtime.setupOrderJournal ?? [],
     pending,
@@ -319,8 +327,37 @@ export function deriveCurrentRuntimeContext({ latestSetupEvent = null, pending =
       latestSetupEvent,
     },
   });
+  const canonicalEvents = mergeCanonicalEventStreams(
+    Array.isArray(runtime.canonicalEvents) ? runtime.canonicalEvents : [],
+    canonicalEventsFromRuntime({
+      ...runtime,
+      latestSetupEvent,
+      pendingTriggerOrder: pending,
+    }, {
+      interval,
+      source: CANONICAL_EVENT_SOURCES.LIVE_SZTAB,
+      symbol,
+    }),
+  ).slice(-100);
+  const currentActionableEvent = [...canonicalEvents]
+    .reverse()
+    .find((event) =>
+      event.source === CANONICAL_EVENT_SOURCES.LIVE_SZTAB &&
+      event.actionable &&
+      [
+        CANONICAL_EVENT_TYPES.ENTRY_TRIGGERED,
+        CANONICAL_EVENT_TYPES.LIVE_PENDING_TRIGGER,
+        CANONICAL_EVENT_TYPES.SETUP_ACTIVE,
+      ].includes(event.eventType),
+    ) ?? null;
+  const currentStrategyState = currentActionableEvent?.executionState ??
+    (runtime.formingSetupCandidate ? "forming_candidate" : latestSetupEvent?.type ?? "waiting_for_setup");
   return {
     ...split,
+    canonicalEvents,
+    currentActionableEvent,
+    currentStrategyState,
+    currentStrategyStateReason: currentActionableEvent?.reasonCode ?? runtime.lastDecisionReason ?? "",
     currentDecisionTimeline: currentDecisionTimeline({
       latestSetupEvent,
       pending,
@@ -637,6 +674,11 @@ function defaultIntervalConfig(interval) {
       slPlacementStatus: "",
       setupOrderJournal: [],
       currentDecisionTimeline: [],
+      canonicalEvents: [],
+      canonicalEventInvariants: [],
+      currentActionableEvent: null,
+      currentStrategyState: "waiting_for_setup",
+      currentStrategyStateReason: "",
       currentLifecycleOrderIds: [],
       currentRunnerStartedAt: null,
       currentSetupFingerprint: "",
@@ -1425,10 +1467,13 @@ export function createSztabRunner({
           pending: null,
           runtime: {
             ...(current.runtime ?? {}),
+            canonicalEvents: strategyResult.canonicalEvents ?? [],
             formingSetupCandidate,
+            interval,
             lastBlockedReason: blockedReason,
             lastDecision: "Fresh signal blocked by global execution lock.",
             lastDecisionReason: "global_execution_block",
+            symbol: profile.symbol,
           },
         });
         await persistRuntime(interval, {
@@ -1512,7 +1557,9 @@ export function createSztabRunner({
         pending: pendingTriggerOrder,
         runtime: {
           ...(current.runtime ?? {}),
+          canonicalEvents: strategyResult.canonicalEvents ?? [],
           formingSetupCandidate: updatedProfile.live?.formingSetupCandidate ?? formingSetupCandidate,
+          interval,
           lastBlockedReason: "",
           lastDecision: pendingTriggerOrder
             ? triggerOrderDecisionText(pendingTriggerOrder)
@@ -1521,12 +1568,13 @@ export function createSztabRunner({
               : "No fresh entry signal on latest closed candle.",
           lastDecisionReason: lastSignal
             ? "fresh_executable_entry_signal"
-            : pendingTriggerOrder
-              ? `trigger_order_${triggerOrderState}`
-              : latestEntryEvent
-                ? "latest_entry_signal_is_historical_or_stale"
-                : "no_entry_signal",
+              : pendingTriggerOrder
+                ? `trigger_order_${triggerOrderState}`
+                : latestEntryEvent
+                  ? "latest_entry_signal_is_historical_or_stale"
+                  : "no_entry_signal",
           setupOrderJournal: triggerSummary.setupOrderJournal,
+          symbol: updatedProfile.symbol ?? current.symbol,
         },
       });
       const orderFingerprintMatchesLatestSetup = Boolean(
@@ -1942,9 +1990,11 @@ export function createSztabRunner({
       pending: nextPending,
       runtime: {
         ...(current.runtime ?? {}),
+        interval,
         lastDecision: triggerOrderDecisionText(nextPending),
         lastDecisionReason: `trigger_order_${nextPending?.status ?? "none"}`,
         setupOrderJournal: triggerSummary.setupOrderJournal,
+        symbol: profile.symbol,
       },
     });
     await persistRuntime(interval, {

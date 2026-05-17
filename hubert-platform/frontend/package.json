@@ -9,7 +9,7 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "test:sztab-runtime-guards": "node scripts/sztab-runtime-guards-regression.mjs",
-    "test:chart-overlay-semantics": "node scripts/chart-overlay-semantics-regression.mjs"
+    "test:canonical-event-stream": "node scripts/canonical-event-stream-regression.mjs"
   },
   "dependencies": {
     "lightweight-charts": "^5.2.0",

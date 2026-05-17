@@ -11,8 +11,18 @@ import { createSolKlineSocket, fetchHistoricalCandles } from "../api/binance";
 import {
   STRATEGY_EVENT_TYPES,
   evaluateChoromanskiStrategy,
-  toStrategyMarkers,
 } from "../engine/strategyEngine";
+import {
+  CANONICAL_EVENT_SOURCES,
+  canonicalEventDebugSummary,
+  canonicalEventsFromRuntime,
+  canonicalEventsFromStrategyEvents,
+  canonicalLineTitles,
+  canonicalMarkerFromEvent,
+  canonicalVisibilityInvariants,
+  filterCanonicalEventsForMode,
+  mergeCanonicalEventStreams,
+} from "../events/canonicalEventStream";
 import { toHeikenAshi } from "../indicators/heikenAshi";
 import { calculateNadarayaEnvelope, toLineData } from "../indicators/nadaraya";
 import ControlCenter from "./ControlCenter";
@@ -21,14 +31,6 @@ import {
   readPlatformState,
   writeStoredJson,
 } from "../utils/persistence";
-import {
-  applyDebugMetadataToMarker,
-  buildStrategyOverlayMetadata,
-  markerMetadataSummary,
-  markerPrefixForOverlay,
-  strategyLineTitles,
-  strategyMarkerId,
-} from "../utils/chartOverlaySemantics";
 import {
   isRecord,
   safeObjectRows,
@@ -1048,6 +1050,10 @@ function runtimeDiagnostics(runtime = {}) {
     ["runningIntervals", runtime.runningIntervalsText ?? "--"],
     ["Stale detection", runtime.staleDetection ?? "--"],
     ["Execution mode", runtime.executionMode || runtime.pendingTriggerOrder?.executionMode || "--"],
+    ["Canonical events", safeObjectRows(runtime.canonicalEvents).length],
+    ["Current strategy state", runtime.currentStrategyState || "--"],
+    ["Current actionable event", runtime.currentActionableEvent?.eventType ? `${runtime.currentActionableEvent.eventType} ${runtime.currentActionableEvent.side ?? ""}` : "--"],
+    ["Canonical reason", runtime.currentStrategyStateReason || runtime.currentActionableEvent?.reasonCode || "--"],
     ["Runner started", runtime.currentRunnerStartedAt ? `${formatChartTime(runtime.currentRunnerStartedAt)} (${ageText(runtime.currentRunnerStartedAt)})` : runtime.startedAt ? `${formatChartTime(runtime.startedAt)} (${ageText(runtime.startedAt)})` : "--"],
     ["Current setup FP", runtime.currentSetupFingerprintShort || runtime.currentSetupFingerprint || runtime.activeSetupFingerprintShort || runtime.latestSetupFingerprint || "--"],
     ["Current order ids", safeStringRows(runtime.currentLifecycleOrderIds).length ? safeStringRows(runtime.currentLifecycleOrderIds).join(", ") : "--"],
@@ -1597,40 +1603,6 @@ function labelMarkers(markers = [], prefix = "") {
     ...marker,
     text: `${prefix} ${marker.text ?? ""}`.trim(),
   }));
-}
-
-function canonicalStrategyOverlayEvents(events = []) {
-  return events.filter((event) =>
-    event.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED ||
-    event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE ||
-    event.type === STRATEGY_EVENT_TYPES.SETUP_INVALIDATED ||
-    event.type === STRATEGY_EVENT_TYPES.SETUP_BLOCKED ||
-    event.type === STRATEGY_EVENT_TYPES.BENCHMARK_CONFIRMED
-  );
-}
-
-function overlayModeStrategyEvents(events = [], mode = "live") {
-  const normalized = normalizeOverlayMode(mode);
-  const relevant = canonicalStrategyOverlayEvents(events).filter((event) =>
-    event.type === STRATEGY_EVENT_TYPES.ENTRY_TRIGGERED ||
-    event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE ||
-    event.type === STRATEGY_EVENT_TYPES.SETUP_INVALIDATED
-  );
-
-  if (normalized === "live") return [];
-  if (normalized === "operational") return relevant.slice(-1);
-  if (normalized === "history") return relevant.slice(-12);
-  return relevant.slice(-MAX_STRATEGY_LINE_EVENTS);
-}
-
-function overlayModeMarkerEvents(events = [], mode = "live") {
-  const normalized = normalizeOverlayMode(mode);
-  const relevant = canonicalStrategyOverlayEvents(events);
-
-  if (normalized === "live") return [];
-  if (normalized === "operational") return relevant.slice(-1);
-  if (normalized === "history") return relevant.slice(-18);
-  return relevant.slice(-MAX_BACKTEST_CHART_MARKERS);
 }
 
 function overlayBacktestSettings(settings = defaultBacktestOverlaySettings, mode = "live") {
@@ -2605,7 +2577,7 @@ export default function TradingViewChart() {
   }, [clearLiveOrderLines, clearStrategyLines, selectedInterval]);
 
   const renderStrategyLines = useCallback(
-    (events, candles, currentOverlayMode = "live", runtime = {}) => {
+    (events, candles, currentOverlayMode = "live") => {
       clearStrategyLines();
 
       const normalizedMode = normalizeOverlayMode(currentOverlayMode);
@@ -2614,50 +2586,37 @@ export default function TradingViewChart() {
         return;
       }
 
-      overlayModeStrategyEvents(events, normalizedMode)
+      const canonicalEvents = Array.isArray(events) ? events : [];
+      canonicalEvents
         .filter((event) => {
-          if (event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE && !setupActionability(event, selectedInterval).actionable) return false;
-          if (event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE) return normalizedMode === "operational" || settings.showBenchmarks || normalizedMode === "debug";
-          if (event.type === STRATEGY_EVENT_TYPES.SETUP_INVALIDATED) return normalizedMode === "operational" || settings.showNegated || normalizedMode === "debug";
+          if (!Number.isFinite(event.trigger) || !Number.isFinite(event.invalidation)) return false;
+          if (event.eventType === STRATEGY_EVENT_TYPES.SETUP_ACTIVE) return normalizedMode === "operational" || settings.showBenchmarks || normalizedMode === "debug";
+          if (event.eventType === STRATEGY_EVENT_TYPES.SETUP_INVALIDATED) return normalizedMode === "operational" || settings.showNegated || normalizedMode === "debug";
           return true;
         })
         .forEach((event) => {
-          if (!Number.isFinite(event.trigger) || !Number.isFinite(event.stopLoss)) {
-            return;
-          }
-          const actionability = setupActionability(event, selectedInterval);
-          const historical = selectedHistoricalWindowRef.current?.mode === "historical";
-          const metadata = buildStrategyOverlayMetadata({
-            actionability,
-            event,
-            historical,
-            interval: selectedInterval,
-            mode: normalizedMode,
-            runtime,
-          });
-
-          const startIndex = event.benchmarkIndex ?? event.index;
+          const startIndex = Number.isInteger(event.raw?.benchmarkIndex ?? event.raw?.index)
+            ? event.raw?.benchmarkIndex ?? event.raw?.index
+            : Math.max(0, candles.findIndex((candle) => candle.time >= event.candleOpenTime));
           const triggerEndIndex = Math.min(startIndex + 6, candles.length - 1);
           const stopEndIndex = Math.min(startIndex + 8, candles.length - 1);
-          const triggerEndTime = candles[triggerEndIndex]?.time ?? event.time;
-          const stopEndTime = candles[stopEndIndex]?.time ?? event.time;
+          const triggerEndTime = candles[triggerEndIndex]?.time ?? event.eventTime ?? event.candleOpenTime;
+          const stopEndTime = candles[stopEndIndex]?.time ?? event.eventTime ?? event.candleOpenTime;
           const historyMode = normalizedMode === "history";
-          const direction = canonicalDirection(event.direction);
-          const triggerColor = direction === "LONG"
-            ? operationalMode ? "rgba(34, 197, 94, 0.72)" : "rgba(245, 245, 245, 0.24)"
-            : operationalMode ? "rgba(239, 68, 68, 0.72)" : "rgba(5, 5, 5, 0.28)";
+          const direction = canonicalDirection(event.side);
+          const liveActionable = event.source === CANONICAL_EVENT_SOURCES.LIVE_SZTAB && event.actionable;
+          const triggerColor = liveActionable
+            ? direction === "LONG" ? "rgba(34, 197, 94, 0.82)" : "rgba(239, 68, 68, 0.82)"
+            : "rgba(148, 163, 184, 0.42)";
           const stopColor = operationalMode ? "rgba(245, 125, 52, 0.6)" : "rgba(120, 24, 24, 0.18)";
-          const startTime = event.benchmarkTime ?? event.time;
-          const { slTitle, triggerTitle } = strategyLineTitles(event, metadata, {
-            historical,
-            mode: normalizedMode,
-          });
+          const startTime = event.candleOpenTime ?? event.eventTime;
+          const { slTitle, triggerTitle } = canonicalLineTitles(event, normalizedMode);
 
           if (settings.showTrigger || operationalMode) {
             addStrategySegment({
               color: triggerColor,
-              lineStyle: historyMode ? 2 : 0,
-              lineWidth: operationalMode ? 2 : 1,
+              lineStyle: historyMode || !liveActionable ? 2 : 0,
+              lineWidth: operationalMode && liveActionable ? 2 : 1,
               title: triggerTitle,
               value: event.trigger,
               startTime,
@@ -2672,7 +2631,7 @@ export default function TradingViewChart() {
               lineStyle: 2,
               lineWidth: operationalMode ? 2 : 1,
               title: slTitle,
-              value: event.stopLoss,
+              value: event.invalidation,
               startTime,
               endTime: stopEndTime,
               showLabel: false,
@@ -2869,39 +2828,37 @@ export default function TradingViewChart() {
 
         const selectedRuntime = normalizeSztabRuntimeForPanel(sztabTelemetry, selectedInterval).runtime ?? {};
         const historicalMode = selectedHistoricalWindowRef.current?.mode === "historical";
-        const markerEvents = canonicalStrategyOverlayEvents(strategyEvents);
-        const actionableMarkerEvents = markerEvents.filter((event) =>
-          event.type !== STRATEGY_EVENT_TYPES.SETUP_ACTIVE ||
-          setupActionability(event, selectedInterval).actionable,
-        );
-        const cappedMarkerEvents = overlayModeMarkerEvents(actionableMarkerEvents, currentOverlayMode);
-        const markerMetadata = cappedMarkerEvents.map((event) => buildStrategyOverlayMetadata({
-          actionability: setupActionability(event, selectedInterval),
-          event,
-          historical: historicalMode,
+        const chartCanonicalEvents = canonicalEventsFromStrategyEvents(strategyEvents, {
           interval: selectedInterval,
-          mode: currentOverlayMode,
-          runtime: selectedRuntime,
-        }));
-        const markerMetadataById = new Map(markerMetadata.map((metadata, index) => [
-          strategyMarkerId(cappedMarkerEvents[index]),
-          metadata,
-        ]));
-        const markerLabelPrefix = markerPrefixForOverlay({ historical: historicalMode, mode: currentOverlayMode });
+          source: historicalMode ? CANONICAL_EVENT_SOURCES.BACKTEST : CANONICAL_EVENT_SOURCES.CHART_SIMULATION,
+          strategyParameters: renderSettings,
+          symbol: "SOLUSDT",
+        });
+        const runtimeCanonicalEvents = selectedRuntime.canonicalEvents?.length
+          ? selectedRuntime.canonicalEvents
+          : canonicalEventsFromRuntime(selectedRuntime, {
+              interval: selectedInterval,
+              source: CANONICAL_EVENT_SOURCES.LIVE_SZTAB,
+              symbol: "SOLUSDT",
+            });
+        const allCanonicalEvents = mergeCanonicalEventStreams(runtimeCanonicalEvents, chartCanonicalEvents);
+        const cappedCanonicalEvents = filterCanonicalEventsForMode(allCanonicalEvents, currentOverlayMode);
+        const invariants = canonicalVisibilityInvariants(allCanonicalEvents, cappedCanonicalEvents, currentOverlayMode);
         const strategyMarkers = sanitizeMarkers(
-          labelMarkers(toStrategyMarkers(cappedMarkerEvents), markerLabelPrefix)
-            .map((marker) => applyDebugMetadataToMarker(marker, markerMetadataById.get(marker.id), currentOverlayMode)),
-          "strategy markers",
+          cappedCanonicalEvents
+            .map((event) => canonicalMarkerFromEvent(event, currentOverlayMode))
+            .filter((marker) => marker.time),
+          "canonical strategy markers",
         );
-        globalThis.__CHOROMANSKI_MARKER_AUDIT__ = markerMetadata;
-        const noVisibleStrategyMarkers = markerMetadata.length === 0;
-        const chartOnlyVisible = markerMetadata.some((metadata) => !metadata.runtimeMatched);
+        globalThis.__CHOROMANSKI_MARKER_AUDIT__ = cappedCanonicalEvents;
+        const noVisibleStrategyMarkers = cappedCanonicalEvents.length === 0;
+        const chartOnlyVisible = cappedCanonicalEvents.some((event) => event.source !== CANONICAL_EVENT_SOURCES.LIVE_SZTAB);
         const markerDebug = currentOverlayMode === "debug"
-          ? markerMetadata.slice(-6).map(markerMetadataSummary).join(" | ")
+          ? cappedCanonicalEvents.slice(-6).map(canonicalEventDebugSummary).join(" | ")
           : "";
-        const hiddenInModeReason = currentOverlayMode === "live" && actionableMarkerEvents.length > 0
+        const hiddenInModeReason = currentOverlayMode === "live" && allCanonicalEvents.length > cappedCanonicalEvents.length
           ? "Sygnały strategii są ukryte w LIVE ONLY, bo ten tryb pokazuje tylko realny stan live."
-          : currentOverlayMode === "operational" && actionableMarkerEvents.length > cappedMarkerEvents.length
+          : currentOverlayMode === "operational" && allCanonicalEvents.length > cappedCanonicalEvents.length
             ? "Tryb OPERACYJNY pokazuje tylko najnowszy istotny sygnał; starsze są w HISTORIA/DEBUG."
             : currentOverlayMode === "operational" && chartOnlyVisible
               ? "Widoczny marker pochodzi z lokalnej symulacji wykresu; brak odpowiadającego zdarzenia w aktualnej osi Sztabu."
@@ -2924,18 +2881,18 @@ export default function TradingViewChart() {
                 : `${overlayModeText} · ${displayInterval(selectedInterval)} · markery wykresu dopasowane do Sztabu`;
 
         strategyMarkersRef.current?.setMarkers(strategyMarkers);
-        renderStrategyLines(strategyEvents, closedCandles, currentOverlayMode, selectedRuntime);
+        renderStrategyLines(cappedCanonicalEvents, closedCandles, currentOverlayMode);
         setChartRenderStats({
-          cappedMarkers: Math.max(0, actionableMarkerEvents.length - cappedMarkerEvents.length),
+          cappedMarkers: Math.max(0, allCanonicalEvents.length - cappedCanonicalEvents.length),
           debugMarkers: 0,
           durationMs: Math.round(performance.now() - renderStartedAt),
-          hiddenInModeReason,
+          hiddenInModeReason: invariants.length ? invariants.join("; ") : hiddenInModeReason,
           markerDebug,
           markerNote,
           markerSource,
           markers: strategyMarkers.length,
           renderedCandles: chartCandles.length,
-          skippedMarkers: Math.max(0, actionableMarkerEvents.length - cappedMarkerEvents.length),
+          skippedMarkers: Math.max(0, allCanonicalEvents.length - cappedCanonicalEvents.length),
           slTpLines: strategyLineSeriesRef.current.length,
         });
       }

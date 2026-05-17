@@ -490,6 +490,53 @@ async function assertPostEligibilityWebsocketTickExecutes() {
   assert(client.calls.some((call) => call.type === "placeMarketOrder" && call.side === "BUY"), "Post-eligibility trigger did not send MARKET.");
 }
 
+async function assertM20ActionableLongCrossSendsMarketOrReason() {
+  process.env.SZTAB_EXECUTION_MODE = "platform_market_trigger";
+  const client = createBingxClient();
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const setup = setupEvent({
+    direction: "LONG",
+    setupId: "M20-actionable-long",
+    time: nowSeconds - 2_400,
+    trigger: 100,
+    stopLoss: 95,
+  });
+  const priceService = createPriceService({
+    price: 99.80,
+    recentTicks: [{ price: 100.04, time: new Date((nowSeconds + 1) * 1000).toISOString() }],
+    time: new Date((nowSeconds + 1) * 1000).toISOString(),
+  });
+  const armed = await processLiveProfileExecution({
+    bingxClient: client,
+    logger: async () => {},
+    priceService,
+    profile: baseProfile({ id: "sztab-20m", timeframe: "20m" }),
+    store,
+    strategyResult: strategyResult({ latestSetupEvent: setup }),
+  });
+  const executed = await processLiveProfileExecution({
+    bingxClient: client,
+    logger: async () => {},
+    priceService,
+    profile: armed,
+    store,
+    strategyResult: strategyResult(),
+  });
+  const status = executed.live.pendingTriggerOrder?.status;
+  const reason = executed.live.pendingTriggerOrder?.skippedReason ??
+    executed.live.pendingTriggerOrder?.terminalReason ??
+    executed.live.pendingTriggerOrder?.risk?.reason ??
+    executed.live.pendingTriggerOrder?.failureClassification ??
+    "";
+  assert(
+    status === "filled_protected" || Boolean(reason),
+    `M20 actionable LONG trigger crossed but no MARKET and no explicit reason: ${JSON.stringify(executed.live.pendingTriggerOrder)}`,
+  );
+  if (status === "filled_protected") {
+    assert(client.calls.some((call) => call.type === "placeMarketOrder" && call.side === "BUY"), "M20 crossed LONG trigger did not send BingX MARKET.");
+  }
+}
+
 async function assertPlatformModeIgnoresLegacyMarkInvalidation() {
   process.env.SZTAB_EXECUTION_MODE = "platform_market_trigger";
   const client = createBingxClient();
@@ -599,6 +646,7 @@ await assertStrategyInvalidationCancelsSetup();
 await assertStaleEntryDifferentFingerprintDoesNotExecuteCurrentSetup();
 await assertPreEligibilityWebsocketTickDoesNotExecute();
 await assertPostEligibilityWebsocketTickExecutes();
+await assertM20ActionableLongCrossSendsMarketOrReason();
 await assertPlatformModeIgnoresLegacyMarkInvalidation();
 await assertSlFailureEmergencyClosesPosition();
 await assertFilledProtectedRequiresConfirmedStopOrder();
