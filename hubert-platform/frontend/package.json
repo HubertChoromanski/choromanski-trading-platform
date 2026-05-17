@@ -8,7 +8,8 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "test:sztab-runtime-guards": "node scripts/sztab-runtime-guards-regression.mjs"
+    "test:sztab-runtime-guards": "node scripts/sztab-runtime-guards-regression.mjs",
+    "test:chart-overlay-semantics": "node scripts/chart-overlay-semantics-regression.mjs"
   },
   "dependencies": {
     "lightweight-charts": "^5.2.0",

@@ -22,6 +22,14 @@ import {
   writeStoredJson,
 } from "../utils/persistence";
 import {
+  applyDebugMetadataToMarker,
+  buildStrategyOverlayMetadata,
+  markerMetadataSummary,
+  markerPrefixForOverlay,
+  strategyLineTitles,
+  strategyMarkerId,
+} from "../utils/chartOverlaySemantics";
+import {
   isRecord,
   safeObjectRows,
   safeOrderId,
@@ -1965,6 +1973,7 @@ export default function TradingViewChart() {
     debugMarkers: 0,
     durationMs: 0,
     hiddenInModeReason: "",
+    markerDebug: "",
     markerSource: "Brak markerów na wykresie",
     markers: 0,
     markerNote: "",
@@ -2587,6 +2596,7 @@ export default function TradingViewChart() {
     setChartRenderStats((current) => ({
       ...current,
       hiddenInModeReason: "",
+      markerDebug: "",
       markerSource: `Ładowanie nakładek dla ${displayInterval(selectedInterval)}`,
       markers: 0,
       skippedMarkers: 0,
@@ -2595,7 +2605,7 @@ export default function TradingViewChart() {
   }, [clearLiveOrderLines, clearStrategyLines, selectedInterval]);
 
   const renderStrategyLines = useCallback(
-    (events, candles, currentOverlayMode = "live") => {
+    (events, candles, currentOverlayMode = "live", runtime = {}) => {
       clearStrategyLines();
 
       const normalizedMode = normalizeOverlayMode(currentOverlayMode);
@@ -2615,36 +2625,36 @@ export default function TradingViewChart() {
           if (!Number.isFinite(event.trigger) || !Number.isFinite(event.stopLoss)) {
             return;
           }
+          const actionability = setupActionability(event, selectedInterval);
+          const historical = selectedHistoricalWindowRef.current?.mode === "historical";
+          const metadata = buildStrategyOverlayMetadata({
+            actionability,
+            event,
+            historical,
+            interval: selectedInterval,
+            mode: normalizedMode,
+            runtime,
+          });
 
           const startIndex = event.benchmarkIndex ?? event.index;
           const triggerEndIndex = Math.min(startIndex + 6, candles.length - 1);
           const stopEndIndex = Math.min(startIndex + 8, candles.length - 1);
-	          const triggerEndTime = candles[triggerEndIndex]?.time ?? event.time;
-	          const stopEndTime = candles[stopEndIndex]?.time ?? event.time;
-	          const historyMode = normalizedMode === "history";
-            const direction = canonicalDirection(event.direction);
-	          const triggerColor = direction === "LONG"
-	            ? operationalMode ? "rgba(34, 197, 94, 0.72)" : "rgba(245, 245, 245, 0.24)"
-	            : operationalMode ? "rgba(239, 68, 68, 0.72)" : "rgba(5, 5, 5, 0.28)";
+          const triggerEndTime = candles[triggerEndIndex]?.time ?? event.time;
+          const stopEndTime = candles[stopEndIndex]?.time ?? event.time;
+          const historyMode = normalizedMode === "history";
+          const direction = canonicalDirection(event.direction);
+          const triggerColor = direction === "LONG"
+            ? operationalMode ? "rgba(34, 197, 94, 0.72)" : "rgba(245, 245, 245, 0.24)"
+            : operationalMode ? "rgba(239, 68, 68, 0.72)" : "rgba(5, 5, 5, 0.28)";
           const stopColor = operationalMode ? "rgba(245, 125, 52, 0.6)" : "rgba(120, 24, 24, 0.18)";
           const startTime = event.benchmarkTime ?? event.time;
-          const historical = selectedHistoricalWindowRef.current?.mode === "historical";
-          const setupState = event.type === STRATEGY_EVENT_TYPES.SETUP_INVALIDATED
-            ? "ANULOWANY SETUP"
-            : event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE
-              ? "ACTIVE SETUP TARGET"
-              : "SYMULOWANY ENTRY";
-	          const triggerTitle = historical
-	            ? `HISTORYCZNY TRIGGER ${direction}`.trim()
-	            : `${setupState} — TRIGGER ${direction}`.trim();
-	          const slTitle = historical
-	            ? "HISTORYCZNY SL SYMULACJI"
-	            : event.type === STRATEGY_EVENT_TYPES.SETUP_ACTIVE
-	              ? `AKTYWNY POZIOM SL SETUPU ${direction}`.trim()
-	              : "SYMULOWANY SL";
-	
-	          if (settings.showTrigger || operationalMode) {
-	            addStrategySegment({
+          const { slTitle, triggerTitle } = strategyLineTitles(event, metadata, {
+            historical,
+            mode: normalizedMode,
+          });
+
+          if (settings.showTrigger || operationalMode) {
+            addStrategySegment({
               color: triggerColor,
               lineStyle: historyMode ? 2 : 0,
               lineWidth: operationalMode ? 2 : 1,
@@ -2656,7 +2666,7 @@ export default function TradingViewChart() {
             });
           }
 
-	          if (settings.showSl && !operationalMode) {
+          if (settings.showSl && !operationalMode) {
             addStrategySegment({
               color: stopColor,
               lineStyle: 2,
@@ -2796,17 +2806,18 @@ export default function TradingViewChart() {
         const totalTrades = mode.analysisResult?.trades?.length ?? 0;
 		        setChartRenderStats({
 		          cappedMarkers: Math.max(0, totalTrades - visibleTrades),
-		          debugMarkers,
-		          durationMs: Math.round(performance.now() - renderStartedAt),
-              hiddenInModeReason: currentOverlayMode === "live" && totalTrades > 0
+	          debugMarkers,
+	          durationMs: Math.round(performance.now() - renderStartedAt),
+	              hiddenInModeReason: currentOverlayMode === "live" && totalTrades > 0
                 ? "Markery backtestu są ukryte w LIVE ONLY, bo ten tryb pokazuje tylko realny stan live."
                 : currentOverlayMode === "operational" && totalTrades > markers.length
                 ? "Tryb OPERACYJNY nie pokazuje pełnej historii backtestu; przełącz HISTORIA/DEBUG."
                 : "",
-              markerNote: currentOverlayMode === "live"
-                ? "Tryb LIVE ONLY ukrywa markery backtestu, aby live stan był czytelny."
-                : "Markery backtestu są symulacją/analityką. Nie są live zleceniami ani pozycjami BingX.",
-	              markerSource: `${overlayModeText} · ${displayInterval(selectedInterval)} · markery analizy backtestu`,
+	              markerNote: currentOverlayMode === "live"
+	                ? "Tryb LIVE ONLY ukrywa markery backtestu, aby live stan był czytelny."
+	                : "Markery backtestu są symulacją/analityką. Nie są live zleceniami ani pozycjami BingX.",
+                  markerDebug: "",
+		              markerSource: `${overlayModeText} · ${displayInterval(selectedInterval)} · markery analizy backtestu`,
 		          markers: markers.length,
 		          renderedCandles: chartCandles.length,
 		          skippedMarkers: Math.max(0, totalTrades - visibleTrades),
@@ -2856,46 +2867,84 @@ export default function TradingViewChart() {
           console.debug("Choromanski setup audit available at window.__CHOROMANSKI_SETUP_AUDIT__");
         }
 
-		        const markerEvents = canonicalStrategyOverlayEvents(strategyEvents);
-            const actionableMarkerEvents = markerEvents.filter((event) =>
-              event.type !== STRATEGY_EVENT_TYPES.SETUP_ACTIVE ||
-              setupActionability(event, selectedInterval).actionable,
-            );
-		        const cappedMarkerEvents = overlayModeMarkerEvents(actionableMarkerEvents, currentOverlayMode);
-        const markerLabelPrefix = selectedHistoricalWindowRef.current?.mode === "historical" ? "HISTORIA" : "SYMULACJA";
-	        const strategyMarkers = sanitizeMarkers(labelMarkers(toStrategyMarkers(cappedMarkerEvents), markerLabelPrefix), "strategy markers");
+        const selectedRuntime = normalizeSztabRuntimeForPanel(sztabTelemetry, selectedInterval).runtime ?? {};
+        const historicalMode = selectedHistoricalWindowRef.current?.mode === "historical";
+        const markerEvents = canonicalStrategyOverlayEvents(strategyEvents);
+        const actionableMarkerEvents = markerEvents.filter((event) =>
+          event.type !== STRATEGY_EVENT_TYPES.SETUP_ACTIVE ||
+          setupActionability(event, selectedInterval).actionable,
+        );
+        const cappedMarkerEvents = overlayModeMarkerEvents(actionableMarkerEvents, currentOverlayMode);
+        const markerMetadata = cappedMarkerEvents.map((event) => buildStrategyOverlayMetadata({
+          actionability: setupActionability(event, selectedInterval),
+          event,
+          historical: historicalMode,
+          interval: selectedInterval,
+          mode: currentOverlayMode,
+          runtime: selectedRuntime,
+        }));
+        const markerMetadataById = new Map(markerMetadata.map((metadata, index) => [
+          strategyMarkerId(cappedMarkerEvents[index]),
+          metadata,
+        ]));
+        const markerLabelPrefix = markerPrefixForOverlay({ historical: historicalMode, mode: currentOverlayMode });
+        const strategyMarkers = sanitizeMarkers(
+          labelMarkers(toStrategyMarkers(cappedMarkerEvents), markerLabelPrefix)
+            .map((marker) => applyDebugMetadataToMarker(marker, markerMetadataById.get(marker.id), currentOverlayMode)),
+          "strategy markers",
+        );
+        globalThis.__CHOROMANSKI_MARKER_AUDIT__ = markerMetadata;
+        const noVisibleStrategyMarkers = markerMetadata.length === 0;
+        const chartOnlyVisible = markerMetadata.some((metadata) => !metadata.runtimeMatched);
+        const markerDebug = currentOverlayMode === "debug"
+          ? markerMetadata.slice(-6).map(markerMetadataSummary).join(" | ")
+          : "";
+        const hiddenInModeReason = currentOverlayMode === "live" && actionableMarkerEvents.length > 0
+          ? "Sygnały strategii są ukryte w LIVE ONLY, bo ten tryb pokazuje tylko realny stan live."
+          : currentOverlayMode === "operational" && actionableMarkerEvents.length > cappedMarkerEvents.length
+            ? "Tryb OPERACYJNY pokazuje tylko najnowszy istotny sygnał; starsze są w HISTORIA/DEBUG."
+            : currentOverlayMode === "operational" && chartOnlyVisible
+              ? "Widoczny marker pochodzi z lokalnej symulacji wykresu; brak odpowiadającego zdarzenia w aktualnej osi Sztabu."
+              : "";
+        const markerNote = currentOverlayMode === "live"
+          ? "Tryb LIVE ONLY ukrywa historyczne/symulowane markery strategii. Zmień tryb na OPERACYJNY, HISTORIA albo DEBUG, żeby je zobaczyć."
+          : historicalMode
+            ? "Historyczne sygnały na wykresie nie oznaczają, że bot był wtedy online."
+            : chartOnlyVisible
+              ? "Marker pochodzi z lokalnej strategii wykresu i nie ma pasującego zdarzenia runtime Sztabu."
+              : "Najnowsze markery są potwierdzone w aktualnym runtime Sztabu.";
+        const markerSource = currentOverlayMode === "live"
+          ? `${overlayModeText} · ${displayInterval(selectedInterval)} · markery strategii ukryte`
+          : noVisibleStrategyMarkers
+            ? `${overlayModeText} · ${displayInterval(selectedInterval)} · brak markerów strategii w tym trybie`
+            : historicalMode
+              ? `${overlayModeText} · ${displayInterval(selectedInterval)} · historyczne sygnały wykresu`
+              : chartOnlyVisible
+                ? `${overlayModeText} · ${displayInterval(selectedInterval)} · markery wykresu bez zdarzenia Sztabu`
+                : `${overlayModeText} · ${displayInterval(selectedInterval)} · markery wykresu dopasowane do Sztabu`;
 
-	        strategyMarkersRef.current?.setMarkers(strategyMarkers);
-		        renderStrategyLines(strategyEvents, closedCandles, currentOverlayMode);
-		        setChartRenderStats({
-		          cappedMarkers: Math.max(0, actionableMarkerEvents.length - cappedMarkerEvents.length),
-		          debugMarkers: 0,
-		          durationMs: Math.round(performance.now() - renderStartedAt),
-              hiddenInModeReason: currentOverlayMode === "live" && actionableMarkerEvents.length > 0
-                ? "Sygnały strategii są ukryte w LIVE ONLY, bo ten tryb pokazuje tylko realny stan live."
-                : currentOverlayMode === "operational" && actionableMarkerEvents.length > cappedMarkerEvents.length
-                ? "Tryb OPERACYJNY pokazuje tylko najnowszy istotny sygnał; starsze są w HISTORIA/DEBUG."
-                : "",
-              markerNote: currentOverlayMode === "live"
-                ? "Tryb LIVE ONLY ukrywa historyczne/symulowane markery strategii. Zmień tryb na OPERACYJNY, HISTORIA albo DEBUG, żeby je zobaczyć."
-                : selectedHistoricalWindowRef.current?.mode === "historical"
-                ? "Historyczne sygnały na wykresie nie oznaczają, że bot był wtedy online."
-                : "Najnowsze markery są live-egzekwowalne tylko wtedy, gdy runner Sztabu widzi je w swoim aktualnym oknie decyzyjnym.",
-              markerSource: selectedHistoricalWindowRef.current?.mode === "historical"
-                ? `${overlayModeText} · ${displayInterval(selectedInterval)} · historyczne sygnały wykresu`
-                : `${overlayModeText} · ${displayInterval(selectedInterval)} · okno live/najnowszych sygnałów`,
-		          markers: strategyMarkers.length,
-		          renderedCandles: chartCandles.length,
-		          skippedMarkers: Math.max(0, actionableMarkerEvents.length - cappedMarkerEvents.length),
-		          slTpLines: strategyLineSeriesRef.current.length,
-	        });
+        strategyMarkersRef.current?.setMarkers(strategyMarkers);
+        renderStrategyLines(strategyEvents, closedCandles, currentOverlayMode, selectedRuntime);
+        setChartRenderStats({
+          cappedMarkers: Math.max(0, actionableMarkerEvents.length - cappedMarkerEvents.length),
+          debugMarkers: 0,
+          durationMs: Math.round(performance.now() - renderStartedAt),
+          hiddenInModeReason,
+          markerDebug,
+          markerNote,
+          markerSource,
+          markers: strategyMarkers.length,
+          renderedCandles: chartCandles.length,
+          skippedMarkers: Math.max(0, actionableMarkerEvents.length - cappedMarkerEvents.length),
+          slTpLines: strategyLineSeriesRef.current.length,
+        });
       }
 
       if (shouldFitContent) {
         chartRef.current?.timeScale().fitContent();
       }
     },
-    [overlayMode, renderBacktestLines, renderStrategyLines, selectedInterval, settings],
+    [overlayMode, renderBacktestLines, renderStrategyLines, selectedInterval, settings, sztabTelemetry],
   );
 
   const scheduleLiveCandleUpdate = useCallback((candles) => {
@@ -3502,6 +3551,7 @@ export default function TradingViewChart() {
         <span>{rawCandles.length} świec na wykresie / {fullHistoryDataset.length || dataDiagnostics.fullCandles || 0} w pamięci</span>
         <span>{chartRenderStats.markers} markerów · {chartRenderStats.slTpLines} linii · {chartRenderStats.durationMs}ms render</span>
         <span title={chartRenderStats.markerNote}>{chartRenderStats.markerSource}</span>
+        {overlayMode === "debug" && chartRenderStats.markerDebug && <span>{chartRenderStats.markerDebug}</span>}
         {chartRenderStats.hiddenInModeReason && <span>{chartRenderStats.hiddenInModeReason}</span>}
         <span>{selectedHistoricalWindow.mode === "historical" ? "Okno historyczne" : "Okno live/najnowsze"}</span>
         <span>Czas: {DISPLAY_TIME_ZONE}</span>
