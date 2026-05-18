@@ -126,10 +126,20 @@ function journalItemTimeMs(item = {}) {
 }
 
 function setupFingerprintFromRuntime(runtime = {}, pending = null) {
-  return pending?.setupFingerprint ??
-    runtime.activeSetupFingerprint ??
-    runtime.latestSetupFingerprint ??
+  const pendingStatus = String(pending?.status ?? "").toLowerCase();
+  const pendingCanOwnCurrentLifecycle = [
+    "accepted",
+    "new",
+    "partially_filled",
+    "pending_sync",
+    "placed",
+    "platform_armed",
+  ].includes(pendingStatus);
+  return pendingCanOwnCurrentLifecycle ? pending.setupFingerprint ?? "" :
     runtime.latestSetupEvent?.setupFingerprint ??
+    runtime.latestSetupFingerprint ??
+    runtime.activeSetupFingerprint ??
+    runtime.currentExecution?.setupFingerprint ??
     runtime.setupFingerprint ??
     "";
 }
@@ -184,6 +194,17 @@ function splitSetupOrderJournal({ journal = [], pending = null, runtime = {} } =
     currentSetupOrderJournal: currentSetupOrderJournal.slice(-50),
     historicalSetupOrderJournal: historicalSetupOrderJournal.slice(-100),
     staleHistoricalOrderCount: historicalSetupOrderJournal.length,
+  };
+}
+
+function executionRuntimeFields(live = {}) {
+  return {
+    currentExecution: live.currentExecution ?? null,
+    currentExecutionReason: live.currentExecutionReason ?? live.currentExecution?.reasonCode ?? "",
+    currentExecutionState: live.currentExecutionState ?? live.currentExecution?.state ?? "IDLE",
+    currentOrderId: live.currentOrderId ?? live.currentExecution?.orderId ?? null,
+    executionTransitionLog: Array.isArray(live.executionTransitionLog) ? live.executionTransitionLog.slice(-200) : [],
+    lastTransitionAt: live.lastTransitionAt ?? live.currentExecution?.timestamp ?? null,
   };
 }
 
@@ -356,8 +377,14 @@ export function deriveCurrentRuntimeContext({ latestSetupEvent = null, pending =
     ...split,
     canonicalEvents,
     currentActionableEvent,
+    currentExecution: runtime.currentExecution ?? null,
+    currentExecutionReason: runtime.currentExecutionReason ?? runtime.currentExecution?.reasonCode ?? "",
+    currentExecutionState: runtime.currentExecutionState ?? runtime.currentExecution?.state ?? "IDLE",
+    currentOrderId: runtime.currentOrderId ?? runtime.currentExecution?.orderId ?? null,
     currentStrategyState,
     currentStrategyStateReason: currentActionableEvent?.reasonCode ?? runtime.lastDecisionReason ?? "",
+    executionTransitionLog: Array.isArray(runtime.executionTransitionLog) ? runtime.executionTransitionLog.slice(-200) : [],
+    lastTransitionAt: runtime.lastTransitionAt ?? runtime.currentExecution?.timestamp ?? null,
     currentDecisionTimeline: currentDecisionTimeline({
       latestSetupEvent,
       pending,
@@ -677,14 +704,20 @@ function defaultIntervalConfig(interval) {
       canonicalEvents: [],
       canonicalEventInvariants: [],
       currentActionableEvent: null,
+      currentExecution: null,
+      currentExecutionReason: "idle",
+      currentExecutionState: "IDLE",
       currentStrategyState: "waiting_for_setup",
       currentStrategyStateReason: "",
+      currentOrderId: null,
       currentLifecycleOrderIds: [],
       currentRunnerStartedAt: null,
       currentSetupFingerprint: "",
       currentSetupFingerprintShort: "",
       currentSetupOrderJournal: [],
       historicalSetupOrderJournal: [],
+      executionTransitionLog: [],
+      lastTransitionAt: null,
       staleHistoricalOrderCount: 0,
       setupFingerprint: "",
       setupFingerprintShort: "",
@@ -1558,6 +1591,7 @@ export function createSztabRunner({
         runtime: {
           ...(current.runtime ?? {}),
           canonicalEvents: strategyResult.canonicalEvents ?? [],
+          ...executionRuntimeFields(updatedProfile.live ?? {}),
           formingSetupCandidate: updatedProfile.live?.formingSetupCandidate ?? formingSetupCandidate,
           interval,
           lastBlockedReason: "",
@@ -1990,6 +2024,7 @@ export function createSztabRunner({
       pending: nextPending,
       runtime: {
         ...(current.runtime ?? {}),
+        ...executionRuntimeFields(updatedProfile.live ?? {}),
         interval,
         lastDecision: triggerOrderDecisionText(nextPending),
         lastDecisionReason: `trigger_order_${nextPending?.status ?? "none"}`,

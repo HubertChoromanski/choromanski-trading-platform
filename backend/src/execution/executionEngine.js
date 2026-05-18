@@ -12,6 +12,16 @@ import {
   closePaperPosition,
   createPaperPosition,
 } from "./paperBroker.js";
+import {
+  ensureLiveExecutionRuntime,
+  isAcceptedExchangePendingTooOld,
+  LIVE_EXECUTION_STATES,
+  pendingAgeMs,
+  resetLiveExecutionForNewSetup,
+  syncExecutionStateFromPending,
+  transitionLiveExecution,
+  transitionLiveExecutionMany,
+} from "./liveExecutionFsm.js";
 
 export async function processProfileExecution({ logger, profile, strategyResult, store }) {
   const stateProfiles = store.getProfiles();
@@ -152,6 +162,7 @@ export async function processLiveProfileExecution({
     setupOrderJournal: [],
     ...(updatedProfile.live ?? {}),
   };
+  ensureLiveExecutionRuntime(updatedProfile);
   const executionMode = sztabExecutionMode();
   let openPosition = updatedProfile.live?.openPosition;
   const exitEvent = openPosition
@@ -191,6 +202,14 @@ export async function processLiveProfileExecution({
       updatedProfile.live.lastCleanupWarning = cleanup;
     }
     await store.upsertTrade(trade);
+    transitionLiveExecution(updatedProfile, {
+      reasonCode: "position_exit_cleanup",
+      setupFingerprint: openPosition.setupFingerprint ?? "",
+      setupId: openPosition.setupId,
+      side: openPosition.direction,
+      source: "position_exit",
+      state: LIVE_EXECUTION_STATES.POSITION_CLOSED,
+    });
     await logger("position closed", { mode: "live", profileId: profile.id, setupId: openPosition.setupId });
   } else if (openPosition && exitEventIsReversal) {
     await logger("core reversal exit observed; live Sztab will execute paired opposite entry event", {
@@ -224,6 +243,7 @@ export async function processLiveProfileExecution({
       : buildLiveSetupEvent(rawActiveSetupEvent, updatedProfile)
     : null;
   if (activeSetupEvent) {
+    resetLiveExecutionForNewSetup(updatedProfile, activeSetupEvent);
     const setupActionability = isSetupActionable(activeSetupEvent, updatedProfile.timeframe, Date.now());
     if (!setupActionability.actionable) {
       const existingPrematurePending = activePendingTriggerOrder(updatedProfile.live?.pendingTriggerOrder);
@@ -294,6 +314,16 @@ export async function processLiveProfileExecution({
         waitingForBenchmarkClose: true,
       };
       updatedProfile.live.latestSetupEventActionable = false;
+      transitionLiveExecution(updatedProfile, {
+        details: setupActionability,
+        reasonCode: "benchmark_candle_not_closed",
+        setupFingerprint: activeSetupEvent.setupFingerprint,
+        setupFingerprintShort: activeSetupEvent.setupFingerprintShort,
+        setupId: activeSetupEvent.setupId,
+        side: activeSetupEvent.direction,
+        source: "strategy_setup",
+        state: LIVE_EXECUTION_STATES.SETUP_DETECTED,
+      });
       await logger("setup candidate waiting for benchmark candle close", {
         direction: activeSetupEvent.direction,
         fingerprint: activeSetupEvent.setupFingerprint,
@@ -306,6 +336,16 @@ export async function processLiveProfileExecution({
     }
     updatedProfile.live.formingSetupCandidate = null;
     updatedProfile.live.latestSetupEventActionable = true;
+    transitionLiveExecution(updatedProfile, {
+      details: setupActionability,
+      reasonCode: activeSetupEvent.strategyEventTrigger ? "strategy_entry_triggered" : "setup_actionable",
+      setupFingerprint: activeSetupEvent.setupFingerprint,
+      setupFingerprintShort: activeSetupEvent.setupFingerprintShort,
+      setupId: activeSetupEvent.setupId,
+      side: activeSetupEvent.direction,
+      source: "strategy_setup",
+      state: activeSetupEvent.strategyEventTrigger ? LIVE_EXECUTION_STATES.TRIGGER_CROSSED : LIVE_EXECUTION_STATES.SETUP_ACTIONABLE,
+    });
   }
   const pendingTriggerOrder = activePendingTriggerOrder(updatedProfile.live?.pendingTriggerOrder);
   openPosition = updatedProfile.live?.openPosition;
@@ -492,7 +532,7 @@ export async function processLiveProfileExecution({
     takeProfitEnabled: liveTakeProfitEnabled(updatedProfile),
   };
   if (!marginSafety.allowed) {
-  updatedProfile.live.pendingTriggerOrder = {
+    updatedProfile.live.pendingTriggerOrder = {
       direction: activeSetupEvent.direction,
       marginSafety,
       orderLifecycle: [{
@@ -2507,6 +2547,57 @@ function classifyTriggerFailureCandidate({ failureDiagnostics = {}, pending = {}
   return "unknown_exchange_failed";
 }
 
+function transitionForJournalEntry(entry = {}) {
+  const event = String(entry.event ?? "").toLowerCase();
+  const status = String(entry.status ?? "").toLowerCase();
+  const reasonCode = entry.reason ?? entry.failureClassification ?? status ?? event;
+
+  if (event === "setup_waiting_benchmark_close") {
+    return { reasonCode: "benchmark_candle_not_closed", state: LIVE_EXECUTION_STATES.SETUP_DETECTED };
+  }
+  if (event === "platform_trigger_armed" || status === "platform_armed" || event === "order_accepted" || status === "accepted") {
+    return { reasonCode: status || event, state: LIVE_EXECUTION_STATES.TRIGGER_ARMED };
+  }
+  if (event.includes("trigger_crossed") || status === "trigger_crossed") {
+    return { reasonCode: reasonCode || "trigger_crossed", state: LIVE_EXECUTION_STATES.TRIGGER_CROSSED };
+  }
+  if (event === "market_order_sent" || status === "market_order_sent") {
+    return { reasonCode: "market_order_sent", state: LIVE_EXECUTION_STATES.ENTRY_SENT };
+  }
+  if (event.includes("entry_confirmed") || event.includes("fill_detected") || status === "entry_confirmed") {
+    return { reasonCode: reasonCode || "entry_confirmed", state: LIVE_EXECUTION_STATES.ENTRY_CONFIRMED };
+  }
+  if (event.includes("sl_sent") || status === "sl_sent") {
+    return { reasonCode: "sl_sent", state: LIVE_EXECUTION_STATES.SL_SENT };
+  }
+  if (event.includes("sl_confirmed") || entry.slPlaced === true || status === "filled_protected") {
+    return { reasonCode: "sl_confirmed", state: LIVE_EXECUTION_STATES.POSITION_OPEN };
+  }
+  if (event.includes("invalidated") || status.includes("invalidated")) {
+    return { reasonCode: reasonCode || "setup_invalidated", state: LIVE_EXECUTION_STATES.SETUP_INVALIDATED };
+  }
+  if (event === "risk_blocked" || status.includes("blocked") || status.includes("price_too_far")) {
+    return { reasonCode: reasonCode || "setup_skipped", state: LIVE_EXECUTION_STATES.SETUP_SKIPPED };
+  }
+  if (event.includes("timeout") || status.includes("timeout")) {
+    return { reasonCode: reasonCode || "setup_timeout", state: LIVE_EXECUTION_STATES.SETUP_SKIPPED };
+  }
+  if (
+    status.includes("failed") ||
+    status.includes("missing") ||
+    status.includes("rejected") ||
+    event.includes("failed") ||
+    event.includes("missing") ||
+    event.includes("rejected")
+  ) {
+    return { reasonCode: reasonCode || "execution_error", state: LIVE_EXECUTION_STATES.ERROR };
+  }
+  if (event.includes("canceled") || event.includes("cancelled") || event.includes("terminal") || status.includes("canceled") || status.includes("cancelled")) {
+    return { reasonCode: reasonCode || "setup_skipped", state: LIVE_EXECUTION_STATES.SETUP_SKIPPED };
+  }
+  return null;
+}
+
 function appendSetupOrderJournal(profile, entry) {
   profile.live = {
     lastProcessedSetupId: null,
@@ -2524,6 +2615,20 @@ function appendSetupOrderJournal(profile, entry) {
       ...entry,
     },
   ].slice(-100);
+  const transition = transitionForJournalEntry(entry);
+  if (transition) {
+    transitionLiveExecution(profile, {
+      details: entry,
+      orderId: entry.orderId ?? null,
+      reasonCode: transition.reasonCode,
+      setupFingerprint: entry.setupFingerprint ?? "",
+      setupFingerprintShort: entry.setupFingerprintShort ?? "",
+      setupId: entry.setupId ?? null,
+      side: entry.side ?? "",
+      source: `journal:${entry.event ?? entry.status ?? "event"}`,
+      state: transition.state,
+    });
+  }
 }
 
 function matchingExchangePosition(positions, { positionSide, symbol }) {
@@ -3188,6 +3293,14 @@ async function processPlatformMarketTrigger({
       skippedReason: "price_feed_degraded",
       updatedAt: new Date().toISOString(),
     };
+    transitionLiveExecution(updatedProfile, {
+      details: baseDiagnostics,
+      orderId: pending.orderId ?? null,
+      pending,
+      reasonCode: "price_feed_degraded",
+      source: "platform_trigger_watch",
+      state: LIVE_EXECUTION_STATES.TRIGGER_ARMED,
+    });
     await logger("platform trigger price feed degraded; waiting for fresh price", {
       ageMs: priceFeed.ageMs,
       fingerprint: pending.setupFingerprint,
@@ -3213,8 +3326,25 @@ async function processPlatformMarketTrigger({
       triggerCrossed: false,
       updatedAt: new Date().toISOString(),
     };
+    transitionLiveExecution(updatedProfile, {
+      details: baseDiagnostics,
+      orderId: pending.orderId ?? null,
+      pending,
+      reasonCode: "trigger_not_crossed",
+      source: "platform_trigger_watch",
+      state: LIVE_EXECUTION_STATES.TRIGGER_ARMED,
+    });
     return updatedProfile;
   }
+
+  transitionLiveExecution(updatedProfile, {
+    details: baseDiagnostics,
+    orderId: pending.orderId ?? null,
+    pending,
+    reasonCode: strategyEventTrigger ? "strategy_entry_event_triggered" : "binance_futures_trigger_crossed",
+    source: "platform_trigger_watch",
+    state: LIVE_EXECUTION_STATES.TRIGGER_CROSSED,
+  });
 
   if (!strategyEventTrigger && slippagePct !== null && slippagePct > maxSlippagePct) {
     updatedProfile.live.pendingTriggerOrder = platformTriggerTerminalUpdate(pending, {
@@ -3438,6 +3568,13 @@ async function processPlatformMarketTrigger({
 
   let marketOrder = null;
   try {
+    transitionLiveExecution(updatedProfile, {
+      details: { ...baseDiagnostics, marginSafety, reversalClose, risk },
+      pending,
+      reasonCode: reversalContext ? "live_reversal_market_entry_sent" : "platform_market_entry_sent",
+      source: "bingx_market_order",
+      state: LIVE_EXECUTION_STATES.ENTRY_SENT,
+    });
     marketOrder = await bingxClient.placeMarketOrder(updatedProfile.symbol, pending.side, quantity);
   } catch (error) {
     const exchangeResponse = error?.bingx ?? { message: error instanceof Error ? error.message : String(error) };
@@ -3555,6 +3692,22 @@ async function processPlatformMarketTrigger({
   }
 
   const protectiveQuantity = positionAmount(position) || quantity;
+  transitionLiveExecution(updatedProfile, {
+    details: { ...baseDiagnostics, marketOrder, position, reversalClose },
+    orderId: resultOrderId(marketOrder) ?? null,
+    pending,
+    reasonCode: reversalContext ? "live_reversal_entry_confirmed" : "platform_market_entry_confirmed",
+    source: "bingx_position_sync",
+    state: LIVE_EXECUTION_STATES.ENTRY_CONFIRMED,
+  });
+  transitionLiveExecution(updatedProfile, {
+    details: { stopLoss: pending.stopLoss, protectiveQuantity },
+    orderId: resultOrderId(marketOrder) ?? null,
+    pending,
+    reasonCode: "sl_place_attempt",
+    source: "bingx_sl_protection",
+    state: LIVE_EXECUTION_STATES.SL_SENT,
+  });
   const protection = await protectLivePositionOrEmergencyClose({
     bingxClient,
     logger,
@@ -3704,6 +3857,33 @@ async function processPlatformMarketTrigger({
     triggerSlippagePct: numericValue(slippagePct),
     updatedAt: new Date().toISOString(),
   };
+  transitionLiveExecutionMany(updatedProfile, protectionConfirmed
+    ? [
+        {
+          details: { protectionOrderId: protection.protectionOrderId, protectionSource: protection.protectionSource },
+          orderId: protection.protectionOrderId ?? resultOrderId(marketOrder) ?? null,
+          pending: updatedProfile.live.pendingTriggerOrder,
+          reasonCode: "sl_confirmed",
+          source: "bingx_sl_protection",
+          state: LIVE_EXECUTION_STATES.SL_CONFIRMED,
+        },
+        {
+          details: { position, protectionOrderId: protection.protectionOrderId },
+          orderId: resultOrderId(marketOrder) ?? null,
+          pending: updatedProfile.live.pendingTriggerOrder,
+          reasonCode: reversalContext ? "live_reversal_completed" : "position_open_sl_confirmed",
+          source: "bingx_position_sync",
+          state: LIVE_EXECUTION_STATES.POSITION_OPEN,
+        },
+      ]
+    : [{
+        details: { emergencyClose: protection.emergencyClose, protectionAttempts: protection.protectionAttempts },
+        orderId: resultOrderId(marketOrder) ?? null,
+        pending: updatedProfile.live.pendingTriggerOrder,
+        reasonCode: terminalUnprotectedStatus,
+        source: "bingx_sl_protection",
+        state: LIVE_EXECUTION_STATES.ERROR,
+      }]);
   appendSetupOrderJournal(updatedProfile, {
     event: reversalContext
       ? protectionConfirmed ? "live_reversal_completed" : terminalUnprotectedStatus
@@ -3766,6 +3946,25 @@ async function syncPendingTriggerFill({
   const pending = activePendingTriggerOrder(updatedProfile.live?.pendingTriggerOrder);
 
   if (!pending) return updatedProfile;
+  if (isAcceptedExchangePendingTooOld(pending)) {
+    return cancelLivePendingTriggerOrder({
+      bingxClient,
+      extraJournal: {
+        pendingAgeMs: pendingAgeMs(pending),
+      },
+      extraPending: {
+        canArmNextSetup: true,
+        pendingAgeMs: pendingAgeMs(pending),
+      },
+      failureClassification: "accepted_trigger_reconcile_timeout",
+      journalEvent: "accepted_trigger_reconcile_timeout",
+      logger,
+      profile: updatedProfile,
+      reason: "accepted_trigger_reconcile_timeout",
+      terminalReason: "accepted_trigger_reconcile_timeout",
+      terminalStatus: "accepted_trigger_reconcile_timeout",
+    });
+  }
   if (isPlatformMarketTriggerPending(pending)) {
     return processPlatformMarketTrigger({
       bingxClient,
@@ -3870,16 +4069,16 @@ async function syncPendingTriggerFill({
         ? classifyTriggerFailureCandidate({ failureDiagnostics, pending, statusResponse: placedOrderStatus })
         : classification.failureClassification;
       updatedProfile.live.pendingTriggerOrder = {
-	        ...pending,
-	        canArmNextSetup: true,
-	        executedQty: classification.executedQty,
-	        exchangeTerminalStatus: classification.statusText,
-	        failureCandidate,
-	        failureDiagnostics,
-	        failureClassification: classification.failureClassification,
-	        lastExchangeStatus: classification.statusText,
-	        lastOrderStatus: placedOrderStatus,
-	        lastStatusCheckAt: new Date().toISOString(),
+        ...pending,
+        canArmNextSetup: true,
+        executedQty: classification.executedQty,
+        exchangeTerminalStatus: classification.statusText,
+        failureCandidate,
+        failureDiagnostics,
+        failureClassification: classification.failureClassification,
+        lastExchangeStatus: classification.statusText,
+        lastOrderStatus: placedOrderStatus,
+        lastStatusCheckAt: new Date().toISOString(),
         orderLifecycle: [
           ...(pending.orderLifecycle ?? []),
           {
@@ -3945,11 +4144,28 @@ async function syncPendingTriggerFill({
       ].slice(-20),
       updatedAt: new Date().toISOString(),
     };
+    syncExecutionStateFromPending(updatedProfile, updatedProfile.live.pendingTriggerOrder, "exchange_trigger_reconcile");
     return updatedProfile;
   }
 
   const protectiveQuantity = positionAmount(position) || pending.quantity;
   const side = pending.side;
+  transitionLiveExecution(updatedProfile, {
+    details: { orderStatus: placedOrderStatus, position },
+    orderId: pending.orderId ?? null,
+    pending,
+    reasonCode: "exchange_trigger_entry_confirmed",
+    source: "bingx_trigger_reconcile",
+    state: LIVE_EXECUTION_STATES.ENTRY_CONFIRMED,
+  });
+  transitionLiveExecution(updatedProfile, {
+    details: { stopLoss: pending.stopLoss, protectiveQuantity },
+    orderId: pending.orderId ?? null,
+    pending,
+    reasonCode: "sl_place_attempt",
+    source: "bingx_sl_protection",
+    state: LIVE_EXECUTION_STATES.SL_SENT,
+  });
   const protection = await protectLivePositionOrEmergencyClose({
     bingxClient,
     logger,
@@ -4084,6 +4300,33 @@ async function syncPendingTriggerFill({
     takeProfitOrder,
     updatedAt: new Date().toISOString(),
   };
+  transitionLiveExecutionMany(updatedProfile, protectionConfirmed
+    ? [
+        {
+          details: { protectionOrderId: protection.protectionOrderId, protectionSource: protection.protectionSource },
+          orderId: protection.protectionOrderId ?? pending.orderId ?? null,
+          pending: updatedProfile.live.pendingTriggerOrder,
+          reasonCode: "sl_confirmed",
+          source: "bingx_sl_protection",
+          state: LIVE_EXECUTION_STATES.SL_CONFIRMED,
+        },
+        {
+          details: { position, protectionOrderId: protection.protectionOrderId },
+          orderId: pending.orderId ?? null,
+          pending: updatedProfile.live.pendingTriggerOrder,
+          reasonCode: "position_open_sl_confirmed",
+          source: "bingx_position_sync",
+          state: LIVE_EXECUTION_STATES.POSITION_OPEN,
+        },
+      ]
+    : [{
+        details: { emergencyClose: protection.emergencyClose, protectionAttempts: protection.protectionAttempts },
+        orderId: pending.orderId ?? null,
+        pending: updatedProfile.live.pendingTriggerOrder,
+        reasonCode: terminalUnprotectedStatus,
+        source: "bingx_sl_protection",
+        state: LIVE_EXECUTION_STATES.ERROR,
+      }]);
   appendSetupOrderJournal(updatedProfile, {
     event: protectionConfirmed ? "fill_detected_sl_confirmed" : terminalUnprotectedStatus,
     exchangeResponseSummary: summarizeExchangeResponse(placedOrderStatus),

@@ -13,6 +13,7 @@
     "test:ai-intent": "node scripts/ai-intent-regression.mjs",
     "test:sztab-benchmark-gating": "node scripts/sztab-benchmark-gating-regression.mjs",
     "test:sztab-cancel-cleanup": "node scripts/sztab-cancel-cleanup-regression.mjs",
+    "test:sztab-execution-fsm": "node scripts/sztab-execution-fsm-regression.mjs",
     "test:sztab-live-parity": "node scripts/sztab-live-parity-regression.mjs",
     "test:sztab-price-websocket": "node scripts/sztab-price-service-websocket-regression.mjs",
     "test:sztab-risk-sizing": "node scripts/sztab-risk-sizing-regression.mjs",

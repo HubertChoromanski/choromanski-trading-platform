@@ -142,18 +142,13 @@ const defaultBacktestOverlaySettings = {
 const overlayModes = [
   {
     id: "live",
-    label: "LIVE ONLY",
-    note: "Tylko pozycja live, SL/TP live, trigger live i aktualny setup.",
-  },
-  {
-    id: "operational",
-    label: "OPERACYJNY",
-    note: "Live plus bieżący setup oczekujący, zablokowany lub zastąpiony.",
+    label: "LIVE",
+    note: "Tylko aktualny cykl live: setup, trigger, wejście, SL i pozycja.",
   },
   {
     id: "history",
     label: "HISTORIA",
-    note: "Ostatnie historyczne/symulowane setupy jako kontekst.",
+    note: "Chronologiczna historia setupów, triggerów, wejść, SL i powodów pominięcia.",
   },
   {
     id: "debug",
@@ -556,7 +551,11 @@ function semanticOverlayLabel(line = {}) {
   const direction = canonicalDirection(line.direction);
   const side = direction ? ` — ${direction}` : "";
   if (line.type === "trigger") {
-    if (line.state === "active_live") return `TRIGGER LIVE — ZLECENIE NA BINGX${side}`;
+    if (line.state === "active_live") {
+      return line.executionMode === "platform_market_trigger"
+        ? `TRIGGER LIVE — PILNOWANY PRZEZ PLATFORMĘ${side}`
+        : `TRIGGER LIVE — ZLECENIE NA BINGX${side}`;
+    }
     if (line.state === "invalidated") return `SETUP ANULOWANY — NEGACJA PRZED TRIGGEREM${side}`;
     if (line.state === "failed") return `NIEUDANY TRIGGER ${direction || ""} — BingX nie wykonał zlecenia`.trim();
     if (line.state === "current_setup") return `SETUP W STRATEGII — BRAK AKTYWNEGO ZLECENIA BINGX${side}`;
@@ -722,6 +721,7 @@ function buildSemanticLiveOverlays({
     if (activePending && pendingGate.actionable) {
       addLine({
         direction: pendingDirection,
+        executionMode: pending.executionMode,
         orderId: pending.orderId,
         setupFingerprint: pending.setupFingerprint,
         setupId: pending.setupId,
@@ -831,6 +831,10 @@ function classifyMarkerReality({ activeAnalysisSession, markerSource, selectedHi
 }
 
 function timelineFromRuntime(runtime = {}) {
+  const transitions = safeObjectRows(runtime.executionTransitionLog).slice(-12).map((item) => ({
+    time: item.timestamp,
+    text: readableExecutionTransition(item),
+  }));
   const decisions = safeObjectRows(runtime.currentDecisionTimeline).slice(-10).map((item) => ({
     time: item.time,
     text: item.text || readableDecisionText(item),
@@ -849,7 +853,7 @@ function timelineFromRuntime(runtime = {}) {
         text: `Strategia zobaczyła setup ${polishSide(runtime.latestSetupEvent.direction)} (${runtime.latestSetupEvent.setupId ?? "bez id"}${runtime.latestSetupEvent.setupFingerprintShort ? ` · ${runtime.latestSetupEvent.setupFingerprintShort}` : ""}).`,
       }]
     : [];
-  const source = decisions.length ? [...decisions, ...journal] : [...setup, ...journal, ...lifecycle];
+  const source = transitions.length ? [...transitions, ...decisions, ...journal] : decisions.length ? [...decisions, ...journal] : [...setup, ...journal, ...lifecycle];
   return source
     .filter((item) => isRecord(item) && item.text)
     .sort((left, right) => {
@@ -858,6 +862,44 @@ function timelineFromRuntime(runtime = {}) {
       return rightTime - leftTime;
     })
     .slice(0, 7);
+}
+
+function readableExecutionTransition(item = {}) {
+  const state = String(item.state ?? "").toUpperCase();
+  const side = item.side ? ` ${polishSide(item.side)}` : "";
+  const setup = item.setupId ? ` ${compactId(item.setupId)}` : "";
+  switch (state) {
+    case "IDLE":
+      return "Sztab nie ma aktywnego scenariusza na tym interwale.";
+    case "SETUP_DETECTED":
+      return `Strategia wykryła setup${side}${setup}, ale nie jest jeszcze gotowy do egzekucji.`;
+    case "SETUP_ACTIONABLE":
+      return `Setup${side}${setup} jest gotowy do uzbrojenia triggera.`;
+    case "TRIGGER_ARMED":
+      return `Trigger${side}${setup} jest uzbrojony i czeka na przebicie.`;
+    case "TRIGGER_CROSSED":
+      return `Trigger${side}${setup} został przebity.`;
+    case "ENTRY_SENT":
+      return `MARKET${side}${setup} został wysłany do BingX.`;
+    case "ENTRY_CONFIRMED":
+      return `BingX potwierdził pozycję${side}${setup}.`;
+    case "SL_SENT":
+      return `System wysłał SL ochronny${setup}.`;
+    case "SL_CONFIRMED":
+      return `SL został potwierdzony na BingX${setup}.`;
+    case "POSITION_OPEN":
+      return `Pozycja live${side}${setup} jest otwarta i chroniona.`;
+    case "POSITION_CLOSED":
+      return `Pozycja${side}${setup} została zamknięta.`;
+    case "SETUP_INVALIDATED":
+      return `Setup${side}${setup} został anulowany przed wejściem.`;
+    case "SETUP_SKIPPED":
+      return `Setup${side}${setup} został pominięty: ${polishReason(item.reasonCode ?? "")}`;
+    case "ERROR":
+      return `Błąd egzekucji${setup}: ${polishReason(item.reasonCode ?? "")}`;
+    default:
+      return `${polishStatus(state)}${setup}: ${polishReason(item.reasonCode ?? "")}`;
+  }
 }
 
 function readableDecisionText(item = {}) {
@@ -1050,6 +1092,9 @@ function runtimeDiagnostics(runtime = {}) {
     ["runningIntervals", runtime.runningIntervalsText ?? "--"],
     ["Stale detection", runtime.staleDetection ?? "--"],
     ["Execution mode", runtime.executionMode || runtime.pendingTriggerOrder?.executionMode || "--"],
+    ["FSM state", runtime.currentExecutionState || "--"],
+    ["FSM reason", runtime.currentExecutionReason || runtime.currentExecution?.reasonCode || "--"],
+    ["FSM transition", runtime.lastTransitionAt ? `${formatChartTime(runtime.lastTransitionAt)} (${ageText(runtime.lastTransitionAt)})` : "--"],
     ["Canonical events", safeObjectRows(runtime.canonicalEvents).length],
     ["Current strategy state", runtime.currentStrategyState || "--"],
     ["Current actionable event", runtime.currentActionableEvent?.eventType ? `${runtime.currentActionableEvent.eventType} ${runtime.currentActionableEvent.side ?? ""}` : "--"],
@@ -1062,6 +1107,113 @@ function runtimeDiagnostics(runtime = {}) {
     ["Heartbeat", runtime.heartbeatAt ? `${formatChartTime(runtime.heartbeatAt)} (${ageText(runtime.heartbeatAt)})` : runtime.heartbeatAgeSeconds !== null && runtime.heartbeatAgeSeconds !== undefined ? `${runtime.heartbeatAgeSeconds}s temu` : "--"],
     ["Fetch error", runtime.frontendStatusFetchError || "--"],
   ];
+}
+
+function fsmRows({ currentPrice, execution = {}, pending = {}, runtime = {}, setup = {} } = {}) {
+  return [
+    ["Stan", execution.state || runtime.currentExecutionState || "--"],
+    ["Powód", polishReason(execution.reasonCode || runtime.currentExecutionReason || "--")],
+    ["Setup", compactId(execution.setupId ?? pending?.setupId ?? setup?.setupId ?? "--")],
+    ["Trigger", formatChartPrice(pending?.triggerPrice ?? setup?.trigger)],
+    ["Cena teraz", formatChartPrice(currentPrice)],
+    ["Order", execution.orderId || pending?.orderId ? compactId(execution.orderId ?? pending?.orderId) : "--"],
+    ["Ostatnia zmiana", execution.timestamp ? formatChartTime(execution.timestamp) : runtime.lastTransitionAt ? formatChartTime(runtime.lastTransitionAt) : "--"],
+  ];
+}
+
+function stateTone(state = "") {
+  if (["POSITION_OPEN", "SL_CONFIRMED", "ENTRY_CONFIRMED"].includes(state)) return "live";
+  if (["TRIGGER_ARMED", "TRIGGER_CROSSED", "ENTRY_SENT", "SL_SENT", "SETUP_ACTIONABLE"].includes(state)) return "pending";
+  if (["SETUP_INVALIDATED", "SETUP_SKIPPED", "POSITION_CLOSED", "IDLE", "SETUP_DETECTED"].includes(state)) return "neutral";
+  return "critical";
+}
+
+function stateTag(state = "") {
+  const labels = {
+    ENTRY_CONFIRMED: "WEJŚCIE POTWIERDZONE",
+    ENTRY_SENT: "MARKET WYSŁANY",
+    ERROR: "BŁĄD EGZEKUCJI",
+    IDLE: "CZEKA NA SETUP",
+    POSITION_CLOSED: "POZYCJA ZAMKNIĘTA",
+    POSITION_OPEN: "POZYCJA LIVE",
+    SETUP_ACTIONABLE: "SETUP GOTOWY",
+    SETUP_DETECTED: "SETUP WYKRYTY",
+    SETUP_INVALIDATED: "SETUP ANULOWANY",
+    SETUP_SKIPPED: "SETUP POMINIĘTY",
+    SL_CONFIRMED: "SL POTWIERDZONY",
+    SL_SENT: "SL WYSŁANY",
+    TRIGGER_ARMED: "TRIGGER UZBROJONY",
+    TRIGGER_CROSSED: "TRIGGER PRZEBITY",
+  };
+  return labels[state] ?? (state || "STAN NIEZNANY");
+}
+
+function headlineForFsmState(intervalName, state, sideText) {
+  const sideSuffix = sideText && sideText !== "--" ? ` ${sideText}` : "";
+  switch (state) {
+    case "SETUP_DETECTED":
+      return `${intervalName}: setup${sideSuffix} wykryty`;
+    case "SETUP_ACTIONABLE":
+      return `${intervalName}: setup${sideSuffix} gotowy`;
+    case "TRIGGER_ARMED":
+      return `${intervalName}: bot czeka na trigger${sideSuffix}`;
+    case "TRIGGER_CROSSED":
+      return `${intervalName}: trigger${sideSuffix} przebity`;
+    case "ENTRY_SENT":
+      return `${intervalName}: MARKET${sideSuffix} wysłany`;
+    case "ENTRY_CONFIRMED":
+      return `${intervalName}: wejście${sideSuffix} potwierdzone`;
+    case "SL_SENT":
+      return `${intervalName}: wysłano SL`;
+    case "SL_CONFIRMED":
+    case "POSITION_OPEN":
+      return `${intervalName}: pozycja${sideSuffix} aktywna`;
+    case "POSITION_CLOSED":
+      return `${intervalName}: pozycja zamknięta`;
+    case "SETUP_INVALIDATED":
+      return `${intervalName}: setup anulowany`;
+    case "SETUP_SKIPPED":
+      return `${intervalName}: setup pominięty`;
+    case "ERROR":
+      return `${intervalName}: błąd egzekucji live`;
+    case "IDLE":
+    default:
+      return `${intervalName}: czeka na setup`;
+  }
+}
+
+function detailForFsmState(state, reason = "") {
+  const reasonText = polishReason(reason);
+  switch (state) {
+    case "SETUP_DETECTED":
+      return "Strategia wykryła setup, ale nie został jeszcze uzbrojony jako live trigger.";
+    case "SETUP_ACTIONABLE":
+      return "Setup jest po zamknięciu świecy benchmarkowej i może przejść do uzbrojenia triggera.";
+    case "TRIGGER_ARMED":
+      return "Bot ma jeden aktywny scenariusz i czeka na przebicie triggera według źródła strategii.";
+    case "TRIGGER_CROSSED":
+      return "Trigger został przebity. Kolejny krok to wysłanie MARKET do BingX albo jawny powód pominięcia.";
+    case "ENTRY_SENT":
+      return "MARKET został wysłany do BingX. Bot czeka na świeży sync pozycji.";
+    case "ENTRY_CONFIRMED":
+      return "Pozycja została potwierdzona. Bot zakłada ochronny SL.";
+    case "SL_SENT":
+      return "SL został wysłany. Bot czeka na potwierdzenie aktywnej ochrony na BingX.";
+    case "SL_CONFIRMED":
+    case "POSITION_OPEN":
+      return "Realna pozycja live istnieje i ochrona SL została potwierdzona.";
+    case "POSITION_CLOSED":
+      return "Pozycja dla tego cyklu została zamknięta; bot może czekać na kolejny setup.";
+    case "SETUP_INVALIDATED":
+      return "Setup został anulowany przez logikę strategii przed wejściem live.";
+    case "SETUP_SKIPPED":
+      return reasonText || "Setup został pominięty z jawnym powodem w runtime.";
+    case "ERROR":
+      return reasonText || "Egzekucja napotkała błąd wymagający kontroli.";
+    case "IDLE":
+    default:
+      return "Runner nie ma aktywnego cyklu egzekucji na tym interwale.";
+  }
 }
 
 function deriveOperationalState({
@@ -1088,6 +1240,9 @@ function deriveOperationalState({
   const side = canonicalDirection(pending?.direction, pending?.positionSide, pending?.side, setup?.direction, formingCandidate?.direction, positionSide(livePosition ?? {}));
   const blockedReason = runtime.lastBlockedReason || pending?.terminalReason || pending?.failureClassification || runtime.lastDecisionReason || "";
   const sideText = polishSide(side);
+  const execution = isRecord(runtime.currentExecution) ? runtime.currentExecution : {};
+  const fsmState = String(runtime.currentExecutionState ?? execution.state ?? "").toUpperCase();
+  const fsmReason = runtime.currentExecutionReason ?? execution.reasonCode ?? "";
   const base = {
     detail: markerReality.note,
     diagnostics: runtimeDiagnostics(runtime),
@@ -1189,6 +1344,35 @@ function deriveOperationalState({
         { label: markerReality.label, tone: markerReality.tone },
       ],
       tone: "stale",
+    };
+  }
+
+  if (fsmState && fsmState !== "IDLE") {
+    const tone = stateTone(fsmState);
+    const rows = fsmRows({ currentPrice, execution, pending, runtime, setup });
+    if (pending?.executionMode) rows.push(["Tryb", pending.executionMode === "platform_market_trigger" ? "platforma pilnuje triggera" : "BingX trigger order"]);
+    if (pending?.priceSource) rows.push(["Źródło ceny", pending.priceSource]);
+    if (pending?.triggerCrossedAt) rows.push(["Trigger przebity", formatChartTime(pending.triggerCrossedAt)]);
+    if (pending?.skippedReason || pending?.terminalReason || pending?.failureClassification) {
+      rows.push(["Powód końcowy", polishReason(pending.skippedReason || pending.terminalReason || pending.failureClassification)]);
+    }
+    return {
+      ...base,
+      detail: detailForFsmState(fsmState, fsmReason),
+      headline: headlineForFsmState(intervalName, fsmState, sideText),
+      rows,
+      tags: [
+        { label: stateTag(fsmState), tone },
+        ...(pending?.executionMode === "platform_market_trigger" && ["TRIGGER_ARMED", "TRIGGER_CROSSED"].includes(fsmState)
+          ? [{ label: "BEZ BINGX TRIGGER ORDER", tone: "neutral" }]
+          : []),
+      ],
+      tone,
+      visualObjects: [{
+        label: stateTag(fsmState),
+        note: detailForFsmState(fsmState, fsmReason),
+        tone,
+      }],
     };
   }
 
@@ -1346,6 +1530,7 @@ function deriveOperationalState({
 function OperationalTelemetryPanel({
   compact = false,
   dock = "left",
+  mode = "live",
   onDock,
   onSelectInterval,
   onToggleCompact,
@@ -1354,6 +1539,9 @@ function OperationalTelemetryPanel({
 }) {
   const selected = states[selectedInterval] ?? deriveOperationalState({ interval: selectedInterval });
   const intervals = timeframes.filter((item) => item.interval !== "4h");
+  const normalizedMode = normalizeOverlayMode(mode);
+  const showHistory = normalizedMode === "history" || normalizedMode === "debug";
+  const showDebug = normalizedMode === "debug";
 
   return (
     <section
@@ -1366,7 +1554,7 @@ function OperationalTelemetryPanel({
       <div className="hubert-operational-panel__head">
         <div>
           <strong>Stan operacyjny</strong>
-          <span>Co realnie dzieje się na interwałach Sztabu</span>
+          <span>{normalizedMode === "live" ? "LIVE: tylko aktualny cykl egzekucji" : normalizedMode === "history" ? "HISTORIA: oś zdarzeń interwału" : "DEBUG: pełna diagnostyka runtime"}</span>
         </div>
         <div>
           <button type="button" onClick={() => onToggleCompact?.()}>{compact ? "Rozwiń" : "Kompakt"}</button>
@@ -1409,6 +1597,7 @@ function OperationalTelemetryPanel({
             </div>
           </div>
 
+          {showDebug && (
           <div className="hubert-operational-section">
             <strong>Znaczenie linii i markerów</strong>
             {(selected.visualObjects ?? []).map((item, index) => (
@@ -1418,7 +1607,9 @@ function OperationalTelemetryPanel({
               </span>
             ))}
           </div>
+          )}
 
+          {showHistory && (
           <div className="hubert-operational-section">
             <strong>Oś zdarzeń</strong>
             {(selected.timeline ?? []).length ? (selected.timeline ?? []).map((item, index) => (
@@ -1433,7 +1624,9 @@ function OperationalTelemetryPanel({
               </span>
             )}
           </div>
+          )}
 
+          {showDebug && (
           <div className="hubert-operational-section">
             <strong>Diagnostyka statusu</strong>
             {(selected.diagnostics ?? []).map(([label, value]) => (
@@ -1443,6 +1636,7 @@ function OperationalTelemetryPanel({
               </span>
             ))}
           </div>
+          )}
         </>
       )}
     </section>
@@ -2763,25 +2957,23 @@ export default function TradingViewChart() {
           ? markers.filter((marker) => String(marker.id ?? "").startsWith("analysis-debug")).length
           : 0;
         const totalTrades = mode.analysisResult?.trades?.length ?? 0;
-		        setChartRenderStats({
-		          cappedMarkers: Math.max(0, totalTrades - visibleTrades),
-	          debugMarkers,
-	          durationMs: Math.round(performance.now() - renderStartedAt),
-	              hiddenInModeReason: currentOverlayMode === "live" && totalTrades > 0
-                ? "Markery backtestu są ukryte w LIVE ONLY, bo ten tryb pokazuje tylko realny stan live."
-                : currentOverlayMode === "operational" && totalTrades > markers.length
-                ? "Tryb OPERACYJNY nie pokazuje pełnej historii backtestu; przełącz HISTORIA/DEBUG."
-                : "",
-	              markerNote: currentOverlayMode === "live"
-	                ? "Tryb LIVE ONLY ukrywa markery backtestu, aby live stan był czytelny."
-	                : "Markery backtestu są symulacją/analityką. Nie są live zleceniami ani pozycjami BingX.",
-                  markerDebug: "",
-		              markerSource: `${overlayModeText} · ${displayInterval(selectedInterval)} · markery analizy backtestu`,
-		          markers: markers.length,
-		          renderedCandles: chartCandles.length,
-		          skippedMarkers: Math.max(0, totalTrades - visibleTrades),
-		          slTpLines,
-	        });
+        setChartRenderStats({
+          cappedMarkers: Math.max(0, totalTrades - visibleTrades),
+          debugMarkers,
+          durationMs: Math.round(performance.now() - renderStartedAt),
+          hiddenInModeReason: currentOverlayMode === "live" && totalTrades > 0
+            ? "Markery backtestu są ukryte w LIVE, bo ten tryb pokazuje tylko realny stan live."
+            : "",
+          markerNote: currentOverlayMode === "live"
+            ? "Tryb LIVE ukrywa markery backtestu, aby live stan był czytelny."
+            : "Markery backtestu są symulacją/analityką. Nie są live zleceniami ani pozycjami BingX.",
+          markerDebug: "",
+          markerSource: `${overlayModeText} · ${displayInterval(selectedInterval)} · markery analizy backtestu`,
+          markers: markers.length,
+          renderedCandles: chartCandles.length,
+          skippedMarkers: Math.max(0, totalTrades - visibleTrades),
+          slTpLines,
+        });
 	      } else {
 	        const closedCandles = chartCandles.filter((candle) => candle.isClosed !== false);
 	        const closedHeikenAshiCandles = sanitizeChartSeriesData(toHeikenAshi(closedCandles), "closed heiken ashi candles");
@@ -2857,14 +3049,10 @@ export default function TradingViewChart() {
           ? cappedCanonicalEvents.slice(-6).map(canonicalEventDebugSummary).join(" | ")
           : "";
         const hiddenInModeReason = currentOverlayMode === "live" && allCanonicalEvents.length > cappedCanonicalEvents.length
-          ? "Sygnały strategii są ukryte w LIVE ONLY, bo ten tryb pokazuje tylko realny stan live."
-          : currentOverlayMode === "operational" && allCanonicalEvents.length > cappedCanonicalEvents.length
-            ? "Tryb OPERACYJNY pokazuje tylko najnowszy istotny sygnał; starsze są w HISTORIA/DEBUG."
-            : currentOverlayMode === "operational" && chartOnlyVisible
-              ? "Widoczny marker pochodzi z lokalnej symulacji wykresu; brak odpowiadającego zdarzenia w aktualnej osi Sztabu."
-              : "";
+          ? "Sygnały strategii są ukryte w LIVE, bo ten tryb pokazuje tylko realny stan live."
+          : "";
         const markerNote = currentOverlayMode === "live"
-          ? "Tryb LIVE ONLY ukrywa historyczne/symulowane markery strategii. Zmień tryb na OPERACYJNY, HISTORIA albo DEBUG, żeby je zobaczyć."
+          ? "Tryb LIVE ukrywa historyczne/symulowane markery strategii. Zmień tryb na HISTORIA albo DEBUG, żeby je zobaczyć."
           : historicalMode
             ? "Historyczne sygnały na wykresie nie oznaczają, że bot był wtedy online."
             : chartOnlyVisible
@@ -3539,6 +3727,7 @@ export default function TradingViewChart() {
       <OperationalTelemetryPanel
         compact={telemetryCompact}
         dock={telemetryDock}
+        mode={overlayMode}
         selectedInterval={selectedInterval}
         states={operationalStates}
         onDock={setTelemetryDock}
