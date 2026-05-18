@@ -37,6 +37,13 @@ import {
   safeOrderId,
   safeStringRows,
 } from "../utils/sztabRuntimeGuards";
+import {
+  DEFAULT_SHOW_DEBUG_OVERLAYS,
+  HISTORY_LIFECYCLE_LIMIT,
+  lifecycleHistoryRows,
+  limitActiveOverlayLines,
+  selectVisibleChartEvents,
+} from "../utils/sztabOperationalUi";
 import "../styles/chart.css";
 
 const DISPLAY_TIME_ZONE = import.meta.env.VITE_DISPLAY_TIME_ZONE || "Europe/Warsaw";
@@ -148,12 +155,12 @@ const overlayModes = [
   {
     id: "history",
     label: "HISTORIA",
-    note: "Chronologiczna historia setupów, triggerów, wejść, SL i powodów pominięcia.",
+    note: "Historia w panelu bocznym. Markery na wykresie są ukryte, dopóki nie włączysz debug overlays.",
   },
   {
     id: "debug",
     label: "DEBUG",
-    note: "Pełne markery i linie diagnostyczne.",
+    note: "Diagnostyka w panelu bocznym. Rysowanie debug overlay jest osobnym przełącznikiem.",
   },
 ];
 const overlayModeIds = new Set(overlayModes.map((mode) => mode.id));
@@ -632,6 +639,7 @@ function warnDirectionLabelMismatch(line = {}, label = "") {
 function shouldRenderSemanticOverlay(line = {}, mode = "live") {
   const normalizedMode = normalizeOverlayMode(mode);
   if (line.state === "live_confirmed" || line.state === "active_live") return true;
+  if (normalizedMode === "live" && line.type === "sl" && line.state === "current_setup") return true;
   if (normalizedMode === "live") return false;
   if (normalizedMode === "operational") {
     return line.state === "current_setup" || (line.type === "sl" && line.state === "planned");
@@ -737,7 +745,7 @@ function buildSemanticLiveOverlays({
         setupId: pending.setupId,
         sourceField: "stopLoss",
         startTime,
-        state: "planned",
+        state: "current_setup",
         type: "sl",
         value: pending.stopLoss,
       });
@@ -799,7 +807,7 @@ function buildSemanticLiveOverlays({
       sourceInterval: interval,
       sourceTime: setup.time,
       startTime: Math.max(firstTime, startTime),
-      state: "planned",
+      state: "current_setup",
       type: "sl",
       value: setup.stopLoss ?? setup.invalidationPrice,
     });
@@ -830,27 +838,27 @@ function classifyMarkerReality({ activeAnalysisSession, markerSource, selectedHi
   };
 }
 
-function timelineFromRuntime(runtime = {}) {
-  const transitions = safeObjectRows(runtime.executionTransitionLog).slice(-12).map((item) => ({
+function timelineFromRuntime(runtime = {}, limit = HISTORY_LIFECYCLE_LIMIT) {
+  const transitions = safeObjectRows(runtime.executionTransitionLog).slice(-limit).map((item) => ({
     time: item.timestamp,
     text: readableExecutionTransition(item),
   }));
-  const decisions = safeObjectRows(runtime.currentDecisionTimeline).slice(-10).map((item) => ({
+  const decisions = safeObjectRows(runtime.currentDecisionTimeline).slice(-limit).map((item) => ({
     time: item.time,
     text: item.text || readableDecisionText(item),
   }));
-  const journal = safeObjectRows(runtime.currentSetupOrderJournal).slice(-8).map((item) => ({
+  const journal = safeObjectRows(runtime.currentSetupOrderJournal).slice(-limit).map((item) => ({
     time: item.timestamp,
     text: readableJournalText(item),
   }));
-  const lifecycle = safeObjectRows(runtime.pendingTriggerOrder?.orderLifecycle).slice(-5).map((item) => ({
+  const lifecycle = safeObjectRows(runtime.pendingTriggerOrder?.orderLifecycle).slice(-limit).map((item) => ({
     time: item.time,
     text: polishLifecycleText(item),
   }));
   const setup = runtime.latestSetupEvent
     ? [{
         time: runtime.latestSetupEvent.time,
-        text: `Strategia zobaczyła setup ${polishSide(runtime.latestSetupEvent.direction)} (${runtime.latestSetupEvent.setupId ?? "bez id"}${runtime.latestSetupEvent.setupFingerprintShort ? ` · ${runtime.latestSetupEvent.setupFingerprintShort}` : ""}).`,
+        text: `Strategia zobaczyła setup ${polishSide(runtime.latestSetupEvent.direction)} (${runtime.latestSetupEvent.setupId ?? "bez id"}).`,
       }]
     : [];
   const source = transitions.length ? [...transitions, ...decisions, ...journal] : decisions.length ? [...decisions, ...journal] : [...setup, ...journal, ...lifecycle];
@@ -861,7 +869,7 @@ function timelineFromRuntime(runtime = {}) {
       const rightTime = typeof right.time === "number" ? right.time * 1000 : new Date(right.time ?? 0).getTime();
       return rightTime - leftTime;
     })
-    .slice(0, 7);
+    .slice(0, limit);
 }
 
 function readableExecutionTransition(item = {}) {
@@ -1110,14 +1118,48 @@ function runtimeDiagnostics(runtime = {}) {
 }
 
 function fsmRows({ currentPrice, execution = {}, pending = {}, runtime = {}, setup = {} } = {}) {
+  const state = String(execution.state || runtime.currentExecutionState || "").toUpperCase();
+  const side = canonicalDirection(execution.side, pending?.direction, pending?.positionSide, pending?.side, setup?.direction);
+  const order = execution.orderId ?? pending?.orderId ?? null;
+  const slConfirmed = runtime.liveProtectionConfirmed ?? runtime.protectionConfirmed ?? pending?.protectionConfirmed;
+  const slStatus = slConfirmed === true
+    ? "potwierdzony"
+    : state === "SL_SENT"
+      ? "wysłany, czeka na potwierdzenie"
+      : state === "POSITION_OPEN" || state === "ENTRY_CONFIRMED"
+        ? "weryfikowany"
+        : "--";
   return [
-    ["Stan", execution.state || runtime.currentExecutionState || "--"],
-    ["Powód", polishReason(execution.reasonCode || runtime.currentExecutionReason || "--")],
+    ["Stan", stateTag(state)],
+    ["Strona", side || "--"],
     ["Setup", compactId(execution.setupId ?? pending?.setupId ?? setup?.setupId ?? "--")],
     ["Trigger", formatChartPrice(pending?.triggerPrice ?? setup?.trigger)],
     ["Cena teraz", formatChartPrice(currentPrice)],
-    ["Order", execution.orderId || pending?.orderId ? compactId(execution.orderId ?? pending?.orderId) : "--"],
-    ["Ostatnia zmiana", execution.timestamp ? formatChartTime(execution.timestamp) : runtime.lastTransitionAt ? formatChartTime(runtime.lastTransitionAt) : "--"],
+    ["Wejście/order", order ? compactId(order) : polishStatus(pending?.status || "--")],
+    ["SL", slStatus],
+    ["Powód", polishReason(execution.reasonCode || runtime.currentExecutionReason || pending?.skippedReason || pending?.terminalReason || "--")],
+  ];
+}
+
+function cleanLifecycleRows({
+  currentPrice,
+  entryStatus = "--",
+  reason = "--",
+  setupId = "--",
+  side = "--",
+  slStatus = "--",
+  state = "--",
+  trigger = null,
+} = {}) {
+  return [
+    ["Stan", state],
+    ["Strona", side || "--"],
+    ["Setup", compactId(setupId || "--")],
+    ["Trigger", formatChartPrice(trigger)],
+    ["Cena teraz", formatChartPrice(currentPrice)],
+    ["Wejście/order", entryStatus || "--"],
+    ["SL", slStatus || "--"],
+    ["Powód", polishReason(reason) || "--"],
   ];
 }
 
@@ -1251,7 +1293,8 @@ function deriveOperationalState({
     pending,
     rows: [],
     tags: [],
-    timeline: timelineFromRuntime(runtime),
+    historyRows: lifecycleHistoryRows(runtime, HISTORY_LIFECYCLE_LIMIT),
+    timeline: timelineFromRuntime(runtime, HISTORY_LIFECYCLE_LIMIT),
     tone: "neutral",
     visualObjects: [markerReality],
   };
@@ -1262,16 +1305,18 @@ function deriveOperationalState({
       ...base,
       detail: protection.note,
       headline: `${intervalName}: pozycja ${polishSide(positionSide(livePosition))} aktywna`,
-      rows: [
-        ["Wejście", formatChartPrice(positionEntry(livePosition))],
-        ["SL", formatChartPrice(livePosition.stopLoss)],
-        ["PnL", formatChartPnl(positionPnl(livePosition))],
-        ["Ilość", formatChartPrice(positionAmount(livePosition))],
-        ["Pozycja live", "tak"],
-        ["SL potwierdzony", takNie(protection.confirmed)],
-        ["Źródło ochrony", polishProtectionSource(protection.source)],
-        ["Order ochrony", protection.orderId ? compactId(protection.orderId) : "--"],
-      ],
+      rows: cleanLifecycleRows({
+        currentPrice,
+        entryStatus: `wejście ${formatChartPrice(positionEntry(livePosition))}${positionPnl(livePosition) ? ` · PnL ${formatChartPnl(positionPnl(livePosition))}` : ""}`,
+        reason: protection.confirmed ? "SL potwierdzony na BingX." : protection.note,
+        setupId: pending?.setupId ?? setup?.setupId,
+        side: polishSide(positionSide(livePosition)),
+        slStatus: protection.confirmed
+          ? `potwierdzony ${formatChartPrice(livePosition.stopLoss)}`
+          : protection.label,
+        state: "POZYCJA LIVE",
+        trigger: triggerPrice,
+      }),
       tags: [
         { label: "LIVE ENTRY — POZYCJA NA BINGX", tone: "live" },
         { label: protection.label, tone: protection.tone },
@@ -1286,24 +1331,21 @@ function deriveOperationalState({
 
   if (status === "interrupted" || status === "error" || status === "recovering") {
     const programError = runtime.error || runtime.lastError || "";
-    const interruptedByCode = Boolean(programError);
     return {
       ...base,
-      headline: status === "recovering"
-        ? `${intervalName}: runner odzyskuje stan`
-        : interruptedByCode
-          ? `${intervalName}: runner przerwany przez błąd programu`
-          : `${intervalName}: runner przerwany, brak live egzekucji`,
-      detail: interruptedByCode
+      action: { label: "Restart interval runner", type: "restart_interval" },
+      headline: `${intervalName}: runner interrupted after backend restart — restart interval runner`,
+      detail: programError
         ? `Runner przerwany przez błąd programu: ${programError}`
-        : "Sztab nie może teraz wysłać live zlecenia z tego interwału.",
+        : "Runner wymaga restartu interwału. Panel pokazuje tylko ostatni znany stan, bez aktywnej egzekucji live.",
       rows: [
-        ["Stan", polishStatus(runtime.watchdogStatus ?? status)],
-        ["Błąd", programError || "--"],
+        ["Stan", "runner przerwany"],
+        ["Akcja", "restart interval runner"],
+        ["Błąd", programError || "backend restart / runtime interrupted"],
       ],
       tags: [
-        { label: interruptedByCode ? "BŁĄD PROGRAMU RUNNERA" : status === "error" ? "BŁĄD RUNNERA / GIEŁDY" : "BOT BYŁ OFFLINE PRZY SYGNALE", tone: "critical" },
-        { label: markerReality.label, tone: markerReality.tone },
+        { label: "RUNNER PRZERWANY", tone: "critical" },
+        { label: "WYMAGANY RESTART INTERWAŁU", tone: "critical" },
       ],
       tone: "critical",
     };
@@ -1382,14 +1424,18 @@ function deriveOperationalState({
       ...base,
       headline: `${intervalName}: bot oczekuje na trigger ${sideText}`,
       detail: `Trigger live jest wystawiony/uzbrojony. Bot czeka, aż cena dotknie poziomu ${formatChartPrice(triggerPrice)} i BingX potwierdzi fill.`,
-      rows: [
-        ["Trigger", formatChartPrice(triggerPrice)],
-        ["Cena teraz", formatChartPrice(currentPrice)],
-        ["Zlecenie", pending?.orderId ? compactId(pending.orderId) : "--"],
-        ["Status BingX", polishStatus(runtime.lastExchangeStatus || pendingStatus)],
-        ["Pozycja live", "nie"],
-        ["Stan SL", protection.label],
-      ],
+      rows: cleanLifecycleRows({
+        currentPrice,
+        entryStatus: pending?.orderId
+          ? `${compactId(pending.orderId)} · ${polishStatus(runtime.lastExchangeStatus || pendingStatus)}`
+          : polishStatus(pendingStatus),
+        reason: runtime.lastDecisionReason || "Bot czeka na przebicie triggera.",
+        setupId: pending?.setupId ?? setup?.setupId,
+        side: sideText,
+        slStatus: protection.label,
+        state: "TRIGGER UZBROJONY",
+        trigger: triggerPrice,
+      }),
       tags: [
         { label: "LIVE TRIGGER NA BINGX", tone: "pending" },
         { label: "CZEKA NA DOTKNIĘCIE TRIGGERA", tone: "pending" },
@@ -1451,19 +1497,18 @@ function deriveOperationalState({
         : pendingStatus === "filled_but_position_missing"
         ? "BingX zgłosił wykonanie, ale świeży sync nie znalazł odpowiadającej pozycji live. Ten scenariusz nie powinien blokować nowego setupu."
         : `Zlecenie trigger zakończyło się na BingX statusem ${polishStatus(runtime.lastExchangeStatus || pending.exchangeTerminalStatus || pendingStatus)}. ${terminalReasonText}`,
-      rows: [
-        ["Ostatni trigger", formatChartPrice(pending.triggerPrice)],
-        ["Poziom negacji", formatChartPrice(pending.invalidationPrice ?? pending.stopLoss)],
-        ["Zlecenie", pending.orderId ? compactId(pending.orderId) : "--"],
-        ["Status BingX", polishStatus(runtime.lastExchangeStatus || pending.exchangeTerminalStatus || pendingStatus)],
-        ["Wykonana ilość", pending.executedQty ?? runtime.triggerOrderExecutedQty ?? "--"],
-        ["Kandydat przyczyny", failureCandidate || "--"],
-        ["Dystans przy awarii", runtime.triggerDistanceAtFailurePct !== null && runtime.triggerDistanceAtFailurePct !== undefined ? `${Number(runtime.triggerDistanceAtFailurePct).toFixed(4)}%` : "--"],
-        ["Blokuje nowy setup", takNie(runtime.activeScenarioCanBlockNewSetup)],
-        ["Powód zakończenia", polishReason(runtime.scenarioTerminalReason || pending.terminalReason || pending.failureClassification || pendingStatus)],
-        ["Zastąpiony przez", runtime.supersededBySetupId ? compactId(runtime.supersededBySetupId) : "--"],
-        ["Pozycja live", "nie"],
-      ],
+      rows: cleanLifecycleRows({
+        currentPrice,
+        entryStatus: pending.orderId
+          ? `${compactId(pending.orderId)} · ${polishStatus(runtime.lastExchangeStatus || pending.exchangeTerminalStatus || pendingStatus)}`
+          : polishStatus(runtime.lastExchangeStatus || pending.exchangeTerminalStatus || pendingStatus),
+        reason: runtime.scenarioTerminalReason || pending.terminalReason || pending.failureClassification || failureCandidate || pendingStatus,
+        setupId: pending.setupId,
+        side: sideText,
+        slStatus: "brak pozycji live",
+        state: superseded ? "SETUP ZASTĄPIONY" : invalidatedBeforeFill ? "SETUP ANULOWANY" : "TRIGGER ZAKOŃCZONY",
+        trigger: pending.triggerPrice,
+      }),
       tags: [
         { label: superseded ? "SETUP ZASTĄPIONY PRZEZ NOWY" : pendingStatus === "filled_but_position_missing" ? "BRAK POTWIERDZONEJ LIVE POZYCJI" : failedTriggerLabel, tone: superseded ? "stale" : "critical" },
         { label: runtime.canArmNextSetup ? "NOWY SETUP MOŻE SIĘ UZBROIĆ" : "SCENARIUSZ NADAL BLOKUJE", tone: runtime.canArmNextSetup ? "live" : "critical" },
@@ -1484,11 +1529,16 @@ function deriveOperationalState({
       ...base,
       headline: `${intervalName}: setup ${sideText} zablokowany`,
       detail: polishReason(blockedReason) || "Runner odrzucił setup przed wysłaniem zlecenia.",
-      rows: [
-        ["Trigger", formatChartPrice(triggerPrice)],
-        ["Cena teraz", formatChartPrice(currentPrice)],
-        ["Powód", polishReason(blockedReason)],
-      ],
+      rows: cleanLifecycleRows({
+        currentPrice,
+        entryStatus: "nie wysłano",
+        reason: blockedReason,
+        setupId: setup?.setupId ?? pending?.setupId,
+        side: sideText,
+        slStatus: "--",
+        state: "SETUP ZABLOKOWANY",
+        trigger: triggerPrice,
+      }),
       tags: [{ label: "SETUP ZABLOKOWANY", tone: "blocked" }],
       tone: "blocked",
       visualObjects: [{ label: "SETUP ZABLOKOWANY", note: "Setup nie przeszedł do live zlecenia na BingX.", tone: "blocked" }],
@@ -1500,11 +1550,16 @@ function deriveOperationalState({
       ...base,
       headline: `${intervalName}: widać setup ${polishSide(setup.direction)}, ale brak live triggera`,
       detail: "Setup jest widoczny w stanie strategii, ale nie ma aktywnego zlecenia trigger na BingX.",
-      rows: [
-        ["Setup", compactId(setup.setupId)],
-        ["Trigger", formatChartPrice(setup.trigger)],
-        ["Cena teraz", formatChartPrice(currentPrice)],
-      ],
+      rows: cleanLifecycleRows({
+        currentPrice,
+        entryStatus: "brak aktywnego ordera",
+        reason: runtime.lastDecisionReason || "Setup nie przeszedł do live triggera.",
+        setupId: setup.setupId,
+        side: polishSide(setup.direction),
+        slStatus: "planowany poziom negacji",
+        state: "SETUP STRATEGII",
+        trigger: setup.trigger,
+      }),
       tags: [
         { label: "SETUP STRATEGII", tone: "simulated" },
         { label: "BRAK LIVE TRIGGERA", tone: "stale" },
@@ -1517,11 +1572,16 @@ function deriveOperationalState({
     ...base,
     headline: `${intervalName}: brak aktywnego setupu`,
     detail: "Runner czeka na kolejną świecę benchmarkową albo nowy setup strategii.",
-    rows: [
-      ["Stan", polishStatus(runtime.watchdogStatus ?? "healthy")],
-      ["Ostatnia świeca", runtime.lastClosedCandleTime ? formatChartTime(runtime.lastClosedCandleTime) : "--"],
-      ["Cena teraz", formatChartPrice(currentPrice)],
-    ],
+    rows: cleanLifecycleRows({
+      currentPrice,
+      entryStatus: "brak",
+      reason: runtime.lastDecisionReason || "Runner czeka na setup.",
+      setupId: "--",
+      side: "--",
+      slStatus: "--",
+      state: "CZEKA NA SETUP",
+      trigger: null,
+    }),
     tags: [{ label: "CZEKA NA ŚWIECĘ BENCHMARKOWĄ", tone: "neutral" }],
     tone: "neutral",
   };
@@ -1532,6 +1592,7 @@ function OperationalTelemetryPanel({
   dock = "left",
   mode = "live",
   onDock,
+  onRestartInterval,
   onSelectInterval,
   onToggleCompact,
   selectedInterval,
@@ -1595,24 +1656,50 @@ function OperationalTelemetryPanel({
                 <span key={label}><b>{label}</b><i>{value ?? "--"}</i></span>
               ))}
             </div>
+            {selected.action?.type === "restart_interval" && (
+              <button
+                className="hubert-operational-action"
+                type="button"
+                onClick={() => onRestartInterval?.(selected.interval)}
+              >
+                {selected.action.label ?? "Restart interval runner"}
+              </button>
+            )}
           </div>
 
           {showDebug && (
-          <div className="hubert-operational-section">
-            <strong>Znaczenie linii i markerów</strong>
+          <details className="hubert-operational-section">
+            <summary>Debug runtime i znaczenie obiektów</summary>
             {(selected.visualObjects ?? []).map((item, index) => (
               <span data-tone={item.tone} key={`${item.label}-${index}`}>
                 <b>{item.label}</b>
                 <i>{item.note}</i>
               </span>
             ))}
-          </div>
+          </details>
           )}
 
           {showHistory && (
           <div className="hubert-operational-section">
-            <strong>Oś zdarzeń</strong>
-            {(selected.timeline ?? []).length ? (selected.timeline ?? []).map((item, index) => (
+            <strong>Historia cykli — ostatnie 20</strong>
+            {(selected.historyRows ?? []).length ? (
+              <div className="hubert-operational-history-table">
+                <b>Czas</b>
+                <b>Strona</b>
+                <b>Setup</b>
+                <b>Wynik</b>
+                <b>Powód</b>
+                <b>Order</b>
+                {(selected.historyRows ?? []).flatMap((item, index) => [
+                  <span key={`${item.time ?? index}-time`}>{formatChartTime(item.time)}</span>,
+                  <span key={`${item.time ?? index}-side`}>{item.side ?? "--"}</span>,
+                  <span key={`${item.time ?? index}-setup`}>{item.setupId || "--"}</span>,
+                  <span key={`${item.time ?? index}-result`}>{item.result || "--"}</span>,
+                  <span key={`${item.time ?? index}-reason`}>{polishReason(item.reason) || "--"}</span>,
+                  <span key={`${item.time ?? index}-order`}>{item.orderId ? compactId(item.orderId) : "--"}</span>,
+                ])}
+              </div>
+            ) : (selected.timeline ?? []).length ? (selected.timeline ?? []).slice(0, HISTORY_LIFECYCLE_LIMIT).map((item, index) => (
               <span key={`${item.time ?? index}-${index}`}>
                 <b>{formatChartTime(item.time)}</b>
                 <i>{item.text}</i>
@@ -1627,15 +1714,15 @@ function OperationalTelemetryPanel({
           )}
 
           {showDebug && (
-          <div className="hubert-operational-section">
-            <strong>Diagnostyka statusu</strong>
+          <details className="hubert-operational-section">
+            <summary>Diagnostyka statusu</summary>
             {(selected.diagnostics ?? []).map(([label, value]) => (
               <span key={label}>
                 <b>{label}</b>
                 <i>{value ?? "--"}</i>
               </span>
             ))}
-          </div>
+          </details>
           )}
         </>
       )}
@@ -1648,10 +1735,14 @@ function chartTimeValue(value) {
   return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
 }
 
-async function apiFetch(path) {
+async function apiFetch(path, options = {}) {
   const response = await fetch(backendApiUrl(path), {
     cache: "no-store",
-    headers: dashboardAuthHeaders(),
+    ...options,
+    headers: {
+      ...dashboardAuthHeaders(),
+      ...(options.headers ?? {}),
+    },
   });
 
   if (!response.ok) {
@@ -2154,6 +2245,7 @@ export default function TradingViewChart() {
     initialIndicatorSettings[persistedState.chartTimeframe ?? "15m"] ?? normalizeIndicatorSettings(persistedState.indicatorSettings),
   );
   const [overlayMode, setOverlayMode] = useState(normalizeOverlayMode(persistedState.chartOverlayMode));
+  const [showDebugOverlays, setShowDebugOverlays] = useState(Boolean(persistedState.showDebugOverlays ?? DEFAULT_SHOW_DEBUG_OVERLAYS));
   const [sztabTelemetry, setSztabTelemetry] = useState(null);
   const [livestreamTelemetry, setLivestreamTelemetry] = useState(null);
   const [telemetryDock, setTelemetryDock] = useState("left");
@@ -2198,8 +2290,28 @@ export default function TradingViewChart() {
             }),
           ];
         }),
-    );
+      );
   }, [activeAnalysisSession, chartRenderStats.markerSource, currentChartPrice, livestreamTelemetry, selectedHistoricalWindow, sztabTelemetry]);
+
+  const restartSztabInterval = useCallback(async (interval) => {
+    if (!interval) return;
+    try {
+      await apiFetch(`/sztab/restart/${encodeURIComponent(interval)}`, { method: "POST" });
+      const refreshed = await apiFetch("/sztab/status");
+      setSztabTelemetry({
+        ...refreshed,
+        __frontendFetchedAt: new Date().toISOString(),
+        __frontendFetchError: "",
+      });
+    } catch (restartError) {
+      const message = restartError instanceof Error ? restartError.message : String(restartError);
+      setSztabTelemetry((current) => ({
+        ...(current ?? {}),
+        __frontendFetchError: message,
+        __frontendFetchFailedAt: new Date().toISOString(),
+      }));
+    }
+  }, []);
 
   useEffect(() => {
     analysisModeRef.current = Boolean(activeAnalysisSession);
@@ -2642,6 +2754,7 @@ export default function TradingViewChart() {
       writeStoredJson(PLATFORM_STORAGE_KEY, {
         chartTimeframe: selectedInterval,
         chartOverlayMode: overlayMode,
+        showDebugOverlays,
         indicatorSettings: settings,
         indicatorSettingsByInterval: {
           ...indicatorSettingsByInterval,
@@ -2654,7 +2767,7 @@ export default function TradingViewChart() {
     }, 350);
 
     return () => window.clearTimeout(timeoutId);
-  }, [indicatorSettingsByInterval, overlayMode, selectedInterval, settings]);
+  }, [indicatorSettingsByInterval, overlayMode, selectedInterval, settings, showDebugOverlays]);
 
   const clearStrategyLines = useCallback(() => {
     if (!chartRef.current) {
@@ -2945,13 +3058,28 @@ export default function TradingViewChart() {
       const overlayModeText = overlayModeDefinition(currentOverlayMode).label;
 
       if (mode.analysisResult) {
-        const effectiveOverlaySettings = overlayBacktestSettings(mode.overlaySettings, currentOverlayMode);
+        const chartDebugEnabled = showDebugOverlays && currentOverlayMode !== "live";
+        const effectiveOverlaySettings = chartDebugEnabled
+          ? overlayBacktestSettings(mode.overlaySettings, currentOverlayMode)
+          : {
+              ...overlayBacktestSettings(mode.overlaySettings, currentOverlayMode),
+              showDebug: false,
+              showPnlLabels: false,
+              showSelectedTradeSlTp: false,
+              showSlTp: false,
+              showTrades: false,
+              showVisibleTradeSlTp: false,
+            };
         const markers = sanitizeMarkers(
-          labelMarkers(toBacktestAnalysisMarkers(mode.analysisResult, effectiveOverlaySettings, chartCandles), "BACKTEST"),
+          chartDebugEnabled
+            ? labelMarkers(toBacktestAnalysisMarkers(mode.analysisResult, effectiveOverlaySettings, chartCandles), "BACKTEST")
+            : [],
           "backtest analysis markers",
         );
         strategyMarkersRef.current?.setMarkers(markers);
-        const slTpLines = renderBacktestLines(mode.analysisResult, effectiveOverlaySettings, chartCandles, currentOverlayMode);
+        const slTpLines = chartDebugEnabled
+          ? renderBacktestLines(mode.analysisResult, effectiveOverlaySettings, chartCandles, currentOverlayMode)
+          : renderBacktestLines(null, effectiveOverlaySettings, chartCandles, "live");
         const visibleTrades = renderedTradeCount(mode.analysisResult, chartCandles, effectiveOverlaySettings);
         const debugMarkers = effectiveOverlaySettings?.showDebug
           ? markers.filter((marker) => String(marker.id ?? "").startsWith("analysis-debug")).length
@@ -2961,14 +3089,16 @@ export default function TradingViewChart() {
           cappedMarkers: Math.max(0, totalTrades - visibleTrades),
           debugMarkers,
           durationMs: Math.round(performance.now() - renderStartedAt),
-          hiddenInModeReason: currentOverlayMode === "live" && totalTrades > 0
-            ? "Markery backtestu są ukryte w LIVE, bo ten tryb pokazuje tylko realny stan live."
+          hiddenInModeReason: !chartDebugEnabled && totalTrades > 0
+            ? "Markery backtestu są ukryte na wykresie. Włącz debug overlays, jeśli naprawdę chcesz zobaczyć symulację."
             : "",
           markerNote: currentOverlayMode === "live"
             ? "Tryb LIVE ukrywa markery backtestu, aby live stan był czytelny."
-            : "Markery backtestu są symulacją/analityką. Nie są live zleceniami ani pozycjami BingX.",
+            : chartDebugEnabled
+              ? "Markery backtestu są symulacją/analityką. Nie są live zleceniami ani pozycjami BingX."
+              : "Historia i debug są pokazane w panelu bocznym; wykres zostaje czysty.",
           markerDebug: "",
-          markerSource: `${overlayModeText} · ${displayInterval(selectedInterval)} · markery analizy backtestu`,
+          markerSource: `${overlayModeText} · ${displayInterval(selectedInterval)} · ${chartDebugEnabled ? "markery analizy backtestu" : "nakładki symulacji ukryte"}`,
           markers: markers.length,
           renderedCandles: chartCandles.length,
           skippedMarkers: Math.max(0, totalTrades - visibleTrades),
@@ -3035,33 +3165,39 @@ export default function TradingViewChart() {
             });
         const allCanonicalEvents = mergeCanonicalEventStreams(runtimeCanonicalEvents, chartCanonicalEvents);
         const cappedCanonicalEvents = filterCanonicalEventsForMode(allCanonicalEvents, currentOverlayMode);
-        const invariants = canonicalVisibilityInvariants(allCanonicalEvents, cappedCanonicalEvents, currentOverlayMode);
+        const visibleCanonicalEvents = selectVisibleChartEvents(cappedCanonicalEvents, currentOverlayMode, showDebugOverlays);
+        const invariants = canonicalVisibilityInvariants(allCanonicalEvents, visibleCanonicalEvents, currentOverlayMode);
         const strategyMarkers = sanitizeMarkers(
-          cappedCanonicalEvents
+          visibleCanonicalEvents
             .map((event) => canonicalMarkerFromEvent(event, currentOverlayMode))
+            .map((marker) => currentOverlayMode === "live" ? { ...marker, text: "" } : marker)
             .filter((marker) => marker.time),
           "canonical strategy markers",
         );
-        globalThis.__CHOROMANSKI_MARKER_AUDIT__ = cappedCanonicalEvents;
-        const noVisibleStrategyMarkers = cappedCanonicalEvents.length === 0;
-        const chartOnlyVisible = cappedCanonicalEvents.some((event) => event.source !== CANONICAL_EVENT_SOURCES.LIVE_SZTAB);
-        const markerDebug = currentOverlayMode === "debug"
-          ? cappedCanonicalEvents.slice(-6).map(canonicalEventDebugSummary).join(" | ")
+        globalThis.__CHOROMANSKI_MARKER_AUDIT__ = visibleCanonicalEvents;
+        const noVisibleStrategyMarkers = visibleCanonicalEvents.length === 0;
+        const chartOnlyVisible = visibleCanonicalEvents.some((event) => event.source !== CANONICAL_EVENT_SOURCES.LIVE_SZTAB);
+        const markerDebug = currentOverlayMode === "debug" && showDebugOverlays
+          ? visibleCanonicalEvents.slice(-6).map(canonicalEventDebugSummary).join(" | ")
           : "";
-        const hiddenInModeReason = currentOverlayMode === "live" && allCanonicalEvents.length > cappedCanonicalEvents.length
-          ? "Sygnały strategii są ukryte w LIVE, bo ten tryb pokazuje tylko realny stan live."
+        const hiddenInModeReason = allCanonicalEvents.length > visibleCanonicalEvents.length
+          ? currentOverlayMode === "live"
+            ? "LIVE pokazuje maksymalnie jeden aktualny cykl. Historia i debug nie są rysowane na wykresie."
+            : showDebugOverlays
+              ? ""
+              : "Historyczne/debugowe markery są ukryte na wykresie. Szczegóły są w panelu bocznym."
           : "";
         const markerNote = currentOverlayMode === "live"
-          ? "Tryb LIVE ukrywa historyczne/symulowane markery strategii. Zmień tryb na HISTORIA albo DEBUG, żeby je zobaczyć."
+          ? "Tryb LIVE pokazuje tylko najnowszy aktywny marker Sztabu. Reszta trafia do panelu."
           : historicalMode
             ? "Historyczne sygnały na wykresie nie oznaczają, że bot był wtedy online."
             : chartOnlyVisible
               ? "Marker pochodzi z lokalnej strategii wykresu i nie ma pasującego zdarzenia runtime Sztabu."
               : "Najnowsze markery są potwierdzone w aktualnym runtime Sztabu.";
         const markerSource = currentOverlayMode === "live"
-          ? `${overlayModeText} · ${displayInterval(selectedInterval)} · markery strategii ukryte`
+          ? `${overlayModeText} · ${displayInterval(selectedInterval)} · czysty live`
           : noVisibleStrategyMarkers
-            ? `${overlayModeText} · ${displayInterval(selectedInterval)} · brak markerów strategii w tym trybie`
+            ? `${overlayModeText} · ${displayInterval(selectedInterval)} · wykres bez markerów historii/debug`
             : historicalMode
               ? `${overlayModeText} · ${displayInterval(selectedInterval)} · historyczne sygnały wykresu`
               : chartOnlyVisible
@@ -3069,18 +3205,18 @@ export default function TradingViewChart() {
                 : `${overlayModeText} · ${displayInterval(selectedInterval)} · markery wykresu dopasowane do Sztabu`;
 
         strategyMarkersRef.current?.setMarkers(strategyMarkers);
-        renderStrategyLines(cappedCanonicalEvents, closedCandles, currentOverlayMode);
+        renderStrategyLines(showDebugOverlays ? visibleCanonicalEvents : [], closedCandles, currentOverlayMode);
         setChartRenderStats({
-          cappedMarkers: Math.max(0, allCanonicalEvents.length - cappedCanonicalEvents.length),
+          cappedMarkers: Math.max(0, allCanonicalEvents.length - visibleCanonicalEvents.length),
           debugMarkers: 0,
           durationMs: Math.round(performance.now() - renderStartedAt),
-          hiddenInModeReason: invariants.length ? invariants.join("; ") : hiddenInModeReason,
+          hiddenInModeReason: showDebugOverlays && invariants.length ? invariants.join("; ") : hiddenInModeReason,
           markerDebug,
           markerNote,
           markerSource,
           markers: strategyMarkers.length,
           renderedCandles: chartCandles.length,
-          skippedMarkers: Math.max(0, allCanonicalEvents.length - cappedCanonicalEvents.length),
+          skippedMarkers: Math.max(0, allCanonicalEvents.length - visibleCanonicalEvents.length),
           slTpLines: strategyLineSeriesRef.current.length,
         });
       }
@@ -3089,7 +3225,7 @@ export default function TradingViewChart() {
         chartRef.current?.timeScale().fitContent();
       }
     },
-    [overlayMode, renderBacktestLines, renderStrategyLines, selectedInterval, settings, sztabTelemetry],
+    [overlayMode, renderBacktestLines, renderStrategyLines, selectedInterval, settings, showDebugOverlays, sztabTelemetry],
   );
 
   const scheduleLiveCandleUpdate = useCallback((candles) => {
@@ -3504,16 +3640,17 @@ export default function TradingViewChart() {
 
     if (!runtime || !firstTime || !lastTime) return;
 
-    buildSemanticLiveOverlays({
+    const semanticLines = buildSemanticLiveOverlays({
       firstTime,
       interval: selectedInterval,
       lastTime,
       livePosition,
-      mode: overlayMode,
+      mode: showDebugOverlays ? overlayMode : "live",
       pending,
       protection,
       setup,
-    }).filter((line) => line.interval === selectedInterval).forEach((line) => {
+    }).filter((line) => line.interval === selectedInterval);
+    limitActiveOverlayLines(semanticLines, overlayMode, showDebugOverlays).forEach((line) => {
       const auditEntry = {
         interval: selectedInterval,
         label: line.label,
@@ -3542,7 +3679,7 @@ export default function TradingViewChart() {
         value: line.value,
       });
     });
-  }, [addLiveOrderSegment, clearLiveOrderLines, livestreamTelemetry, overlayMode, rawCandles, selectedInterval, sztabTelemetry]);
+  }, [addLiveOrderSegment, clearLiveOrderLines, livestreamTelemetry, overlayMode, rawCandles, selectedInterval, showDebugOverlays, sztabTelemetry]);
 
   return (
     <main className="hubert-dashboard">
@@ -3694,9 +3831,9 @@ export default function TradingViewChart() {
       <div className="hubert-window-panel" aria-label="Kontrola okna wykresu">
         <strong>{dataDiagnostics.provider ?? "binance-futures"}</strong>
         <span>{rawCandles.length} świec na wykresie / {fullHistoryDataset.length || dataDiagnostics.fullCandles || 0} w pamięci</span>
-        <span>{chartRenderStats.markers} markerów · {chartRenderStats.slTpLines} linii · {chartRenderStats.durationMs}ms render</span>
+        <span>{overlayMode === "live" ? "Czysty LIVE" : showDebugOverlays ? "Nakładki debug włączone" : "Nakładki historii/debug ukryte"} · {chartRenderStats.durationMs}ms render</span>
         <span title={chartRenderStats.markerNote}>{chartRenderStats.markerSource}</span>
-        {overlayMode === "debug" && chartRenderStats.markerDebug && <span>{chartRenderStats.markerDebug}</span>}
+        {overlayMode === "debug" && showDebugOverlays && chartRenderStats.markerDebug && <span>{chartRenderStats.markerDebug}</span>}
         {chartRenderStats.hiddenInModeReason && <span>{chartRenderStats.hiddenInModeReason}</span>}
         <span>{selectedHistoricalWindow.mode === "historical" ? "Okno historyczne" : "Okno live/najnowsze"}</span>
         <span>Czas: {DISPLAY_TIME_ZONE}</span>
@@ -3713,6 +3850,14 @@ export default function TradingViewChart() {
             </button>
           ))}
         </div>
+        <label className="hubert-debug-overlay-toggle">
+          <input
+            checked={showDebugOverlays}
+            type="checkbox"
+            onChange={(event) => setShowDebugOverlays(event.target.checked)}
+          />
+          <span>Debug overlays</span>
+        </label>
         <div>
           <input
             aria-label="Skocz do daty"
@@ -3731,6 +3876,7 @@ export default function TradingViewChart() {
         selectedInterval={selectedInterval}
         states={operationalStates}
         onDock={setTelemetryDock}
+        onRestartInterval={restartSztabInterval}
         onSelectInterval={updateSelectedInterval}
         onToggleCompact={() => setTelemetryCompact((value) => !value)}
       />

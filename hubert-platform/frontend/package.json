@@ -9,7 +9,8 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "test:sztab-runtime-guards": "node scripts/sztab-runtime-guards-regression.mjs",
-    "test:canonical-event-stream": "node scripts/canonical-event-stream-regression.mjs"
+    "test:canonical-event-stream": "node scripts/canonical-event-stream-regression.mjs",
+    "test:sztab-operational-ui": "node scripts/sztab-operational-ui-regression.mjs"
   },
   "dependencies": {
     "lightweight-charts": "^5.2.0",
